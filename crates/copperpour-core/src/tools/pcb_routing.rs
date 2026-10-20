@@ -146,7 +146,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC before committing.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -961,9 +961,24 @@ struct ApplyEvidence {
     created_count: usize,
     preserved_locked_track_count: usize,
     preserved_locked_via_count: usize,
-    drc_violations: usize,
-    unconnected_items: usize,
-    schematic_parity_violations: usize,
+    drc: cli::DrcReport,
+}
+
+/// Keep unavailable DRC categories distinct from checked zero findings.
+/// Import completion describes the mutation; a clean verdict additionally
+/// requires every DRC category to have been evaluated.
+fn specctra_drc_evidence(report: &cli::DrcReport) -> serde_json::Value {
+    let missing_categories = report.missing_categories();
+    let complete = missing_categories.is_empty();
+    json!({
+        "clean": complete && report.all().next().is_none(),
+        "complete": complete,
+        "violations": report.violations.len(),
+        "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
+        "schematic_parity_violations": report.schematic_parity.as_ref().map(Vec::len),
+        "missing_categories": missing_categories,
+        "schematic_parity_diagnostic": report.schematic_parity_diagnostic
+    })
 }
 
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
@@ -1186,7 +1201,6 @@ async fn handle_apply_specctra_ses(
             copperpour_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
             let drc = runtime.block_on(cli::run_drc(&cli_path, &candidate_for_ipc, false))?;
-            let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
             Ok(ApplyEvidence {
                 source_sha256: plan.source_sha256.clone(),
                 session_id: plan.session_id.clone(),
@@ -1196,9 +1210,7 @@ async fn handle_apply_specctra_ses(
                 created_count: created_ids.len(),
                 preserved_locked_track_count: plan.locked_track_count,
                 preserved_locked_via_count: plan.locked_via_count,
-                drc_violations: drc.violations.len(),
-                unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
-                schematic_parity_violations: parity_count,
+                drc,
             })
         })();
         match operation {
@@ -1259,14 +1271,7 @@ async fn handle_apply_specctra_ses(
                 "vias": evidence.preserved_locked_via_count
             },
             "ipc_readback": "exact_count_match",
-            "drc": {
-                "clean": evidence.drc_violations == 0
-                    && evidence.unconnected_items == 0
-                    && evidence.schematic_parity_violations == 0,
-                "violations": evidence.drc_violations,
-                "unconnected_items": evidence.unconnected_items,
-                "schematic_parity_violations": evidence.schematic_parity_violations
-            }
+            "drc": specctra_drc_evidence(&evidence.drc)
         }))),
         Err(failure) => {
             let reason = failure.message().to_string();
@@ -2793,6 +2798,93 @@ async fn handle_route_diff_pair(
         "net_pos": net_pos, "net_neg": net_neg,
         "layer": layer, "width": width, "gap": gap
     })))
+}
+
+#[cfg(test)]
+mod specctra_drc_evidence_tests {
+    use super::*;
+
+    fn checked_zero() -> cli::DrcReport {
+        cli::DrcReport {
+            violations: Vec::new(),
+            unconnected_items: Some(Vec::new()),
+            schematic_parity: Some(Vec::new()),
+            ownership_diagnostic: None,
+            schematic_parity_diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn complete_checked_zero_is_clean() {
+        let evidence = specctra_drc_evidence(&checked_zero());
+        assert_eq!(evidence["clean"], true);
+        assert_eq!(evidence["complete"], true);
+        assert_eq!(evidence["violations"], 0);
+        assert_eq!(evidence["unconnected_items"], 0);
+        assert_eq!(evidence["schematic_parity_violations"], 0);
+        assert_eq!(evidence["missing_categories"], json!([]));
+    }
+
+    #[test]
+    fn unavailable_categories_are_null_and_never_clean() {
+        for (unconnected, parity, missing) in [
+            (false, true, vec!["unconnected_items"]),
+            (true, false, vec!["schematic_parity"]),
+            (false, false, vec!["unconnected_items", "schematic_parity"]),
+        ] {
+            let mut report = checked_zero();
+            report.unconnected_items = unconnected.then(Vec::new);
+            report.schematic_parity = parity.then(Vec::new);
+            let evidence = specctra_drc_evidence(&report);
+            assert_eq!(evidence["clean"], false, "{evidence}");
+            assert_eq!(evidence["complete"], false, "{evidence}");
+            assert_eq!(evidence["unconnected_items"].is_null(), !unconnected);
+            assert_eq!(evidence["schematic_parity_violations"].is_null(), !parity);
+            assert_eq!(evidence["missing_categories"], json!(missing));
+        }
+    }
+
+    #[test]
+    fn unavailable_parity_preserves_the_kicad_diagnostic() {
+        let mut report = checked_zero();
+        report.schematic_parity = None;
+        report.schematic_parity_diagnostic =
+            Some("KiCad could not read the candidate root schematic".into());
+        let evidence = specctra_drc_evidence(&report);
+        assert_eq!(evidence["clean"], false);
+        assert_eq!(
+            evidence["schematic_parity_diagnostic"],
+            "KiCad could not read the candidate root schematic"
+        );
+    }
+
+    #[test]
+    fn findings_in_every_category_prevent_a_clean_verdict() {
+        for category in ["violations", "unconnected_items", "schematic_parity"] {
+            let mut report = checked_zero();
+            let finding = cli::DrcViolation {
+                severity: "error".into(),
+                description: "observed design finding".into(),
+                rule: "clearance".into(),
+                pos: None,
+                items: Vec::new(),
+            };
+            match category {
+                "violations" => report.violations.push(finding),
+                "unconnected_items" => report.unconnected_items.as_mut().unwrap().push(finding),
+                _ => report.schematic_parity.as_mut().unwrap().push(finding),
+            }
+            let evidence = specctra_drc_evidence(&report);
+            assert_eq!(evidence["complete"], true, "{evidence}");
+            assert_eq!(evidence["clean"], false, "{evidence}");
+            let field = if category == "schematic_parity" {
+                "schematic_parity_violations"
+            } else {
+                category
+            };
+            assert_eq!(evidence[field], 1, "{evidence}");
+        }
+    }
 }
 
 /// Manual live acceptance gate for the final #337 undo boundary.
