@@ -1088,7 +1088,8 @@ fn parity_root_schematic(pcb: &Path) -> std::path::PathBuf {
 /// kicad-cli exits 0, prints [`PARITY_NOT_RUN`] to stderr, and writes
 /// `"schematic_parity": []` — the same silent zero #245 removed from Konnect's
 /// side, now produced by KiCad. KiCad's own statement is the signal, not a
-/// filesystem guess; the expected root path only names what was missing.
+/// filesystem guess when KiCad reports failure; an absent exact root is also
+/// sufficient to withhold an empty result when KiCad stays silent.
 ///
 /// A **non-empty** array is KiCad's evidence and is kept whatever stderr or
 /// the filesystem say: findings cannot be un-found by a lookup failing.
@@ -1096,18 +1097,26 @@ fn apply_parity_evidence(report: &mut DrcReport, stderr: &str, pcb: &Path) {
     let Some(parity) = report.schematic_parity.as_ref() else {
         return;
     };
-    if !parity.is_empty() || !stderr.contains(PARITY_NOT_RUN) {
+    let expected = parity_root_schematic(pcb);
+    let native_not_run = stderr.contains(PARITY_NOT_RUN);
+    // KiCad 10.0.7 can also silently emit [] when the root is absent.
+    // A missing root cannot be positive parity evidence, even without stderr.
+    if !parity.is_empty() || (!native_not_run && expected.is_file()) {
         return;
     }
-    let expected = parity_root_schematic(pcb);
     let root_state = if expected.is_file() {
         "which exists but could not be read for parity"
     } else {
         "which does not exist"
     };
     report.schematic_parity = None;
+    let reason = if native_not_run {
+        format!("kicad-cli reported \"{PARITY_NOT_RUN}\"")
+    } else {
+        "the expected root schematic is unavailable".to_string()
+    };
     report.schematic_parity_diagnostic = Some(format!(
-        "kicad-cli reported \"{PARITY_NOT_RUN}\" for {}: the parity test reads the project's root \
+        "{reason} for {}: the parity test reads the project's root \
          schematic {} ({root_state}), so the empty parity result it wrote is not a checked zero",
         pcb.display(),
         expected.display()
@@ -2377,15 +2386,68 @@ mod drc_parse_tests {
         assert!(!report.missing_categories().contains(&"schematic_parity"));
     }
 
-    /// No statement from KiCad and an empty array is a real checked zero.
+    /// Silence only permits a checked zero when the exact root is present.
     #[test]
     fn a_silent_empty_parity_array_is_a_checked_zero() {
         let mut report = parse_drc_report(&real_report()).unwrap();
 
-        apply_parity_evidence(&mut report, "", Path::new("/somewhere/board.kicad_pcb"));
+        let tmp = tempfile::tempdir().unwrap();
+        let pcb = tmp.path().join("board.kicad_pcb");
+        std::fs::write(pcb.with_extension("kicad_sch"), "(kicad_sch)").unwrap();
+        apply_parity_evidence(&mut report, "", &pcb);
 
         assert_eq!(report.schematic_parity.as_ref().map(Vec::len), Some(0));
         assert!(report.schematic_parity_diagnostic.is_none());
+    }
+
+    /// Native 10.0.7 also emits [] without a diagnostic for a missing root.
+    #[test]
+    fn a_silent_empty_parity_array_without_root_stays_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pcb = tmp.path().join("board.kicad_pcb");
+        let mut report = parse_drc_report(&real_report()).unwrap();
+        apply_parity_evidence(&mut report, "", &pcb);
+        assert!(report.schematic_parity.is_none());
+        let reason = report.schematic_parity_diagnostic.as_deref().unwrap();
+        assert!(reason.contains("root schematic is unavailable"), "{reason}");
+        assert!(reason.contains("does not exist"), "{reason}");
+        assert_eq!(report.unconnected_items.as_ref().map(Vec::len), Some(2));
+        assert_eq!(report.violations.len(), 2);
+    }
+
+    /// Bounded live CLI acceptance. Does not exercise SES import/undo or IPC.
+    #[tokio::test]
+    #[ignore = "requires KiCad 10.0.7 and retained independent native fixtures"]
+    async fn native_independent_drc_controls() {
+        let root = PathBuf::from(std::env::var("KONNECT_NATIVE_FIXTURES").unwrap());
+        let cli = std::env::var("KONNECT_NATIVE_CLI").unwrap();
+        for case in ["mechanical-positive", "routed-probes"] {
+            let report = run_drc(&cli, &root.join(case).join("fixture.kicad_pcb"), false)
+                .await
+                .unwrap();
+            assert!(report.missing_categories().is_empty(), "{case}: {report:?}");
+            assert!(report.all().next().is_none(), "{case}: {report:?}");
+        }
+        let report = run_drc(
+            &cli,
+            &root.join("unconnected-probes/fixture.kicad_pcb"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.unconnected_items.as_ref().map(Vec::len), Some(1));
+        assert!(report.violations.is_empty());
+        let report = run_drc(&cli, &root.join("parity-mismatch/fixture.kicad_pcb"), false)
+            .await
+            .unwrap();
+        assert!(!report.schematic_parity.as_ref().unwrap().is_empty());
+        for case in ["missing-schematic", "missing-project-and-schematic"] {
+            let report = run_drc(&cli, &root.join(case).join("fixture.kicad_pcb"), false)
+                .await
+                .unwrap();
+            assert!(report.schematic_parity.is_none(), "{case}: {report:?}");
+            assert!(report.schematic_parity_diagnostic.is_some());
+        }
     }
 
     /// A kicad-cli that never reported the category stays "not reported" and
