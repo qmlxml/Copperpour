@@ -179,7 +179,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
                     "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "optimizer_enabled": { "type": "boolean" },
-                    "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+                    "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Freerouting's own job limit. A job that reaches it ends TIMED_OUT and Freerouting refuses its output: the routing is lost. To bound the optimizer, use optimize_seconds." },
+                    "optimize_seconds": { "type": "integer", "minimum": 0, "maximum": 86400, "description": "Once routing is complete and the optimizer has started (optimizer_enabled), let it run this many seconds, then keep the best board found so far and stop the job (final_state OPTIMIZATION_STOPPED). Detection reads Freerouting's log; without it the optimizer runs to its end." },
                     "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
                 },
                 "required": ["dsn_path", "ses_output_path"]
@@ -3165,6 +3166,7 @@ async fn handle_route_specctra_dsn(
         max_passes,
         optimizer_enabled: args["optimizer_enabled"].as_bool(),
         job_timeout_seconds,
+        optimize_seconds: args["optimize_seconds"].as_u64(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
@@ -3197,7 +3199,8 @@ async fn handle_route_specctra_dsn(
         "final_state": evidence.final_state,
         "poll_count": evidence.poll_count,
         "elapsed_seconds": evidence.elapsed_seconds,
-        "ses_bytes": evidence.ses_bytes
+        "ses_bytes": evidence.ses_bytes,
+        "last_activity": evidence.last_activity
     })))
 }
 

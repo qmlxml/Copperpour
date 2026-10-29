@@ -60,6 +60,9 @@ pub(crate) struct RouteSettings {
     pub max_passes: Option<u32>,
     pub optimizer_enabled: Option<bool>,
     pub job_timeout_seconds: Option<u64>,
+    /// Once routing is complete and the optimizer has started, how long to let
+    /// it run before taking the best board so far and stopping the job.
+    pub optimize_seconds: Option<u64>,
     pub poll_interval: Duration,
     pub overall_timeout: Duration,
 }
@@ -303,6 +306,12 @@ fn validate_inputs(
     {
         bail!("job_timeout_seconds must be between 1 and 86400");
     }
+    if settings
+        .optimize_seconds
+        .is_some_and(|seconds| seconds > 86_400)
+    {
+        bail!("optimize_seconds must be between 0 and 86400");
+    }
     Ok(())
 }
 
@@ -373,6 +382,8 @@ async fn run_state_machine(
 
     let mut poll_count = 0u32;
     let mut progress = JobProgress::new(&job_id);
+    let mut optimizing_since: Option<Instant> = None;
+    let mut output_downloaded = false;
     let final_state = loop {
         let details = client
             .call_tool("get_job_details", json!({ "path": { "jobId": job_id } }))
@@ -385,16 +396,45 @@ async fn run_state_machine(
             "FAILED" | "CANCELLED" | "CANCELED" => {
                 bail!("Freerouting job {job_id} ended in state {state}")
             }
-            _ => tokio::time::sleep(settings.poll_interval).await,
+            // Terminal too, and Freerouting refuses the output of all three:
+            // polling on would only wait for the overall timeout.
+            "TIMED_OUT" | "TERMINATED" | "INVALID" => bail!(
+                "Freerouting job {job_id} ended in state {state}, which has no downloadable \
+                 output; to bound the optimizer, use optimize_seconds rather than \
+                 job_timeout_seconds"
+            ),
+            _ => {}
         }
+
+        if let Some(limit) = settings.optimize_seconds {
+            if optimizing_since.is_none()
+                && (progress.is_optimizing() || stage_is_optimizing(&details))
+            {
+                optimizing_since = Some(Instant::now());
+            }
+            let limit_reached =
+                optimizing_since.is_some_and(|since| since.elapsed() >= Duration::from_secs(limit));
+            if limit_reached && download_running_output(client, &job_id, temporary).await? {
+                // The snapshot is in hand, so stopping the job is a courtesy:
+                // close() reaps the child whatever cancel_job answers.
+                let _ = client
+                    .call_tool("cancel_job", json!({ "path": { "jobId": job_id } }))
+                    .await;
+                output_downloaded = true;
+                break "OPTIMIZATION_STOPPED".to_string();
+            }
+        }
+        tokio::time::sleep(settings.poll_interval).await;
     };
 
-    client
-        .call_tool(
-            "download_job_output_to_local_file",
-            json!({ "jobId": job_id, "filePath": absolute_utf8(temporary)? }),
-        )
-        .await?;
+    if !output_downloaded {
+        client
+            .call_tool(
+                "download_job_output_to_local_file",
+                json!({ "jobId": job_id, "filePath": absolute_utf8(temporary)? }),
+            )
+            .await?;
+    }
     Ok(RouteEvidence {
         session_id,
         job_id,
@@ -406,6 +446,37 @@ async fn run_state_machine(
         diagnostics_path: None,
         last_activity: progress.activity,
     })
+}
+
+/// Whether `get_job_details` places the job in its optimization stage.
+fn stage_is_optimizing(details: &Value) -> bool {
+    details
+        .get("stage")
+        .and_then(Value::as_str)
+        .is_some_and(|stage| stage.to_ascii_uppercase().contains("OPTIMI"))
+}
+
+/// Save the output of a job that is still running.
+///
+/// Freerouting publishes the incumbent board, the best one so far, at the
+/// start and end of every optimizer pass; candidates are worked on copies.
+/// Taken during optimization, the snapshot is therefore a complete routing.
+/// Returns false while no output has been published yet.
+async fn download_running_output(
+    client: &mut LocalMcpClient,
+    job_id: &str,
+    temporary: &Path,
+) -> Result<bool> {
+    let _ = tokio::fs::remove_file(temporary).await;
+    client
+        .call_tool(
+            "download_job_output_to_local_file",
+            json!({ "jobId": job_id, "filePath": absolute_utf8(temporary)? }),
+        )
+        .await?;
+    Ok(tokio::fs::metadata(temporary)
+        .await
+        .is_ok_and(|metadata| metadata.len() > 0))
 }
 
 /// How often an unchanged job still sends a progress notification, so the
@@ -478,6 +549,13 @@ impl JobProgress {
             ),
         );
         self.last_message = message;
+    }
+
+    /// Whether the job's log has reached the optimizer stage.
+    fn is_optimizing(&self) -> bool {
+        self.activity
+            .as_deref()
+            .is_some_and(|activity| activity.starts_with("optimiz"))
     }
 
     fn read_activity(&self) -> Option<String> {
@@ -1041,6 +1119,22 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_stage_is_seen_in_the_log_or_the_job_stage() {
+        let mut progress = JobProgress::new("a3aa32eb");
+        assert!(!progress.is_optimizing());
+        progress.activity = Some("pass 18: 0 unrouted, 218 violations".into());
+        assert!(!progress.is_optimizing());
+        progress.activity = Some("optimizing, 218 violations".into());
+        assert!(progress.is_optimizing());
+        progress.activity = Some("optimizer pass 2: score 73.70 -> 84.26 (improved)".into());
+        assert!(progress.is_optimizing());
+
+        assert!(stage_is_optimizing(&json!({ "stage": "OPTIMIZATION" })));
+        assert!(!stage_is_optimizing(&json!({ "stage": "ROUTING" })));
+        assert!(!stage_is_optimizing(&json!({})));
+    }
+
+    #[test]
     fn job_tag_is_the_upper_cased_id_prefix() {
         assert_eq!(
             JobProgress::new("a3aa32eb-5b14-4a2b-8742-6b44c34d63bb").tag,
@@ -1060,6 +1154,7 @@ mod tests {
             max_passes: None,
             optimizer_enabled: None,
             job_timeout_seconds: None,
+            optimize_seconds: None,
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1073,6 +1168,16 @@ mod tests {
             error.contains("diagnostics output already exists"),
             "{error}"
         );
+
+        std::fs::remove_file(diagnostics_path(&ses)).unwrap();
+        let too_long = RouteSettings {
+            optimize_seconds: Some(86_401),
+            ..settings
+        };
+        assert!(validate_inputs(&jar, &dsn, &ses, &too_long)
+            .unwrap_err()
+            .to_string()
+            .contains("optimize_seconds"));
     }
 
     #[test]
@@ -1191,6 +1296,7 @@ mod tests {
                 max_passes: Some(2),
                 optimizer_enabled: Some(false),
                 job_timeout_seconds: Some(300),
+                optimize_seconds: None,
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
             },
@@ -1225,6 +1331,7 @@ mod tests {
                     max_passes: Some(100),
                     optimizer_enabled: Some(true),
                     job_timeout_seconds: Some(300),
+                    optimize_seconds: None,
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
                 },
@@ -1272,6 +1379,7 @@ mod tests {
                     max_passes: Some(100),
                     optimizer_enabled: Some(true),
                     job_timeout_seconds: Some(300),
+                    optimize_seconds: None,
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
                 },
