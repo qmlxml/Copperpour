@@ -177,9 +177,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "dsn_path": { "type": "string", "description": "Existing Specctra .dsn input" },
                     "ses_output_path": { "type": "string", "description": "New .ses output path; existing files are never replaced" },
                     "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
-                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Routing passes (Freerouting's autorouter.max_passes). Unlimited by default: the router stops once every connection is routed or no pass makes progress." },
                     "optimizer_enabled": { "type": "boolean" },
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Freerouting's own job limit. A job that reaches it ends TIMED_OUT and Freerouting refuses its output: the routing is lost. To bound the optimizer, use optimize_seconds." },
+                    "optimizer_max_passes": { "type": "integer", "minimum": 1, "maximum": 100, "description": "At most this many optimizer passes (Freerouting's optimizer.max_passes, default 100). Each pass can take minutes on a dense board." },
+                    "optimizer_improvement_threshold": { "type": "number", "minimum": 0, "maximum": 100, "description": "Stop optimizing after a pass that improves the optimizer score by less than this many percent (Freerouting's default 2.5). Lower it to keep optimizing for smaller gains." },
                     "optimize_seconds": { "type": "integer", "minimum": 0, "maximum": 86400, "description": "Once routing is complete and the optimizer has started (optimizer_enabled), let it run this many seconds, then keep the best board found so far and stop the job (final_state OPTIMIZATION_STOPPED). Detection reads Freerouting's log; without it the optimizer runs to its end." },
                     "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
                 },
@@ -3167,6 +3169,12 @@ async fn handle_route_specctra_dsn(
         optimizer_enabled: args["optimizer_enabled"].as_bool(),
         job_timeout_seconds,
         optimize_seconds: args["optimize_seconds"].as_u64(),
+        optimizer_max_passes: args["optimizer_max_passes"]
+            .as_u64()
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("optimizer_max_passes is too large"))?,
+        optimizer_improvement_threshold: args["optimizer_improvement_threshold"].as_f64(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
