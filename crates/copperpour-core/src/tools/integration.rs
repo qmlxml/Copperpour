@@ -3035,7 +3035,8 @@ async fn handle_check_freerouting(
                      https://github.com/freerouting/freerouting/releases), or pass jar_path."
         }))),
         FreeroutingJar::Found(jar_path) => {
-            let mut java_command = tokio::process::Command::new("java");
+            let java_path = crate::java_runtime::java_executable();
+            let mut java_command = tokio::process::Command::new(&java_path);
             java_command.arg("-version");
             let java = match run_java_command(&mut java_command).await {
                 Ok(output) => output,
@@ -3046,6 +3047,7 @@ async fn handle_check_freerouting(
                         "native_mcp_available": false,
                         "bridge_available": false,
                         "jar_path": jar_path,
+                        "java_path": java_path,
                         "java_available": false,
                         "note": error
                     })));
@@ -3058,13 +3060,39 @@ async fn handle_check_freerouting(
                     "native_mcp_available": false,
                     "bridge_available": false,
                     "jar_path": jar_path,
+                    "java_path": java_path,
                     "java_available": false,
                     "java_output": command_output(&java),
                     "note": "Freerouting was found, but Java did not start successfully"
                 })));
             }
 
-            let mut freerouting_command = tokio::process::Command::new("java");
+            // An older Java only fails once the JAR is loaded, with
+            // UnsupportedClassVersionError: say so before anything else runs.
+            let java_release = crate::java_runtime::java_release(&command_output(&java));
+            let required_release = crate::java_runtime::required_java_release(&jar_path);
+            if let (Some(found), Some(required)) = (java_release, required_release) {
+                if found < required {
+                    return Ok(CallToolResult::json(&json!({
+                        "available": false,
+                        "engine_found": true,
+                        "native_mcp_available": false,
+                        "bridge_available": false,
+                        "jar_path": jar_path,
+                        "java_path": java_path,
+                        "java_available": true,
+                        "java_release": found,
+                        "required_java_release": required,
+                        "note": format!(
+                            "This Freerouting JAR needs Java {required} or later, but {} is Java {found}. \
+                             Install a newer JDK, or point JAVA_HOME at one.",
+                            java_path.display()
+                        )
+                    })));
+                }
+            }
+
+            let mut freerouting_command = tokio::process::Command::new(&java_path);
             freerouting_command.args([
                 crate::freerouting_mcp::JAVA_HEADLESS_ARG,
                 "-jar",
@@ -3078,13 +3106,18 @@ async fn handle_check_freerouting(
             };
 
             let bridge = crate::freerouting_mcp::probe_local(&jar_path).await;
+            // Available means the JAR actually ran here, not merely that a JAR
+            // and some `java` exist.
             Ok(CallToolResult::json(&json!({
-                "available": true,
+                "available": version_checked,
                 "engine_found": true,
                 "native_mcp_available": bridge.native_mcp_available,
                 "bridge_available": bridge.bridge_available,
                 "jar_path": jar_path,
+                "java_path": java_path,
                 "java_available": true,
+                "java_release": java_release,
+                "required_java_release": required_release,
                 "java_output": command_output(&java),
                 "version_checked": version_checked,
                 "version_output": version_output,

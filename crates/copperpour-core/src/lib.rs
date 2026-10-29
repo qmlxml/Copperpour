@@ -5,6 +5,7 @@ pub(crate) mod freerouting_mcp;
 pub mod gates;
 pub mod guidance;
 pub(crate) mod hex;
+pub(crate) mod java_runtime;
 pub mod kicad_install;
 pub mod mcp;
 pub(crate) mod native_specctra_bridge;
