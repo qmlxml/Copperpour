@@ -215,7 +215,14 @@ pub(crate) async fn route_local(
             if diagnostics.is_empty() {
                 Err(error)
             } else {
-                Err(error).context(format!("Freerouting stderr: {diagnostics}"))
+                let full = diagnostics_path
+                    .as_deref()
+                    .map(|path| format!(", all of it in {path}"))
+                    .unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "{error:#}\nFreerouting stderr, last lines{full}:\n{}",
+                    stderr_tail(&diagnostics)
+                ))
             }
         }
     };
@@ -412,6 +419,14 @@ async fn run_state_machine(
                 .await?;
             if let Some(effective) = effective_settings(&effective) {
                 settings_not_applied = settings_mismatches(&job_settings, effective);
+                // Known before start_job: refuse now rather than after a run
+                // that would ignore part of what was asked.
+                if !settings_not_applied.is_empty() {
+                    bail!(
+                        "Freerouting did not apply these settings, nothing was routed: {}",
+                        settings_not_applied.join("; ")
+                    );
+                }
                 settings_warnings = effective
                     .get("validation_warnings")
                     .and_then(Value::as_array)
@@ -784,7 +799,10 @@ impl LocalMcpClient {
             return if diagnostics.is_empty() {
                 Err(error)
             } else {
-                Err(error).context(format!("Freerouting stderr: {diagnostics}"))
+                Err(anyhow::anyhow!(
+                    "{error:#}\nFreerouting stderr, last lines:\n{}",
+                    stderr_tail(&diagnostics)
+                ))
             };
         }
         Ok(client)
@@ -1126,6 +1144,19 @@ fn named_settings(settings: &RouteSettings) -> Map<String, Value> {
     body
 }
 
+/// The end of Freerouting's stderr for an error message: its banner and
+/// warnings run to thousands of characters, and the cause is at the end.
+fn stderr_tail(diagnostics: &str) -> String {
+    const LINES: usize = 12;
+    const CHARS: usize = 2000;
+    let lines: Vec<&str> = diagnostics.lines().collect();
+    let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
+    match tail.char_indices().rev().nth(CHARS - 1) {
+        Some((start, _)) => format!("...{}", &tail[start..]),
+        None => tail,
+    }
+}
+
 /// Deep-merge `overlay` into `base`: objects merge key by key, anything else
 /// in `overlay` replaces what `base` had.
 fn merge_into(base: &mut Map<String, Value>, overlay: Map<String, Value>) {
@@ -1440,6 +1471,21 @@ mod tests {
                 "hole_clearance_um": 200.0
             })
         );
+    }
+
+    #[test]
+    fn stderr_in_errors_is_cut_to_its_last_lines() {
+        let long: String = (1..=40)
+            .map(|n| format!("2026-10-29 INFO line {n}\n"))
+            .collect();
+        let tail = stderr_tail(&long);
+        assert!(tail.starts_with("2026-10-29 INFO line 29"), "{tail}");
+        assert!(tail.ends_with("line 40"));
+        let wide = "x".repeat(5000);
+        let cut = stderr_tail(&wide);
+        assert_eq!(cut.chars().count(), 2003);
+        assert!(cut.starts_with("..."));
+        assert_eq!(stderr_tail("short"), "short");
     }
 
     #[test]
