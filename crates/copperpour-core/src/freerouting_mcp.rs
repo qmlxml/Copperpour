@@ -26,6 +26,10 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Polls in a row that may go unanswered before the job is given up. A busy
+/// JVM (garbage collection, a starved CPU) can stop answering for minutes in
+/// the middle of a long route; the overall timeout still bounds the wait.
+const MAX_MISSED_POLLS: u32 = 10;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -355,7 +359,49 @@ fn validate_inputs(
     {
         bail!("optimizer_improvement_threshold must be between 0 and 100 (percent)");
     }
+    if let Some(router_settings) = &settings.router_settings {
+        let negative = negative_settings(router_settings);
+        if !negative.is_empty() {
+            bail!(
+                "router_settings must not be negative, nothing was routed: {}",
+                negative.join("; ")
+            );
+        }
+    }
     Ok(())
+}
+
+/// Every number below zero in `settings`, as "path: value". Freerouting takes
+/// a negative cost or count without a warning and routes with it, yet none of
+/// its settings has a meaning below zero: costs, penalties, weights, counts,
+/// distances and thresholds.
+fn negative_settings(settings: &Map<String, Value>) -> Vec<String> {
+    fn walk(value: &Value, path: &str, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let here = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(value, &here, out);
+                }
+            }
+            Value::Array(items) => {
+                for (index, value) in items.iter().enumerate() {
+                    walk(value, &format!("{path}[{index}]"), out);
+                }
+            }
+            Value::Number(number) if number.as_f64().is_some_and(|n| n < 0.0) => {
+                out.push(format!("{path}: {number}"))
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(&Value::Object(settings.clone()), "", &mut out);
+    out
 }
 
 async fn run_state_machine(
@@ -443,10 +489,21 @@ async fn run_state_machine(
     let mut progress = JobProgress::new(&job_id);
     let mut optimizing_since: Option<Instant> = None;
     let mut output_downloaded = false;
+    let mut missed_polls = 0u32;
     let final_state = loop {
-        let details = client
+        let details = match client
             .call_tool("get_job_details", json!({ "path": { "jobId": job_id } }))
-            .await?;
+            .await
+        {
+            Ok(details) => details,
+            Err(error) if is_request_timeout(&error) && missed_polls < MAX_MISSED_POLLS => {
+                missed_polls += 1;
+                progress.report_missed_poll(missed_polls, started);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        missed_polls = 0;
         poll_count = poll_count.saturating_add(1);
         let state = required_string(&details, &["state", "status"], "job state")?;
         progress.report(&state, &details, started);
@@ -598,6 +655,19 @@ impl JobProgress {
         if message == self.last_message && !due {
             return;
         }
+        self.send(message, started);
+    }
+
+    /// A poll Freerouting left unanswered: always said, since the silence is
+    /// what the caller needs to see.
+    fn report_missed_poll(&mut self, missed: u32, started: Instant) {
+        self.send(
+            format!("not answering, {missed}/{MAX_MISSED_POLLS} polls missed in a row"),
+            started,
+        );
+    }
+
+    fn send(&mut self, message: String, started: Instant) {
         self.sent += 1;
         self.last_sent = Some(Instant::now());
         let elapsed = started.elapsed().as_secs();
@@ -934,20 +1004,25 @@ impl LocalMcpClient {
         }))
         .await?;
         let deadline = Instant::now() + limit;
+        let timed_out = || RequestTimedOut {
+            method: method.to_string(),
+        };
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("Freerouting MCP request '{method}' timed out");
+                return Err(timed_out().into());
             }
             let line = timeout(remaining, self.stdout.next_line())
                 .await
-                .map_err(|_| anyhow::anyhow!("Freerouting MCP request '{method}' timed out"))??
+                .map_err(|_| timed_out())??
                 .context("Freerouting MCP closed stdout before responding")?;
             let Some(response) = json_rpc_message(&line) else {
                 continue;
             };
             if response.get("id") != Some(&json!(id)) {
-                if response.get("method").is_some() {
+                // A notification, or the late answer to a request that timed
+                // out and was given up.
+                if response.get("method").is_some() || is_stale_response(&response, id) {
                     continue;
                 }
                 bail!("Freerouting MCP returned an unexpected response id");
@@ -1217,6 +1292,35 @@ fn same_value(a: &Value, b: &Value) -> bool {
         (Some(x), Some(y)) => (x - y).abs() <= 1e-9 * x.abs().max(1.0),
         _ => a == b,
     }
+}
+
+/// A request Freerouting did not answer in time, told apart from other errors
+/// so a missed poll can be retried.
+#[derive(Debug)]
+struct RequestTimedOut {
+    method: String,
+}
+
+impl std::fmt::Display for RequestTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Freerouting MCP request '{}' timed out", self.method)
+    }
+}
+
+impl std::error::Error for RequestTimedOut {}
+
+fn is_request_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RequestTimedOut>().is_some())
+}
+
+/// Whether `response` answers a request sent before the one awaited as `id`.
+fn is_stale_response(response: &Value, id: u64) -> bool {
+    response
+        .get("id")
+        .and_then(Value::as_u64)
+        .is_some_and(|earlier| earlier < id)
 }
 
 fn duration_string(seconds: u64) -> String {
@@ -1518,6 +1622,44 @@ mod tests {
                 "hole_clearance_um: sent 200.0, effective 0.0",
                 "no_such_setting: not a Freerouting setting",
             ]
+        );
+    }
+
+    #[test]
+    fn a_timed_out_poll_is_told_apart_from_other_errors() {
+        let timed_out = anyhow::Error::from(RequestTimedOut {
+            method: "tools/call".into(),
+        })
+        .context("call Freerouting MCP tool 'get_job_details'");
+        assert!(is_request_timeout(&timed_out));
+        assert_eq!(
+            format!("{timed_out:#}"),
+            "call Freerouting MCP tool 'get_job_details': \
+             Freerouting MCP request 'tools/call' timed out"
+        );
+        assert!(!is_request_timeout(&anyhow::anyhow!(
+            "Freerouting MCP closed stdout before responding"
+        )));
+    }
+
+    #[test]
+    fn only_answers_to_earlier_requests_are_stale() {
+        assert!(is_stale_response(&json!({ "id": 4, "result": {} }), 5));
+        assert!(!is_stale_response(&json!({ "id": 6, "result": {} }), 5));
+        assert!(!is_stale_response(&json!({ "id": "4", "result": {} }), 5));
+    }
+
+    #[test]
+    fn negative_router_settings_are_named_by_path() {
+        let settings = json!({
+            "scoring": { "via_costs": -5, "plane_via_costs": 5 },
+            "layers": [{ "bend_cost": 0.0 }, { "bend_cost": -0.5 }],
+            "plane_nets": ["GND"],
+            "fanout": { "min_escape_length_mm": 2.5 }
+        });
+        assert_eq!(
+            negative_settings(settings.as_object().unwrap()),
+            ["layers[1].bend_cost: -0.5", "scoring.via_costs: -5"]
         );
     }
 
