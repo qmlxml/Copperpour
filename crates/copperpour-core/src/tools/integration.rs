@@ -184,6 +184,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "optimizer_improvement_threshold": { "type": "number", "minimum": 0, "maximum": 100, "description": "Stop optimizing after a pass that improves the optimizer score by less than this many percent (Freerouting's default 2.5). Lower it to keep optimizing for smaller gains." },
                     "plane_nets": { "type": "array", "items": { "type": "string" }, "description": "Net names Freerouting treats as power-plane nets (its plane_nets): plane routing mode and cheaper vias to the plane. A (plane ...) declared in the DSN already marks its net the same way." },
                     "plane_as_obstacle": { "type": "boolean", "description": "Whether copper pours block foreign traces (Freerouting's plane_as_obstacle, default false)." },
+                    "router_settings": { "type": "object", "description": "Any Freerouting router setting, in its JSON shape, passed through as given; the named arguments above are merged on top and win. Groups: autorouter.{max_passes, max_threads, max_items, ignore_net_classes}, fanout.{enabled, max_passes, ripup_allowed, min_escape_length_mm, max_escape_length_mm, start_via_diameter_mm, end_via_diameter_mm, pin_sorting_order, fallback_to_board_vias}, optimizer.{enabled, max_passes, max_threads, improvement_threshold, enable_preflight_guards, max_consecutive_failures, max_autoroute_passes, trace_ripup_cost_factor}, scoring.{via_costs, plane_via_costs, start_ripup_costs, default_preferred_direction_trace_cost, default_undesired_direction_trace_cost, bend_penalty}, router_scoring.*, optimizer_scoring.*, and top level copper_to_edge_clearance_um, hole_clearance_um, clearance_tolerance_um, neck_width_um, automatic_neckdown, strict_drc, trace_pull_tight_accuracy, allowed_via_types, plane_nets, plane_as_obstacle, max_threads, layers. Settings Freerouting did not apply come back in settings_not_applied." },
                     "optimize_seconds": { "type": "integer", "minimum": 0, "maximum": 86400, "description": "Once routing is complete and the optimizer has started (optimizer_enabled), let it run this many seconds, then keep the best board found so far and stop the job (final_state OPTIMIZATION_STOPPED). Detection reads Freerouting's log; without it the optimizer runs to its end." },
                     "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
                 },
@@ -3184,6 +3185,7 @@ async fn handle_route_specctra_dsn(
                 .collect()
         }),
         plane_as_obstacle: args["plane_as_obstacle"].as_bool(),
+        router_settings: args["router_settings"].as_object().cloned(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
@@ -3217,7 +3219,9 @@ async fn handle_route_specctra_dsn(
         "poll_count": evidence.poll_count,
         "elapsed_seconds": evidence.elapsed_seconds,
         "ses_bytes": evidence.ses_bytes,
-        "last_activity": evidence.last_activity
+        "last_activity": evidence.last_activity,
+        "settings_not_applied": evidence.settings_not_applied,
+        "settings_warnings": evidence.settings_warnings
     })))
 }
 
