@@ -182,6 +182,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Freerouting's own job limit. A job that reaches it ends TIMED_OUT and Freerouting refuses its output: the routing is lost. To bound the optimizer, use optimize_seconds." },
                     "optimizer_max_passes": { "type": "integer", "minimum": 1, "maximum": 100, "description": "At most this many optimizer passes (Freerouting's optimizer.max_passes, default 100). Each pass can take minutes on a dense board." },
                     "optimizer_improvement_threshold": { "type": "number", "minimum": 0, "maximum": 100, "description": "Stop optimizing after a pass that improves the optimizer score by less than this many percent (Freerouting's default 2.5). Lower it to keep optimizing for smaller gains." },
+                    "plane_nets": { "type": "array", "items": { "type": "string" }, "description": "Net names Freerouting treats as power-plane nets (its plane_nets): plane routing mode and cheaper vias to the plane. A (plane ...) declared in the DSN already marks its net the same way." },
+                    "plane_as_obstacle": { "type": "boolean", "description": "Whether copper pours block foreign traces (Freerouting's plane_as_obstacle, default false)." },
                     "optimize_seconds": { "type": "integer", "minimum": 0, "maximum": 86400, "description": "Once routing is complete and the optimizer has started (optimizer_enabled), let it run this many seconds, then keep the best board found so far and stop the job (final_state OPTIMIZATION_STOPPED). Detection reads Freerouting's log; without it the optimizer runs to its end." },
                     "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
                 },
@@ -3175,6 +3177,13 @@ async fn handle_route_specctra_dsn(
             .transpose()
             .map_err(|_| anyhow::anyhow!("optimizer_max_passes is too large"))?,
         optimizer_improvement_threshold: args["optimizer_improvement_threshold"].as_f64(),
+        plane_nets: args["plane_nets"].as_array().map(|nets| {
+            nets.iter()
+                .filter_map(|net| net.as_str())
+                .map(str::to_string)
+                .collect()
+        }),
+        plane_as_obstacle: args["plane_as_obstacle"].as_bool(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
