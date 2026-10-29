@@ -3192,8 +3192,22 @@ async fn handle_route_specctra_dsn(
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
         .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
+    // A board with unrouted connections is not a routed board, even though
+    // Freerouting ends the job COMPLETED (max_passes reached, or no progress).
+    // The SES is still written, for inspection. An unknown count (log not
+    // readable) is not turned into a failure.
+    let fully_routed = evidence.unrouted.is_none_or(|unrouted| unrouted == 0);
+    let message = (!fully_routed).then(|| {
+        format!(
+            "Freerouting left {} connection(s) unrouted; the SES at {} is incomplete",
+            evidence.unrouted.unwrap_or_default(),
+            ses_output.display()
+        )
+    });
     Ok(CallToolResult::json(&json!({
-        "success": true,
+        "success": fully_routed,
+        "message": message,
+        "unrouted_connections": evidence.unrouted,
         "method": "local_freerouting_native_mcp",
         "engine": {
             "name": "Freerouting",

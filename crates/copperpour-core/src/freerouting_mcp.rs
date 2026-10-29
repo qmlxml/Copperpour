@@ -96,6 +96,9 @@ pub(crate) struct RouteEvidence {
     /// Last routing activity read from Freerouting's log, e.g.
     /// "pass 17: 0 unrouted, 218 violations".
     pub last_activity: Option<String>,
+    /// Connections still unrouted when the job ended, from the last count in
+    /// Freerouting's log; None when the log could not be read.
+    pub unrouted: Option<u64>,
     /// Settings sent but not found with the same value among the job's
     /// effective settings: unknown key, typo, or a value Freerouting replaced.
     pub settings_not_applied: Vec<String>,
@@ -485,6 +488,7 @@ async fn run_state_machine(
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
+        unrouted: progress.read_unrouted(),
         last_activity: progress.activity,
         settings_not_applied,
         settings_warnings,
@@ -605,6 +609,11 @@ impl JobProgress {
         let tail = read_tail(self.log.as_deref()?, LOG_TAIL_BYTES)?;
         latest_activity(&tail, &self.tag)
     }
+
+    fn read_unrouted(&self) -> Option<u64> {
+        let tail = read_tail(self.log.as_deref()?, LOG_TAIL_BYTES)?;
+        latest_unrouted(&tail, &self.tag)
+    }
 }
 
 /// Freerouting's log file: `FREEROUTING_LOG`, else its default under the XDG
@@ -629,6 +638,27 @@ fn read_tail(path: &Path, bytes: u64) -> Option<String> {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).ok()?;
     Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// The last unrouted-connection count logged for the job tagged `tag`: a pass
+/// line's "(N unrouted and ...)" or an optimizer line's "incomplete
+/// connections: N".
+fn latest_unrouted(log: &str, tag: &str) -> Option<u64> {
+    log.lines()
+        .rev()
+        .filter(|line| line.contains(tag))
+        .find_map(|line| {
+            let count = |marker: &str, before: bool| -> Option<u64> {
+                if before {
+                    let head = line.split_once(marker)?.0;
+                    head.rsplit(['(', ' ']).next()?.parse().ok()
+                } else {
+                    let tail = line.split_once(marker)?.1;
+                    tail.split([',', '.', ' ']).next()?.parse().ok()
+                }
+            };
+            count(" unrouted and ", true).or_else(|| count("incomplete connections: ", false))
+        })
 }
 
 /// The most recent routing-pass or optimizer line of the job tagged `tag`.
@@ -1294,6 +1324,21 @@ mod tests {
         assert!(stage_is_optimizing(&json!({ "stage": "OPTIMIZATION" })));
         assert!(!stage_is_optimizing(&json!({ "stage": "ROUTING" })));
         assert!(!stage_is_optimizing(&json!({})));
+    }
+
+    #[test]
+    fn the_last_unrouted_count_of_the_job_is_found() {
+        let routing = "\
+2026-10-29 17:52:54.000 INFO   [A3AA32] Auto-routing pass #8 on board 'a' was completed in 16.00 seconds with score 964.79 (4 unrouted and 218 violations), using 1.00 CPU seconds.
+2026-10-29 17:52:55.000 DEBUG  [A3AA32]   Net 'SCK2' has 4 incomplete(s)
+2026-10-29 17:52:56.000 INFO   [B00000] Auto-routing pass #2 on board 'b' was completed in 1.00 seconds with score 1.00 (50 unrouted and 3 violations), using 1.00 CPU seconds.
+";
+        assert_eq!(latest_unrouted(routing, "[A3AA32]"), Some(4));
+        let optimizing = format!(
+            "{routing}2026-10-29 17:54:26.961 INFO   [A3AA32] Optimization stage started on board 'c'. Baseline router score: 980.71, optimizer score: 71.70, incomplete connections: 0, clearance violations: 218.\n"
+        );
+        assert_eq!(latest_unrouted(&optimizing, "[A3AA32]"), Some(0));
+        assert_eq!(latest_unrouted(routing, "[C11111]"), None);
     }
 
     #[test]
