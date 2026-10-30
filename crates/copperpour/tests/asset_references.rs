@@ -657,6 +657,12 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
     // KiCad's own vocabulary, and file/format names.
     const NOT_TOOLS: &[&str] = &[
+        // KiCad DRC violation types named in the kicad-pcb skill's silkscreen
+        // cleanup, and move_footprint_texts arguments (its schema has them).
+        "silk_overlap",
+        "silk_over_copper",
+        "local_x",
+        "local_y",
         // Parameters and a net in the kicad-simulation protection stand-ins, which
         // `protection_skill.rs` ties to the decks the live tests run.
         "sh_t0",

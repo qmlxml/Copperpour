@@ -60,3 +60,21 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
     net touching the pad) is taken, with the pour rule kept.
 16. **Step 7: `04afb36` is not applied** (both behaviours already present; `delete_trace` accepting
     via UUIDs would change a public tool's inputs, and `delete_via` exists).
+
+### Prepared for the owner: should a copper pour block a pad-net change? (decision 15)
+
+- **Now (Copperpour):** `update_pcb_from_schematic` refuses to change a pad's net when a zone pours
+  its old or new net (tests `a_pour_still_blocks_its_own_net`, `a_pour_blocks_a_pad_moving_onto_its_net`).
+  Cost: a part on GND or a poured supply cannot change net until someone deletes the pour.
+- **marju212 `6dad58a`:** allow it and list the pour nets in `zones_to_refill`; the caller runs
+  `refill_zones`. This is what KiCad's Update PCB does. Cost: the stored fill is wrong until refilled
+  (DRC may report a short); verified by the fork on a real board.
+- **Third option:** refill inside the same call. Not possible in plan (dry-run) mode, rewrites every
+  fill, and can take seconds.
+- **Second opinion (second reviewer, asked without a stated preference): option 2**, because a fill is derived
+  data that `refill_zones` regenerates, while a track is not. Conditions: report `zones_to_refill` in
+  the plan as well as after apply, as a warning naming the next action; collect zone nets separately
+  from track nets in `snapshot_board` (today one `routed_nets` count mixes them), so a track still
+  refuses and an unreadable zone still refuses; migration note; the tests asserting "not blocked"
+  name the states where blocking is right (Rule A).
+- **First opinion (this session):** option 2, with the same conditions. 2 models agree.

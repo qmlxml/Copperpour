@@ -1432,6 +1432,7 @@ pub fn tools() -> Vec<ToolDef> {
         super::board_stackup::tool(),
         super::footprint_fields::tool(),
     ];
+    tools.extend(super::pcb_components::footprint_text_tools());
     tools.extend(super::pcb_board_zones::tools());
     tools
 }

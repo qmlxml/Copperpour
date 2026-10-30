@@ -238,7 +238,7 @@ and Windows servers do not.
 ## PCB
 
 ### `pcb_board` · 18 tools
-**Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import, custom fields on placed footprints.
+**Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import, custom fields on placed footprints, footprint texts.
 **Source:** [`crates/copperpour-core/src/tools/pcb_board.rs`](crates/copperpour-core/src/tools/pcb_board.rs)
 
 | Tool | Description |
@@ -261,6 +261,8 @@ and Windows servers do not.
 | `delete_zone` | Delete exactly one zone UUID returned by `list_zones` using its matching source and revision. Live deletion uses one KiCad commit; it then requests refill, waits for readiness and verifies full readback. Saved-file deletion checks the same revision under the atomic document lock and verifies absence and preserved zone metadata. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 | `set_footprint_field` | Add or update a custom field (LCSC, MPN, …) on a placed footprint via KiCAD IPC. Refuses the mandatory fields; a new field is hidden by default and sits on the footprint's Fab layer. One undo step; the response is a fresh read-back. |
+| `list_board_footprint_texts` | List the texts of placed footprints — reference, value, custom fields and plain texts — with layer, absolute board and footprint-local position, angle, size and visibility. Requires KiCAD running with the board open. |
+| `move_footprint_texts` | Move, rotate, re-layer or hide footprint texts (reference designators, values, custom fields, plain texts) without moving the footprints: absolute, relative or footprint-local positions, checked first and sent as one undo step. Requires KiCAD running with the board open. |
 
 ### `pcb_components` · 20 tools
 **Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics and 3D models.
