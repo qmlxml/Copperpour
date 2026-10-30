@@ -29,7 +29,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 21 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 22 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -498,6 +498,17 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
 
 ---
+
+## Simulation
+
+### `simulation` · 1 tools
+
+**Purpose:** Simulate a schematic with KiCad's SPICE engine and check whether it is ready to run.
+**Source:** [`crates/konnect-core/src/tools/simulation.rs`](crates/konnect-core/src/tools/simulation.rs)
+
+| Tool | Description |
+|------|-------------|
+| `check_simulation_readiness` | Report whether a schematic can be simulated, and why not, without running a simulation. |
 
 ## Appendix: Structural observations
 
