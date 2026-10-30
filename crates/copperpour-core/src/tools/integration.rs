@@ -186,7 +186,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "plane_as_obstacle": { "type": "boolean", "description": "Whether copper pours block foreign traces (Freerouting's plane_as_obstacle, default false)." },
                     "router_settings": { "type": "object", "additionalProperties": true, "description": "Any Freerouting router setting, in its JSON shape, passed through as given; the named arguments above are merged on top and win. Groups: autorouter.{max_passes, max_threads, max_items, ignore_net_classes}, fanout.{enabled, max_passes, ripup_allowed, min_escape_length_mm, max_escape_length_mm, start_via_diameter_mm, end_via_diameter_mm, pin_sorting_order, fallback_to_board_vias}, optimizer.{enabled, max_passes, max_threads, improvement_threshold, enable_preflight_guards, max_consecutive_failures, max_autoroute_passes, trace_ripup_cost_factor}, scoring.{via_costs, plane_via_costs, start_ripup_costs, default_preferred_direction_trace_cost, default_undesired_direction_trace_cost, bend_penalty}, router_scoring.*, optimizer_scoring.*, and top level copper_to_edge_clearance_um, hole_clearance_um, clearance_tolerance_um, neck_width_um, automatic_neckdown, strict_drc, trace_pull_tight_accuracy, allowed_via_types, plane_nets, plane_as_obstacle, max_threads, layers. A setting Freerouting does not apply (unknown key, typo, value it replaced) is refused before routing starts, and named in the error. So is any negative number: no Freerouting setting means anything below zero." },
                     "optimize_seconds": { "type": "integer", "minimum": 0, "maximum": 86400, "description": "Once routing is complete and the optimizer has started (optimizer_enabled), let it run this many seconds, then keep the best board found so far and stop the job (final_state OPTIMIZATION_STOPPED). Detection reads Freerouting's log; without it the optimizer runs to its end." },
-                    "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
+                    "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "description": "Hard limit on the whole call, routing and optimizer together; the job is killed and nothing is kept when it is reached. Default 900, plus optimize_seconds when that is given. Set explicitly, it must exceed optimize_seconds, since the optimizer window only opens once routing is done." }
                 },
                 "required": ["dsn_path", "ses_output_path"]
             }),
@@ -3166,7 +3166,13 @@ async fn handle_route_specctra_dsn(
         .transpose()
         .map_err(|_| anyhow::anyhow!("max_passes is too large"))?;
     let job_timeout_seconds = args["job_timeout_seconds"].as_u64();
-    let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or(900);
+    // The optimizer window opens only once routing is done: a default that
+    // ignored it killed a run 900 s in, with the optimizer still inside the
+    // optimize_seconds it had been given.
+    let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or_else(|| {
+        let optimize = args["optimize_seconds"].as_u64().unwrap_or(0);
+        900u64.saturating_add(optimize).min(86_400)
+    });
     let settings = crate::freerouting_mcp::RouteSettings {
         max_passes,
         optimizer_enabled: args["optimizer_enabled"].as_bool(),

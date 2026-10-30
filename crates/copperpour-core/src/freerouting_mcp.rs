@@ -347,6 +347,15 @@ fn validate_inputs(
     {
         bail!("optimize_seconds must be between 0 and 86400");
     }
+    if let Some(seconds) = settings.optimize_seconds {
+        if settings.overall_timeout <= Duration::from_secs(seconds) {
+            bail!(
+                "overall_timeout_seconds ({}) must exceed optimize_seconds ({seconds}): routing \
+                 comes first, and the optimizer window opens only once it is done",
+                settings.overall_timeout.as_secs()
+            );
+        }
+    }
     if settings
         .optimizer_max_passes
         .is_some_and(|passes| !(1..=100).contains(&passes))
@@ -612,10 +621,19 @@ const LOG_TAIL_BYTES: u64 = 256 * 1024;
 /// Freerouting's own log, where each line of a job carries the first six hex
 /// digits of its id, upper-cased: `[A3AA32] Auto-routing pass #8 ... (4
 /// unrouted and 218 violations)`.
+///
+/// The log is read incrementally: an optimizer pass writes over a megabyte of
+/// DEBUG lines between two of the lines that matter, so any fixed tail of the
+/// file can hold none of them.
 struct JobProgress {
     tag: String,
     log: Option<PathBuf>,
+    /// How far the log has been read; `None` before the first read.
+    offset: Option<u64>,
+    /// The end of the last read when it stopped inside a line.
+    partial: String,
     activity: Option<String>,
+    unrouted: Option<u64>,
     last_message: String,
     last_sent: Option<Instant>,
     sent: u32,
@@ -629,7 +647,10 @@ impl JobProgress {
                 job_id.get(..6).unwrap_or(job_id).to_ascii_uppercase()
             ),
             log: freerouting_log_path(),
+            offset: None,
+            partial: String::new(),
             activity: None,
+            unrouted: None,
             last_message: String::new(),
             last_sent: None,
             sent: 0,
@@ -637,9 +658,7 @@ impl JobProgress {
     }
 
     fn report(&mut self, state: &str, details: &Value, started: Instant) {
-        if let Some(activity) = self.read_activity() {
-            self.activity = Some(activity);
-        }
+        self.read_log();
         let mut message = state.to_ascii_lowercase();
         match &self.activity {
             Some(activity) => message = format!("{message}, {activity}"),
@@ -690,14 +709,59 @@ impl JobProgress {
             .is_some_and(|activity| activity.starts_with("optimiz"))
     }
 
-    fn read_activity(&self) -> Option<String> {
-        let tail = read_tail(self.log.as_deref()?, LOG_TAIL_BYTES)?;
-        latest_activity(&tail, &self.tag)
+    /// The last unrouted count of the job, after reading what the log gained.
+    fn read_unrouted(&mut self) -> Option<u64> {
+        self.read_log();
+        self.unrouted
     }
 
-    fn read_unrouted(&self) -> Option<u64> {
-        let tail = read_tail(self.log.as_deref()?, LOG_TAIL_BYTES)?;
-        latest_unrouted(&tail, &self.tag)
+    /// Reads the lines the log gained since the last call and keeps the
+    /// latest activity and unrouted count found in them. The first read
+    /// starts `LOG_TAIL_BYTES` from the end: the job has only just started.
+    fn read_log(&mut self) {
+        use std::io::{Read, Seek, SeekFrom};
+        let Some(path) = self.log.as_deref() else {
+            return;
+        };
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return;
+        };
+        let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
+            return;
+        };
+        let start = match self.offset {
+            // Shorter than what was read: the log was replaced or truncated.
+            Some(offset) if offset <= len => offset,
+            _ => {
+                self.partial.clear();
+                len.saturating_sub(LOG_TAIL_BYTES)
+            }
+        };
+        let mut buffer = Vec::new();
+        if file.seek(SeekFrom::Start(start)).is_err()
+            || file.take(len - start).read_to_end(&mut buffer).is_err()
+        {
+            return;
+        }
+        self.offset = Some(len);
+        let mut text = std::mem::take(&mut self.partial);
+        text.push_str(&String::from_utf8_lossy(&buffer));
+        let complete = match text.rfind('\n') {
+            Some(end) => {
+                self.partial = text[end + 1..].to_string();
+                &text[..end]
+            }
+            None => {
+                self.partial = text;
+                return;
+            }
+        };
+        if let Some(activity) = latest_activity(complete, &self.tag) {
+            self.activity = Some(activity);
+        }
+        if let Some(unrouted) = latest_unrouted(complete, &self.tag) {
+            self.unrouted = Some(unrouted);
+        }
     }
 }
 
@@ -713,16 +777,6 @@ fn freerouting_log_path() -> Option<PathBuf> {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
         })?;
     Some(state.join("freerouting/logs/freerouting.log"))
-}
-
-fn read_tail(path: &Path, bytes: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(bytes))).ok()?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).ok()?;
-    Some(String::from_utf8_lossy(&buffer).into_owned())
 }
 
 /// The last unrouted-connection count logged for the job tagged `tag`: a pass
@@ -1416,6 +1470,53 @@ mod tests {
     }
 
     #[test]
+    fn the_log_is_read_incrementally_through_a_flood_of_debug_lines() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("freerouting.log");
+        let append = |text: &str| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap()
+        };
+        let mut progress = JobProgress::new("933480eb");
+        progress.log = Some(path.clone());
+
+        append("2026-10-30 00:56:24.082 INFO   [933480] Optimizer pass #3: optimizer score 119.14 -> 116.76 (REGRESSED, -1.9974%), router score: 979.51, incomplete connections: 0, clearance violations: 220.\n");
+        progress.read_log();
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 3: score 119.14 -> 116.76 (regressed)")
+        );
+
+        // An optimizer pass: 1.2 MB of DEBUG lines of the same job, more than
+        // any fixed tail, and nothing that says where the job stands.
+        let debug = "2026-10-30 00:58:00.000 DEBUG  [933480]   Net 'SCK2' has 4 incomplete(s)\n";
+        append(&debug.repeat(LOG_TAIL_BYTES as usize / debug.len() * 5));
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(0));
+
+        // A line cut in two by a read is only taken once complete.
+        append("2026-10-30 01:01:05.787 INFO   [933480] Optimizer pass #4: optimizer score 119.14 -> 119.14 (UNCHANGED, 0.0000%), router score: 979.51, incomplete ");
+        progress.read_log();
+        assert!(progress
+            .activity
+            .as_deref()
+            .unwrap()
+            .starts_with("optimizer pass 3"));
+        append("connections: 0, clearance violations: 220.\n");
+        assert_eq!(progress.read_unrouted(), Some(0));
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 4: score 119.14 -> 119.14 (unchanged)")
+        );
+    }
+
+    #[test]
     fn routing_activity_is_read_from_the_jobs_own_log_lines() {
         // Lines as Freerouting 2.5.0 writes them; [B00000] is another job.
         let log = "\
@@ -1517,6 +1618,30 @@ mod tests {
         );
 
         std::fs::remove_file(diagnostics_path(&ses)).unwrap();
+        // The 900 s overall default with optimize_seconds 1100 killed a run
+        // whose optimizer was still within its window.
+        let optimizer_outlives_the_call = RouteSettings {
+            optimize_seconds: Some(1100),
+            plane_nets: None,
+            router_settings: None,
+            ..settings
+        };
+        let error = validate_inputs(&jar, &dsn, &ses, &optimizer_outlives_the_call)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("overall_timeout_seconds (900) must exceed optimize_seconds (1100)"),
+            "{error}"
+        );
+        let room_for_both = RouteSettings {
+            optimize_seconds: Some(1100),
+            overall_timeout: Duration::from_secs(2000),
+            plane_nets: None,
+            router_settings: None,
+            ..settings
+        };
+        validate_inputs(&jar, &dsn, &ses, &room_for_both).unwrap();
+
         let too_long = RouteSettings {
             optimize_seconds: Some(86_401),
             optimizer_max_passes: None,
