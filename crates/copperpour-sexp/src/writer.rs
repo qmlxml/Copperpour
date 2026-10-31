@@ -114,6 +114,23 @@ pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), Se
     write_atomic_unlocked_with(path, content, || {}, ensure_closed_or_prepared_for_write)
 }
 
+/// [`write_atomic_unlocked`] for a caller that planned `content` from
+/// `planned_from`: the guard against a save made while preparing the editor
+/// then compares against that text, not against a fresh read.
+fn write_atomic_unlocked_planned(
+    path: &Path,
+    planned_from: &str,
+    content: &str,
+) -> Result<(), SexpError> {
+    write_atomic_unlocked_from(
+        path,
+        Some(planned_from.as_bytes().to_vec()),
+        content,
+        || {},
+        ensure_closed_or_prepared_for_write,
+    )
+}
+
 /// Make the document safe to replace, and refuse if doing so changed it.
 ///
 /// The live-editor hook saves the user's unsaved work in KiCad's Schematic
@@ -143,6 +160,16 @@ fn write_atomic_unlocked_with(
     prepare: impl Fn(&Path) -> Result<(), SexpError>,
 ) -> Result<(), SexpError> {
     let before = std::fs::read(path).ok();
+    write_atomic_unlocked_from(path, before, content, before_replace, prepare)
+}
+
+fn write_atomic_unlocked_from(
+    path: &Path,
+    before: Option<Vec<u8>>,
+    content: &str,
+    before_replace: impl FnOnce(),
+    prepare: impl Fn(&Path) -> Result<(), SexpError>,
+) -> Result<(), SexpError> {
     prepare_unchanged(path, &before, &prepare)?;
     let (tmp_path, mut file) = create_scratch_file(path)?;
 
@@ -188,7 +215,7 @@ pub fn write_atomic_if_unchanged(
         });
     }
 
-    write_atomic_unlocked(path, content)?;
+    write_atomic_unlocked_planned(path, expected, content)?;
     if std::fs::read_to_string(path)? != content {
         return Err(SexpError::Conflict {
             path: path.to_path_buf(),
@@ -208,7 +235,7 @@ pub fn transact_atomic<T>(
     let (next, result) = update(&current)?;
 
     if next != current {
-        write_atomic_unlocked(path, &next)?;
+        write_atomic_unlocked_planned(path, &current, &next)?;
         if std::fs::read_to_string(path)? != next {
             return Err(SexpError::Conflict {
                 path: path.to_path_buf(),
@@ -1851,6 +1878,31 @@ mod atomic_write_tests {
         write_atomic_unlocked_with(&path, "replacement", || {}, |_| Ok(())).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
+    }
+
+    /// A conditional write compares against the text the edit was planned
+    /// from, so a change made after that read is caught even if it happened
+    /// before the write started.
+    #[test]
+    fn a_conditional_write_compares_against_the_planned_from_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, "changed after planning").unwrap();
+
+        let error = write_atomic_unlocked_from(
+            &path,
+            Some(b"planned from".to_vec()),
+            "replacement",
+            || {},
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SexpError::Conflict { .. }), "{error:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "changed after planning"
+        );
     }
 
     /// The second check, just before the rename, must catch a save made

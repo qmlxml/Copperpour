@@ -67,3 +67,32 @@ other test in the process.
 
 Gate after fix pass 1 (`logs/gate-step3-fix1.summary`): 3,167 passed (+4), 1 failed (the known
 baseline failure), 60 ignored; clippy passes.
+Committed as `48d4d93`.
+
+## Review 2 (robustness) and fix pass 2
+
+Review 2 found ten problems, nearly all in the Windows-only code (the C# bridge and
+`live_editor.rs`), which cannot be compiled, run or tested on this machine. Two can lose design data
+without any error (the user's Ctrl+S before the reload overwrites the agent's write; a server exit or
+a reload that always fails leaves the editor stale with nothing reported). They are listed in
+`docs/LIVE_EDITOR.md`, "Known defects".
+
+**Owner ruling 2026-10-31** (both models recommended it): keep the merged code, make the feature
+opt-in, document the known defects next to the setting, finish the review cycle on the shared Rust
+parts, and record the Windows defects as deferred work. Options not chosen: fixing all ten without
+being able to compile or test them; removing step 3; pausing step 3 with the feature still on by
+default.
+
+Done:
+- `live_editor.rs` installs the hook only when `COPPERPOUR_LIVE_EDITOR` is `1`, `on` or `true` (it was
+  on whenever the bridge was found); the log says it is experimental. Not compiled here.
+- `docs/LIVE_EDITOR.md` says the feature is experimental and off by default and lists the ten known
+  defects. New `docs/BACKLOG.md` records them with a closing condition, together with the other work
+  deferred so far in this merge.
+- Finding 7 (shared Rust): the guard compared against a fresh read taken inside the write, not the
+  text the edit was planned from. `write_atomic_if_unchanged` and `transact_atomic` now pass the text
+  they planned from (`write_atomic_unlocked_planned`). Test
+  `a_conditional_write_compares_against_the_planned_from_text`.
+
+Gate after fix pass 2 (`logs/gate-step3-fix2.summary`): 3,168 passed (+1), 1 failed (the known
+baseline failure), 60 ignored.

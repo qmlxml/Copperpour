@@ -16,7 +16,8 @@
 //! 4. If the user edits in KiCad between a write and the reload, nothing is reverted: the next
 //!    write is refused with instructions, because only the user can choose whose edit wins.
 //!
-//! `COPPERPOUR_LIVE_EDITOR=0` restores the refusal. `COPPERPOUR_EDITOR_BRIDGE` overrides the
+//! Off unless `COPPERPOUR_LIVE_EDITOR=1` (owner ruling 2026-10-31: known defects that can lose
+//! design data are listed in docs/LIVE_EDITOR.md). `COPPERPOUR_EDITOR_BRIDGE` overrides the
 //! bridge path (default: `kicad-editor-bridge.exe` beside `copperpour.exe`). Each variable is
 //! also read under its `KONNECT_` name, as Copperpour's other variables are
 //! (`copperpour_core::app_dirs::env_var`). Windows only.
@@ -74,13 +75,19 @@ To keep Claude's edit, use File > Revert in KiCad. To keep yours, press Ctrl+S i
     }
 
     pub fn install() {
-        if matches!(
+        // Opt-in (owner ruling 2026-10-31): known defects that can lose design
+        // data are listed in docs/LIVE_EDITOR.md and docs/BACKLOG.md, and this
+        // module has not been built or tested on Windows since it was merged.
+        if !matches!(
             copperpour_core::app_dirs::env_var("LIVE_EDITOR")
                 .and_then(|value| value.into_string().ok())
                 .as_deref(),
-            Some("0") | Some("off") | Some("false")
+            Some("1") | Some("on") | Some("true")
         ) {
-            info!("live editor: disabled by COPPERPOUR_LIVE_EDITOR");
+            info!(
+                "live editor: off (experimental; set COPPERPOUR_LIVE_EDITOR=1 to enable, see \
+                 docs/LIVE_EDITOR.md for its known defects)"
+            );
             return;
         }
         let Some(bridge) = bridge_path() else {
@@ -113,7 +120,8 @@ To keep Claude's edit, use File > Revert in KiCad. To keep yours, press Ctrl+S i
             prepare(&sessions, &hook_bridge, path)
         })) {
             info!(
-                "live editor: enabled via {} (editor reloads {} ms after the last write)",
+                "live editor: EXPERIMENTAL, enabled via {} (editor reloads {} ms after the last \
+                 write); known defects can lose design data, see docs/LIVE_EDITOR.md",
                 bridge.display(),
                 debounce.as_millis()
             );

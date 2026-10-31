@@ -3,7 +3,40 @@
 Contributed by AryanSenthil (fork `AryanSenthil/Konnect`, branch `live-editor`, commit `97dbaa4`,
 2026-10-28), merged into this fork in plan step 3 (`docs/development/2026-10-31-00-Fork_Survey.md`).
 **Copperpour can edit a schematic while KiCad's Schematic Editor has it open**, on Windows, when the
-helper `kicad-editor-bridge.exe` is installed beside `copperpour.exe`.
+helper `kicad-editor-bridge.exe` is installed beside `copperpour.exe` **and `COPPERPOUR_LIVE_EDITOR=1`
+is set**.
+
+**Experimental, off by default** (owner ruling 2026-10-31). The defects listed under "Known defects"
+below can lose design data. They are in Windows-only code that has not been compiled or tested since
+the merge. Without `COPPERPOUR_LIVE_EDITOR=1`, Copperpour refuses schematic writes while the editor
+has the file open, as before.
+
+## Known defects (not fixed; recorded in `docs/BACKLOG.md`)
+
+Found by review 2 of plan step 3, from reading the code (not measured):
+
+1. **An agent's edit can be lost without any error.** If the user edits and presses Ctrl+S during the
+   1.5 s before the reload, KiCad saves its older content over the agent's write, and the next write
+   is allowed because the editor looks clean.
+2. **The editor can be left showing stale content with nothing reported.** If the server exits during
+   a burst, or the reload fails every time (menu item not found, repeated timeouts), the editor is
+   never reloaded; the reload is retried every 1.7 s with only a log warning, later writes still
+   succeed, and the user's next save overwrites the agent's edits.
+3. **The bridge may click a dialog that is not the Revert confirmation**: it takes the first new
+   window of KiCad's process, which can be a dialog the user opened at the same moment, or a tooltip.
+4. **Editor windows are matched by file name only** (two projects with `main.kicad_sch` collide; a
+   stale lock plus another project's editor of the same name lets the write through) and by English
+   window titles (a non-English KiCad is refused with a misleading "stale lock" message).
+5. **A conflict never expires**: after the user resolves it and no write follows, an ordinary unsaved
+   edit hours later is reported as a conflict whose advice (File > Revert) would discard it.
+6. **No timeout on the bridge process**; the reload thread holds the session lock while it reloads,
+   so a bridge that hangs blocks all schematic writes.
+7. A first write refused because the save changed the file still schedules a reload, which clears
+   KiCad's undo history.
+8. The bridge's JSON escaping does not cover carriage return or tab, and non-ASCII dialog titles are
+   garbled (console code page).
+9. Session keys fall back to the raw path spelling when the file cannot be canonicalised.
+10. If the session lock is poisoned, the reload thread stops without reporting it.
 
 ## Why the write is otherwise refused
 
