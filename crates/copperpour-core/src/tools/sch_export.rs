@@ -1086,7 +1086,7 @@ fn connectivity_write_refusal(path: &Path, error: &SexpError) -> Option<CallTool
         SexpError::KiCadEditorLocked { .. } => {
             return Some(stale_connectivity_target(
                 path.display().to_string(),
-                &copperpour_sexp::writer::schematic_lock_message(path),
+                copperpour_sexp::writer::schematic_lock_message(path),
             ));
         }
         _ => return None,

@@ -2464,7 +2464,7 @@ fn component_delete_commit_refusal(
             return Some(
                 ComponentDeleteTargetError::stale(
                     path,
-                    &copperpour_sexp::writer::schematic_lock_message(path),
+                    copperpour_sexp::writer::schematic_lock_message(path),
                 )
                 .into_result(),
             );
