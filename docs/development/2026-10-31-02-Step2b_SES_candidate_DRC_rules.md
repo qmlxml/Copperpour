@@ -50,3 +50,40 @@ migration note say it is not design acceptance. Tests:
 `routing_is_clean_when_rules_and_connectivity_were_checked_and_pass`,
 `routing_is_not_clean_when_connectivity_was_not_checked` (states why not acting is correct and
 when it would be wrong), `routing_is_not_clean_with_a_violation_or_an_unconnected_item`.
+
+Routing verdict committed as `59733ab`. Gate (`logs/gate-step2b-verdict.summary`): 3,148 passed
+(+3 routing tests), 1 failed (the known baseline failure), 59 ignored.
+
+## Review 1 (implementation) and fix pass 1
+
+1. **Project-local footprint libraries were not found by the candidate's DRC** (defect). Moving
+   the board into a temporary directory also moved `${KIPRJMOD}` and dropped the project's
+   `fp-lib-table`. Measured by the reviewer and reproduced here on kicad-cli 10.0.7: source in
+   place, 4 `copper_edge_clearance`; temporary copy, the same plus `lib_footprint_issues`;
+   copy with the table copied unchanged, still `lib_footprint_issues` ("not enabled"); copy
+   with `${KIPRJMOD}` expanded to the source directory, the same 4 as the source. Fixed:
+   `candidate_drc` writes the table with `${KIPRJMOD}` (and the legacy `$(KIPRJMOD)`) expanded
+   and lists it in `rules_applied`; `rules_source` stays `"project"` only when a `.kicad_pro`
+   or `.kicad_dru` was applied. New fixture `tests/fixtures/candidate_drc_project_lib` (with a
+   README recording the measurement) and ignored live test
+   `candidate_drc_live_finds_project_local_footprint_libraries`, which passes here. Control:
+   with the table copy disabled, the live test fails.
+2. **The parity diagnostic described a file in the temporary directory** under the candidate's
+   name, and contradicted the earlier advice to place a schematic beside the candidate.
+   Replaced with a fixed statement that parity is not checked for an SES candidate and why.
+3. **A relative candidate path rewrote diagnostics to the filesystem root.** The rewrite now
+   uses the candidate's canonical path. Not covered by a test: a relative path would require
+   changing the working directory of the test process, which other tests share.
+4. **`<candidate>.drc.json` was still checked for and deleted on rollback**, although DRC no
+   longer writes it. Both removed: an unrelated file of that name no longer blocks an import
+   and is never deleted by this tool.
+5. **The fake-cli test checked file names only.** It now checks the copied contents, that
+   `${KIPRJMOD}` was expanded, that the temporary directory was removed, and the exact parity
+   diagnostic.
+
+Checked by the reviewer and found correct: `runtime.block_on` of the async `candidate_drc`
+inside `spawn_blocking`; the temporary directory is dropped on every early return; ownership
+enrichment reads a byte-identical copy; `routing_clean` matches its documentation.
+
+Gate after fix pass 1 (`logs/gate-step2b-fix1.summary`): 3,148 passed, 1 failed (the known
+baseline failure), 60 ignored (+1: the library live test).

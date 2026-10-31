@@ -146,7 +146,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is not checked for the candidate and is reported as missing. For complete evidence, run run_drc on the source board with sync_live_board: true; note that this saves the live board over the source file, which this tool itself avoids. The candidate's DRC runs on a temporary copy beside the source project's .kicad_pro and .kicad_dru, so the project's rules apply; drc.rules_applied names them. drc.routing_clean is true when design-rule violations and unconnected items were both checked and are zero; it does not cover schematic parity, so it is not design acceptance.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is not checked for the candidate and is reported as missing. For complete evidence, run run_drc on the source board with sync_live_board: true; note that this saves the live board over the source file, which this tool itself avoids. The candidate's DRC runs on a temporary copy beside the source project's .kicad_pro, .kicad_dru and fp-lib-table (with ${KIPRJMOD} expanded), so the project's rules and footprint libraries apply; drc.rules_applied names the files used. drc.routing_clean is true when design-rule violations and unconnected items were both checked and are zero; it does not cover schematic parity, so it is not design acceptance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -978,7 +978,8 @@ struct ApplyEvidence {
 /// rule files.
 #[derive(Debug, Clone, PartialEq)]
 struct CandidateRules {
-    /// The source project's rule files that were applied to the candidate.
+    /// The source project's files that were applied to the candidate:
+    /// `.kicad_pro`, `.kicad_dru` and `fp-lib-table`, those that exist.
     /// Empty when the source project has none, in which case kicad-cli's
     /// defaults are also what the source board itself is checked with.
     applied: Vec<std::path::PathBuf>,
@@ -989,10 +990,23 @@ struct CandidateRules {
 /// The candidate is copied into a temporary directory together with the
 /// source's `.kicad_pro` and `.kicad_dru`, renamed to the candidate's stem,
 /// so the user's directory gains no project files. The temporary directory
-/// is removed when this returns. Diagnostics that name the temporary copy
-/// are rewritten to name the candidate. Schematic parity stays unchecked:
-/// no `<candidate stem>.kicad_sch` is placed beside the copy, because a
-/// root schematic copied alone would lose its hierarchical sheets.
+/// is removed when this returns.
+///
+/// The project's `fp-lib-table` is copied too, with `${KIPRJMOD}` replaced by
+/// the source project's directory. Without it kicad-cli's footprint-library
+/// checks fail for project-local libraries; copying it unchanged is not
+/// enough, because `${KIPRJMOD}` would then name the temporary directory.
+/// Measured on kicad-cli 10.0.7 with the fixture
+/// tests/fixtures/candidate_drc_project_lib: source in place, 4
+/// `copper_edge_clearance`; copy without the table, the same plus
+/// `lib_footprint_issues`; copy with the expanded table, the same 4 as the
+/// source.
+///
+/// Schematic parity stays unchecked: no `<candidate stem>.kicad_sch` is
+/// placed beside the copy, because a root schematic copied alone would lose
+/// its hierarchical sheets. The parity diagnostic says so instead of
+/// describing a file in the temporary directory. Other diagnostics that name
+/// the temporary copy are rewritten to name the candidate.
 async fn candidate_drc(
     cli_path: &str,
     candidate: &Path,
@@ -1016,17 +1030,40 @@ async fn candidate_drc(
             applied.push(rules);
         }
     }
+    let source_dir = source
+        .parent()
+        .context("the source board path names no directory")?;
+    let library_table = source_dir.join("fp-lib-table");
+    if library_table.is_file() {
+        let text = tokio::fs::read_to_string(&library_table)
+            .await
+            .with_context(|| format!("read {}", library_table.display()))?;
+        let project_dir = source_dir.display().to_string();
+        let expanded = text
+            .replace("${KIPRJMOD}", &project_dir)
+            .replace("$(KIPRJMOD)", &project_dir);
+        tokio::fs::write(dir.path().join("fp-lib-table"), expanded)
+            .await
+            .context("write the footprint library table for the candidate's DRC")?;
+        applied.push(library_table);
+    }
     let mut report = cli::run_drc(cli_path, &copy, false).await?;
-    if let Some(candidate_dir) = candidate.parent() {
+    if report.schematic_parity.is_none() {
+        report.schematic_parity_diagnostic = Some(
+            "schematic parity is not checked for an SES candidate: its DRC runs on a temporary \
+             copy with no schematic beside it, because a root schematic copied alone would lose \
+             its hierarchical sheets"
+                .to_string(),
+        );
+    }
+    let candidate_dir = tokio::fs::canonicalize(candidate)
+        .await
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    if let Some(candidate_dir) = candidate_dir {
         let from = dir.path().display().to_string();
         let to = candidate_dir.display().to_string();
-        for diagnostic in [
-            &mut report.schematic_parity_diagnostic,
-            &mut report.ownership_diagnostic,
-        ]
-        .into_iter()
-        .flatten()
-        {
+        if let Some(diagnostic) = report.ownership_diagnostic.as_mut() {
             *diagnostic = diagnostic.replace(&from, &to);
         }
     }
@@ -1057,7 +1094,14 @@ fn specctra_drc_evidence(report: &cli::DrcReport, rules: &CandidateRules) -> ser
         "routing_clean": report.violations.is_empty()
             && report.unconnected_items.as_ref().is_some_and(Vec::is_empty),
         "routing_clean_excludes": ["schematic_parity"],
-        "rules_source": if rules.applied.is_empty() { "kicad_defaults" } else { "project" },
+        "rules_source": if rules.applied.iter().any(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "kicad_pro" || extension == "kicad_dru")
+        }) {
+            "project"
+        } else {
+            "kicad_defaults"
+        },
         "rules_applied": rules_applied,
         "violations": report.violations.len(),
         "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
@@ -1116,8 +1160,9 @@ async fn handle_apply_specctra_ses(
             "must have the .kicad_pcb extension",
         ));
     }
-    let drc_output = candidate.with_extension("drc.json");
-    let conflicts = [&candidate, &drc_output]
+    // The candidate's DRC runs on a temporary copy (`candidate_drc`), so no
+    // `<candidate>.drc.json` is written beside it and none is checked here.
+    let conflicts = [&candidate]
         .into_iter()
         .filter(|path| path.exists())
         .map(|path| path.display().to_string())
@@ -1149,7 +1194,6 @@ async fn handle_apply_specctra_ses(
     let board_for_ipc = board.clone();
     let candidate_for_ipc = candidate.clone();
     let source_for_rules = board.clone();
-    let drc_output_for_ipc = drc_output.clone();
     let cli_path = ctx.config.kicad_cli.clone();
     let runtime = tokio::runtime::Handle::current();
 
@@ -1328,14 +1372,6 @@ async fn handle_apply_specctra_ses(
                         format!(
                             "SES import failed ({error}); also failed to remove candidate {}",
                             candidate_for_ipc.display()
-                        )
-                    })?;
-                }
-                if drc_output_for_ipc.exists() {
-                    std::fs::remove_file(&drc_output_for_ipc).with_context(|| {
-                        format!(
-                            "SES import failed ({error}); also failed to remove DRC output {}",
-                            drc_output_for_ipc.display()
                         )
                     })?;
                 }
@@ -2928,7 +2964,9 @@ mod specctra_drc_evidence_tests {
     }
 
     /// The candidate's DRC must see the source project's rule files under the
-    /// candidate's stem, and must leave nothing in the candidate's directory.
+    /// candidate's stem and its footprint library table with `${KIPRJMOD}`
+    /// expanded, must leave nothing in the candidate's directory, and must
+    /// remove its temporary directory.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_candidates_drc_runs_beside_the_source_projects_rule_files() {
@@ -2941,8 +2979,17 @@ mod specctra_drc_evidence_tests {
         }
         let source = project.join("amp.kicad_pcb");
         std::fs::write(&source, "(kicad_pcb)").unwrap();
-        std::fs::write(source.with_extension("kicad_pro"), "{}").unwrap();
-        std::fs::write(source.with_extension("kicad_dru"), "(version 1)").unwrap();
+        std::fs::write(source.with_extension("kicad_pro"), "{\"source\": \"pro\"}").unwrap();
+        std::fs::write(
+            source.with_extension("kicad_dru"),
+            "(version 1) ; source dru",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"mylib\")(uri \"${KIPRJMOD}/mylib.pretty\")))",
+        )
+        .unwrap();
         let candidate = out.join("amp.routed.kicad_pcb");
         std::fs::write(&candidate, "(kicad_pcb)").unwrap();
         let report = tools.join("report.json");
@@ -2952,17 +2999,22 @@ mod specctra_drc_evidence_tests {
         )
         .unwrap();
         let observed = tools.join("observed");
-        // The board is kicad-cli's last argument; record what sits beside it.
+        // The board is kicad-cli's last argument; record its directory, what
+        // sits beside it, and the contents of the copied project files.
+        let script = format!(
+            "#!/bin/sh\nfor last; do :; done\nd=\"$(dirname \"$last\")\"\n\
+             echo \"$d\" > \"{o}.dir\"\nls \"$d\" > \"{o}\"\n\
+             cat \"$d/amp.routed.kicad_pro\" \"$d/amp.routed.kicad_dru\" \"$d/fp-lib-table\" \
+             > \"{o}.contents\"\n\
+             while [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    \
+             shift\n    cp \"{r}\" \"$1\"\n  fi\n  shift\ndone\nexit 0\n",
+            o = observed.display(),
+            r = report.display()
+        );
         let cli = crate::tools::cli::test_support::write_script(
             &tools,
             "fake-kicad-cli",
-            &format!(
-                "#!/bin/sh\nfor last; do :; done\nls \"$(dirname \"$last\")\" > \"{}\"\n\
-                 while [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    \
-                 shift\n    cp \"{}\" \"$1\"\n  fi\n  shift\ndone\nexit 0\n",
-                observed.display(),
-                report.display()
-            ),
+            &script,
             "@echo off\r\nexit /b 1\r\n",
         );
 
@@ -2974,19 +3026,88 @@ mod specctra_drc_evidence_tests {
         assert!(beside.contains("amp.routed.kicad_pcb"), "{beside}");
         assert!(beside.contains("amp.routed.kicad_pro"), "{beside}");
         assert!(beside.contains("amp.routed.kicad_dru"), "{beside}");
+        assert!(beside.contains("fp-lib-table"), "{beside}");
         assert_eq!(
             rules.applied,
             [
                 source.with_extension("kicad_pro"),
-                source.with_extension("kicad_dru")
+                source.with_extension("kicad_dru"),
+                project.join("fp-lib-table"),
             ]
+        );
+        let contents = std::fs::read_to_string(observed.with_extension("contents")).unwrap();
+        assert!(contents.contains("\"source\": \"pro\""), "{contents}");
+        assert!(contents.contains("; source dru"), "{contents}");
+        assert!(
+            contents.contains(&format!("{}/mylib.pretty", project.display())),
+            "KIPRJMOD must name the source project's directory: {contents}"
+        );
+        assert!(!contents.contains("KIPRJMOD"), "{contents}");
+        let checked_in = std::fs::read_to_string(observed.with_extension("dir")).unwrap();
+        assert!(
+            !Path::new(checked_in.trim()).exists(),
+            "the temporary directory is removed"
         );
         let left: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
         assert_eq!(left.len(), 1, "only the candidate remains in its directory");
-        // Parity has no root beside the copy; the diagnostic names the
-        // candidate's directory, not the deleted temporary one.
-        let reason = drc.schematic_parity_diagnostic.as_deref().unwrap();
-        assert!(reason.contains(&out.display().to_string()), "{reason}");
+        assert_eq!(
+            drc.schematic_parity_diagnostic.as_deref(),
+            Some(
+                "schematic parity is not checked for an SES candidate: its DRC runs on a \
+                 temporary copy with no schematic beside it, because a root schematic copied \
+                 alone would lose its hierarchical sheets"
+            )
+        );
+    }
+
+    /// Live check of the footprint library table: a project-local library
+    /// (`${KIPRJMOD}/mylib.pretty`) must still be found when the candidate is
+    /// checked as a temporary copy. Control: the copy checked without the
+    /// table reports `lib_footprint_issues`. Fixture and measurement:
+    /// tests/fixtures/candidate_drc_project_lib.README.md.
+    ///
+    ///     KICAD_CLI=/usr/bin/kicad-cli cargo test -p copperpour-core --lib \
+    ///         candidate_drc_live -- --ignored
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli (measured on 10.0.7)"]
+    async fn candidate_drc_live_finds_project_local_footprint_libraries() {
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/candidate_drc_project_lib");
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join("mylib.pretty")).unwrap();
+        for name in ["amp.kicad_pcb", "amp.kicad_pro", "fp-lib-table"] {
+            std::fs::copy(fixture.join(name), project.join(name)).unwrap();
+        }
+        let footprint = "PinSocket_1x04_P2.54mm_Vertical_SMD_low_profile_Pin1Left.kicad_mod";
+        std::fs::copy(
+            fixture.join("mylib.pretty").join(footprint),
+            project.join("mylib.pretty").join(footprint),
+        )
+        .unwrap();
+        let source = project.join("amp.kicad_pcb");
+        let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let candidate = out.join("amp.routed.kicad_pcb");
+        std::fs::copy(&source, &candidate).unwrap();
+
+        let in_place = cli::run_drc(&cli, &source, false).await.unwrap();
+        let rules_of = |report: &cli::DrcReport| {
+            let mut rules: Vec<_> = report.violations.iter().map(|v| v.rule.clone()).collect();
+            rules.sort();
+            rules
+        };
+        let alone = cli::run_drc(&cli, &candidate, false).await.unwrap();
+        assert!(
+            alone
+                .violations
+                .iter()
+                .any(|v| v.rule == "lib_footprint_issues"),
+            "control: a copy without the library table cannot find mylib"
+        );
+        let (drc, _) = candidate_drc(&cli, &candidate, &source).await.unwrap();
+        assert_eq!(rules_of(&drc), rules_of(&in_place));
     }
 
     /// Live check against a real kicad-cli on the fixture measured by

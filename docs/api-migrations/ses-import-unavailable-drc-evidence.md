@@ -14,10 +14,15 @@ The candidate's DRC now runs with the source project's rules. Previously
 kicad-cli checked the candidate with its default severities, clearances and
 net classes, because the candidate is a new file with no project file of its
 own name. It is now checked as a temporary copy beside the source's
-`.kicad_pro` and `.kicad_dru`, renamed to the candidate's stem; the candidate's
-directory gains no files. `rules_source` is `"project"` when either file was
-applied and `"kicad_defaults"` when the source project has neither, and
-`rules_applied` lists the source files used. Violation counts can differ from
+`.kicad_pro` and `.kicad_dru`, renamed to the candidate's stem, and the
+project's `fp-lib-table` with `${KIPRJMOD}` replaced by the source project's
+directory, so project-local footprint libraries are still found. The
+candidate's directory gains no files, and an existing `<candidate>.drc.json`
+no longer blocks the import. `rules_source` is `"project"` when a
+`.kicad_pro` or `.kicad_dru` was applied and `"kicad_defaults"` when the
+source project has neither, and `rules_applied` lists the source files used.
+The parity diagnostic now says that parity is not checked for an SES
+candidate. Violation counts can differ from
 earlier releases for the same board.
 
 `clean` is false for every import, because parity is not checked for the
