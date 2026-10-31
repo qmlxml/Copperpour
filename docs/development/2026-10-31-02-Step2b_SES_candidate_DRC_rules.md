@@ -167,3 +167,19 @@ Put to the owner (see the rulings below):
 
 Gate after fix pass 3 (`logs/gate-step2b-fix3.summary`): 3,155 passed (+3), 1 failed (the known
 baseline failure), 60 ignored.
+
+### Ruling on finding 1 (owner, 2026-10-31): keep the import when only the check failed, and add a re-check
+
+Both models recommended option C; the owner chose it. To implement:
+- Roll back only for failures that say something about the import: IPC read-back mismatch and
+  candidate write failure. A failure of the DRC setup or run (temporary directory, copy,
+  kicad-cli crash or timeout, kicad-cli unable to load the candidate) keeps the import and the
+  candidate. The candidate is KiCad's own saved output, verified by read-back, so a load failure
+  is treated as a check failure.
+- Report such a failure as `drc.status: "not_run"` with the reason, `clean` and `routing_clean`
+  false and every category missing, and show the not-run state at the top level of the response
+  so a caller reading only `success` sees it.
+- The distinction must be typed (which step failed), not inferred from error text.
+- Add a way to re-check an existing candidate with the source project's rules (reusing
+  `candidate_drc`). The tool description must say that a board on which kicad-cli always
+  exceeds its 600 s limit will time out again.
