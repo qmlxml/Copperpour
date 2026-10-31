@@ -192,3 +192,30 @@ is one the import created (`created_ids`), otherwise `preexisting`. Add `import_
 introduced findings, and unconnected items checked and zero); keep `routing_clean` as the
 whole-board verdict. No second DRC run. Assumption to verify in a live run with the KiCad
 editor: the item IDs KiCad returns over IPC are the UUIDs it writes into the saved candidate.
+
+### Implementation of the two rulings
+
+- **Finding 1 ruling.** `ApplyEvidence.drc` is now `Result<(DrcReport, CandidateRules), String>`:
+  everything up to and including writing the candidate is still inside the closure whose error
+  rolls the import back; the `candidate_drc` result is captured instead of propagated. The
+  response gains `drc_status` (`"checked"` or `"not_run"`) and a top-level `warning` when the
+  check did not run; the `drc` object is then `drc_not_run_evidence` (status, reason, every
+  verdict false, every category missing). New tool `check_specctra_candidate` re-checks an
+  existing candidate with the source project's rules. It is registered in the `verification`
+  toolset, not `pcb_routing`: `pcb_routing` already had 20 tools, and Copperpour's test
+  `no_toolset_exceeds_max_size` (limit 20) says to split a toolset rather than raise the limit.
+  Migration notes updated and `docs/api-migrations/check-specctra-candidate.md` added.
+- **Finding 3 ruling.** `specctra_drc_evidence` takes the created item IDs; a finding is
+  introduced when any item it names has one of those IDs (compared without regard to case).
+  New fields `introduced_violations`, `preexisting_violations`, `import_clean`; they are
+  `null` from `check_specctra_candidate`, which does not know the created items.
+- **Not testable here:** the keep-the-import path inside `apply_specctra_ses`, and the
+  assumption that IPC KIIDs equal the saved UUIDs, need a running KiCad editor. Assertions for
+  both were added to Copperpour's existing live test (`specctra_live_undo_test`, needs KiCad and
+  Freerouting). Unit tests added: `findings_are_split_by_whether_they_name_an_item_the_import_created`,
+  `import_clean_requires_connectivity_to_have_been_checked`,
+  `without_the_created_items_the_split_is_unknown_not_zero`,
+  `a_check_that_did_not_run_passes_nothing`,
+  `check_specctra_candidate_reports_the_candidates_drc_or_why_it_did_not_run`.
+- Gate (`logs/gate-step2b-rulings.summary`): 3,160 passed (+5), 1 failed (the known baseline
+  failure), 60 ignored. A first run failed `no_toolset_exceeds_max_size` until the tool moved.

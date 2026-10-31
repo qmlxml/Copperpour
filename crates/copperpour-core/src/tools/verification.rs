@@ -30,6 +30,19 @@ use tokio::task;
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
+            "check_specctra_candidate",
+            "Run KiCad DRC on an existing apply_specctra_ses candidate .kicad_pcb with the source project's rules: the candidate is checked as a temporary copy beside the source project's .kicad_pro, .kicad_dru and fp-lib-table (with ${KIPRJMOD} expanded); neither file is modified. Use it when apply_specctra_ses reported drc_status not_run. Returns the same drc object as apply_specctra_ses, except that import_clean, introduced_violations and preexisting_violations are null: which items the import created is not known after the fact. A board on which kicad-cli exceeds its 600 s limit will time out again.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Source .kicad_pcb whose project rules apply (the board given to apply_specctra_ses)" },
+                    "candidate_output_path": { "type": "string", "description": "Candidate .kicad_pcb written by apply_specctra_ses" }
+                },
+                "required": ["board", "candidate_output_path"]
+            }),
+            |args, ctx| async move { crate::tools::pcb_routing::handle_check_specctra_candidate(args, ctx).await }
+        ),
+        tool!(
             "run_drc",
             "Run the Design Rule Check on the PCB and return structured violation results, \
              with separate error and warning counts in the summary. Prefer this over \

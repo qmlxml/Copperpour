@@ -146,7 +146,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is not checked for the candidate and is reported as missing. For complete evidence, run run_drc on the source board with sync_live_board: true; note that this saves the live board over the source file, which this tool itself avoids. The candidate's DRC runs on a temporary copy beside the source project's .kicad_pro, .kicad_dru and fp-lib-table (with ${KIPRJMOD} expanded), so the project's rules and footprint libraries apply; drc.rules_applied names the files used. drc.routing_clean is true when design-rule violations and unconnected items were both checked and are zero; it does not cover schematic parity, so it is not design acceptance.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is not checked for the candidate and is reported as missing. For complete evidence, run run_drc on the source board with sync_live_board: true; note that this saves the live board over the source file, which this tool itself avoids. The candidate's DRC runs on a temporary copy beside the source project's .kicad_pro, .kicad_dru and fp-lib-table (with ${KIPRJMOD} expanded), so the project's rules and footprint libraries apply; drc.rules_applied names the files used. drc.routing_clean is true when design-rule violations and unconnected items were both checked and are zero; it does not cover schematic parity, so it is not design acceptance. Findings are split into drc.introduced_violations (naming an item the import created) and drc.preexisting_violations; drc.import_clean is true when none was introduced and connectivity was checked and is zero. If the DRC itself cannot run (kicad-cli failure or timeout), the verified import is kept, drc_status is not_run with the reason, and check_specctra_candidate can check the candidate later.",
             json!({
                 "type": "object",
                 "properties": {
@@ -961,8 +961,12 @@ struct ApplyEvidence {
     created_count: usize,
     preserved_locked_track_count: usize,
     preserved_locked_via_count: usize,
-    drc: cli::DrcReport,
-    rules: CandidateRules,
+    /// The candidate's DRC, or why it could not run. A failure of the check
+    /// itself keeps the verified import (owner ruling 2026-10-31): it says
+    /// nothing about the routing, and rolling back would make a board on
+    /// which kicad-cli always fails impossible to import.
+    drc: Result<(cli::DrcReport, CandidateRules), String>,
+    created_ids: Vec<String>,
 }
 
 /// Which DRC rules kicad-cli applied to the candidate board.
@@ -1146,6 +1150,20 @@ async fn candidate_drc(
     ))
 }
 
+/// DRC evidence when the candidate's check could not run: every category is
+/// missing and no verdict is true.
+fn drc_not_run_evidence(reason: &str) -> serde_json::Value {
+    json!({
+        "status": "not_run",
+        "reason": reason,
+        "clean": false,
+        "complete": false,
+        "routing_clean": false,
+        "import_clean": false,
+        "missing_categories": ["violations", "unconnected_items", "schematic_parity"]
+    })
+}
+
 /// Keep unavailable DRC categories distinct from checked zero findings.
 /// Import completion describes the mutation; a clean verdict additionally
 /// requires every DRC category to have been evaluated.
@@ -1156,7 +1174,40 @@ async fn candidate_drc(
 /// design-rule violations and unconnected items were both checked and both
 /// are zero. It is false when the unconnected-items category is missing.
 /// `routing_clean_excludes` names what it does not cover.
-fn specctra_drc_evidence(report: &cli::DrcReport, rules: &CandidateRules) -> serde_json::Value {
+fn specctra_drc_evidence(
+    report: &cli::DrcReport,
+    rules: &CandidateRules,
+    created: Option<&[String]>,
+) -> serde_json::Value {
+    let (introduced, preexisting, import_clean) = match created {
+        Some(created) => {
+            let created: std::collections::HashSet<String> =
+                created.iter().map(|id| id.to_ascii_lowercase()).collect();
+            let introduced = report
+                .violations
+                .iter()
+                .filter(|violation| {
+                    violation.items.iter().any(|item| {
+                        item.uuid
+                            .as_deref()
+                            .is_some_and(|uuid| created.contains(&uuid.to_ascii_lowercase()))
+                    })
+                })
+                .count();
+            let clean =
+                introduced == 0 && report.unconnected_items.as_ref().is_some_and(Vec::is_empty);
+            (
+                json!(introduced),
+                json!(report.violations.len() - introduced),
+                json!(clean),
+            )
+        }
+        None => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
+    };
     let mut missing_categories = report.missing_categories();
     if rules.library_diagnostic.is_some() {
         missing_categories.push("footprint_library");
@@ -1173,6 +1224,9 @@ fn specctra_drc_evidence(report: &cli::DrcReport, rules: &CandidateRules) -> ser
         "routing_clean": report.violations.is_empty()
             && report.unconnected_items.as_ref().is_some_and(Vec::is_empty),
         "routing_clean_excludes": ["schematic_parity"],
+        "introduced_violations": introduced,
+        "preexisting_violations": preexisting,
+        "import_clean": import_clean,
         "rules_source": if rules.applied.iter().any(|path| {
             path.extension()
                 .is_some_and(|extension| extension == "kicad_pro" || extension == "kicad_dru")
@@ -1413,11 +1467,16 @@ async fn handle_apply_specctra_ses(
             let candidate_source = client.save_document_to_string_in(document.clone())?;
             copperpour_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
-            let (drc, rules) = runtime.block_on(candidate_drc(
-                &cli_path,
-                &candidate_for_ipc,
-                &source_for_rules,
-            ))?;
+            // Everything above says something about the import, and a
+            // failure rolls it back. A failure from here on is a failure of
+            // the check, and keeps the import.
+            let drc = runtime
+                .block_on(candidate_drc(
+                    &cli_path,
+                    &candidate_for_ipc,
+                    &source_for_rules,
+                ))
+                .map_err(|error| format!("{error:#}"));
             Ok(ApplyEvidence {
                 source_sha256: plan.source_sha256.clone(),
                 session_id: plan.session_id.clone(),
@@ -1428,7 +1487,7 @@ async fn handle_apply_specctra_ses(
                 preserved_locked_track_count: plan.locked_track_count,
                 preserved_locked_via_count: plan.locked_via_count,
                 drc,
-                rules,
+                created_ids: created_ids.clone(),
             })
         })();
         match operation {
@@ -1481,7 +1540,15 @@ async fn handle_apply_specctra_ses(
                 "vias": evidence.preserved_locked_via_count
             },
             "ipc_readback": "exact_count_match",
-            "drc": specctra_drc_evidence(&evidence.drc, &evidence.rules)
+            "drc_status": if evidence.drc.is_ok() { "checked" } else { "not_run" },
+            "warning": evidence.drc.as_ref().err().map(|reason| format!(
+                "the routing was imported and verified by IPC read-back, but its DRC did not run \
+                 ({reason}); run check_specctra_candidate to check the candidate"
+            )),
+            "drc": match &evidence.drc {
+                Ok((report, rules)) => specctra_drc_evidence(report, rules, Some(&evidence.created_ids)),
+                Err(reason) => drc_not_run_evidence(reason),
+            }
         }))),
         Err(failure) => {
             let reason = failure.message().to_string();
@@ -1492,6 +1559,51 @@ async fn handle_apply_specctra_ses(
                 format!("Specctra SES import refused or rolled back: {reason}"),
             ))
         }
+    }
+}
+
+/// Re-check an existing SES candidate with the source project's rules: the
+/// way out when `apply_specctra_ses` kept an import whose DRC did not run
+/// (owner ruling 2026-10-31). Registered in the `verification` toolset,
+/// because `pcb_routing` is at Copperpour's limit of 20 tools per toolset.
+pub(crate) async fn handle_check_specctra_candidate(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let candidate = get_path(args, "candidate_output_path")?;
+    for (name, path) in [("board", &board), ("candidate_output_path", &candidate)] {
+        if !extension_is(path, "kicad_pcb") {
+            return Ok(invalid_specctra_argument(
+                name,
+                "must have the .kicad_pcb extension",
+            ));
+        }
+        if !path.is_file() {
+            return Ok(invalid_specctra_argument(
+                name,
+                "must name an existing file",
+            ));
+        }
+    }
+    let board = board
+        .canonicalize()
+        .with_context(|| format!("resolve board {}", board.display()))?;
+    match candidate_drc(&ctx.config.kicad_cli, &candidate, &board).await {
+        Ok((report, rules)) => Ok(CallToolResult::json(&json!({
+            "success": true,
+            "board": board,
+            "candidate_output_path": candidate,
+            "drc_status": "checked",
+            "drc": specctra_drc_evidence(&report, &rules, None)
+        }))),
+        Err(error) => Ok(CallToolResult::json(&json!({
+            "success": false,
+            "board": board,
+            "candidate_output_path": candidate,
+            "drc_status": "not_run",
+            "drc": drc_not_run_evidence(&format!("{error:#}"))
+        }))),
     }
 }
 
@@ -3013,6 +3125,18 @@ async fn handle_route_diff_pair(
 #[cfg(test)]
 mod specctra_drc_evidence_tests {
     use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn response_json(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str(text).expect("handler returned JSON text")
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
 
     /// Rules as they are when the source project has a project file.
     fn project_rules() -> CandidateRules {
@@ -3025,7 +3149,7 @@ mod specctra_drc_evidence_tests {
 
     #[test]
     fn applied_project_rules_are_named_in_the_evidence() {
-        let evidence = specctra_drc_evidence(&checked_zero(), &project_rules());
+        let evidence = specctra_drc_evidence(&checked_zero(), &project_rules(), None);
         assert_eq!(evidence["rules_source"], "project");
         assert_eq!(evidence["rules_applied"], json!(["/project/amp.kicad_pro"]));
         assert_eq!(evidence["complete"], true);
@@ -3042,6 +3166,7 @@ mod specctra_drc_evidence_tests {
                 library_diagnostic: None,
                 connectivity_diagnostic: None,
             },
+            None,
         );
         assert_eq!(evidence["rules_source"], "kicad_defaults");
         assert_eq!(evidence["rules_applied"], json!([]));
@@ -3209,7 +3334,7 @@ mod specctra_drc_evidence_tests {
         assert!(reason.contains("double quote"), "{reason}");
         let beside = std::fs::read_to_string(&observed).unwrap();
         assert!(!beside.contains("fp-lib-table"), "{beside}");
-        let evidence = specctra_drc_evidence(&checked_zero(), &rules);
+        let evidence = specctra_drc_evidence(&checked_zero(), &rules, None);
         assert_eq!(evidence["library_diagnostic"], reason);
     }
 
@@ -3306,7 +3431,7 @@ mod specctra_drc_evidence_tests {
             .await
             .unwrap();
         assert!(drc.unconnected_items.is_none());
-        let evidence = specctra_drc_evidence(&drc, &rules);
+        let evidence = specctra_drc_evidence(&drc, &rules, None);
         assert_eq!(evidence["routing_clean"], false);
         assert!(evidence["missing_categories"]
             .as_array()
@@ -3325,9 +3450,154 @@ mod specctra_drc_evidence_tests {
             library_diagnostic: Some("not applied".into()),
             connectivity_diagnostic: None,
         };
-        let evidence = specctra_drc_evidence(&checked_zero(), &rules);
+        let evidence = specctra_drc_evidence(&checked_zero(), &rules, None);
         assert_eq!(evidence["complete"], false);
         assert_eq!(evidence["missing_categories"], json!(["footprint_library"]));
+    }
+
+    fn finding_naming(uuid: &str) -> cli::DrcViolation {
+        let mut finding = one_finding().remove(0);
+        finding.items = vec![serde_json::from_value(json!({
+            "description": "Track",
+            "pos": null,
+            "uuid": uuid
+        }))
+        .unwrap()];
+        finding
+    }
+
+    #[test]
+    fn findings_are_split_by_whether_they_name_an_item_the_import_created() {
+        let created = vec!["AAAA-1".to_string()];
+        let mut report = checked_zero();
+        report.violations = vec![finding_naming("aaaa-1"), finding_naming("bbbb-2")];
+        let evidence = specctra_drc_evidence(&report, &project_rules(), Some(&created));
+        assert_eq!(evidence["introduced_violations"], 1);
+        assert_eq!(evidence["preexisting_violations"], 1);
+        assert_eq!(evidence["import_clean"], false);
+        assert_eq!(evidence["routing_clean"], false);
+
+        report.violations = vec![finding_naming("bbbb-2")];
+        let evidence = specctra_drc_evidence(&report, &project_rules(), Some(&created));
+        assert_eq!(evidence["introduced_violations"], 0);
+        assert_eq!(evidence["preexisting_violations"], 1);
+        assert_eq!(
+            evidence["import_clean"], true,
+            "only an older finding remains"
+        );
+        assert_eq!(
+            evidence["routing_clean"], false,
+            "the whole board is not clean"
+        );
+    }
+
+    /// import_clean false with no introduced findings is correct only when
+    /// connectivity was not checked; with it checked and empty, the test
+    /// above shows import_clean true.
+    #[test]
+    fn import_clean_requires_connectivity_to_have_been_checked() {
+        let created = vec!["aaaa-1".to_string()];
+        let mut report = checked_zero();
+        report.unconnected_items = None;
+        let evidence = specctra_drc_evidence(&report, &project_rules(), Some(&created));
+        assert_eq!(evidence["import_clean"], false);
+    }
+
+    #[test]
+    fn without_the_created_items_the_split_is_unknown_not_zero() {
+        let evidence = specctra_drc_evidence(&checked_zero(), &project_rules(), None);
+        assert!(evidence["introduced_violations"].is_null());
+        assert!(evidence["preexisting_violations"].is_null());
+        assert!(evidence["import_clean"].is_null());
+    }
+
+    #[test]
+    fn a_check_that_did_not_run_passes_nothing() {
+        let evidence = drc_not_run_evidence("kicad-cli timed out after 600s");
+        assert_eq!(evidence["status"], "not_run");
+        assert_eq!(evidence["reason"], "kicad-cli timed out after 600s");
+        for verdict in ["clean", "complete", "routing_clean", "import_clean"] {
+            assert_eq!(evidence[verdict], false, "{verdict}");
+        }
+        assert_eq!(
+            evidence["missing_categories"],
+            json!(["violations", "unconnected_items", "schematic_parity"])
+        );
+    }
+
+    fn file_only_ctx(kicad_cli: &str) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: kicad_cli.to_string(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn check_specctra_candidate_reports_the_candidates_drc_or_why_it_did_not_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("amp.kicad_pcb");
+        std::fs::write(&source, "(kicad_pcb)").unwrap();
+        std::fs::write(source.with_extension("kicad_pro"), "{}").unwrap();
+        let candidate = tmp.path().join("amp.routed.kicad_pcb");
+        std::fs::write(&candidate, "(kicad_pcb)").unwrap();
+        let report = tmp.path().join("report.json");
+        std::fs::write(
+            &report,
+            r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
+        )
+        .unwrap();
+        let working = crate::tools::cli::test_support::write_script(
+            tmp.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    \
+                 shift\n    cp \"{}\" \"$1\"\n  fi\n  shift\ndone\nexit 0\n",
+                report.display()
+            ),
+            "@echo off\r\nexit /b 1\r\n",
+        );
+        let args = json!({"board": source, "candidate_output_path": candidate});
+
+        let result =
+            handle_check_specctra_candidate(&args, &file_only_ctx(working.to_str().unwrap()))
+                .await
+                .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["drc_status"], "checked", "{body}");
+        assert_eq!(body["drc"]["rules_source"], "project");
+        assert_eq!(body["drc"]["routing_clean"], true);
+        assert!(body["drc"]["import_clean"].is_null());
+
+        let failing = crate::tools::cli::test_support::write_script(
+            tmp.path(),
+            "failing-kicad-cli",
+            "#!/bin/sh\nexit 7\n",
+            "@exit /b 7\r\n",
+        );
+        let result =
+            handle_check_specctra_candidate(&args, &file_only_ctx(failing.to_str().unwrap()))
+                .await
+                .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["drc_status"], "not_run");
+        assert_eq!(body["drc"]["routing_clean"], false);
+        assert!(
+            body["drc"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("exited with 7"),
+            "{body}"
+        );
     }
 
     /// Live check of the footprint library table: a project-local library
@@ -3450,7 +3720,7 @@ mod specctra_drc_evidence_tests {
 
     #[test]
     fn complete_checked_zero_is_clean() {
-        let evidence = specctra_drc_evidence(&checked_zero(), &project_rules());
+        let evidence = specctra_drc_evidence(&checked_zero(), &project_rules(), None);
         assert_eq!(evidence["clean"], true);
         assert_eq!(evidence["complete"], true);
         assert_eq!(evidence["violations"], 0);
@@ -3464,7 +3734,7 @@ mod specctra_drc_evidence_tests {
     fn an_ownership_diagnostic_is_passed_through() {
         let mut report = checked_zero();
         report.ownership_diagnostic = Some("footprint ownership could not be read".into());
-        let evidence = specctra_drc_evidence(&report, &project_rules());
+        let evidence = specctra_drc_evidence(&report, &project_rules(), None);
         assert_eq!(
             evidence["ownership_diagnostic"],
             "footprint ownership could not be read"
@@ -3481,7 +3751,7 @@ mod specctra_drc_evidence_tests {
             let mut report = checked_zero();
             report.unconnected_items = unconnected.then(Vec::new);
             report.schematic_parity = parity.then(Vec::new);
-            let evidence = specctra_drc_evidence(&report, &project_rules());
+            let evidence = specctra_drc_evidence(&report, &project_rules(), None);
             assert_eq!(evidence["clean"], false, "{evidence}");
             assert_eq!(evidence["complete"], false, "{evidence}");
             assert_eq!(evidence["unconnected_items"].is_null(), !unconnected);
@@ -3496,7 +3766,7 @@ mod specctra_drc_evidence_tests {
         report.schematic_parity = None;
         report.schematic_parity_diagnostic =
             Some("the expected root schematic is unavailable".into());
-        let evidence = specctra_drc_evidence(&report, &project_rules());
+        let evidence = specctra_drc_evidence(&report, &project_rules(), None);
         assert_eq!(evidence["clean"], false);
         assert_eq!(evidence["complete"], false);
         assert_eq!(
@@ -3521,7 +3791,7 @@ mod specctra_drc_evidence_tests {
     fn routing_is_clean_when_rules_and_connectivity_were_checked_and_pass() {
         let mut report = checked_zero();
         report.schematic_parity = None;
-        let evidence = specctra_drc_evidence(&report, &project_rules());
+        let evidence = specctra_drc_evidence(&report, &project_rules(), None);
         assert_eq!(evidence["clean"], false);
         assert_eq!(evidence["routing_clean"], true);
         assert_eq!(
@@ -3537,7 +3807,7 @@ mod specctra_drc_evidence_tests {
     fn routing_is_not_clean_when_connectivity_was_not_checked() {
         let mut report = checked_zero();
         report.unconnected_items = None;
-        let evidence = specctra_drc_evidence(&report, &project_rules());
+        let evidence = specctra_drc_evidence(&report, &project_rules(), None);
         assert_eq!(evidence["routing_clean"], false);
     }
 
@@ -3546,13 +3816,13 @@ mod specctra_drc_evidence_tests {
         let mut with_violation = checked_zero();
         with_violation.violations = one_finding();
         assert_eq!(
-            specctra_drc_evidence(&with_violation, &project_rules())["routing_clean"],
+            specctra_drc_evidence(&with_violation, &project_rules(), None)["routing_clean"],
             false
         );
         let mut with_unconnected = checked_zero();
         with_unconnected.unconnected_items = Some(one_finding());
         assert_eq!(
-            specctra_drc_evidence(&with_unconnected, &project_rules())["routing_clean"],
+            specctra_drc_evidence(&with_unconnected, &project_rules(), None)["routing_clean"],
             false
         );
     }
@@ -3573,7 +3843,7 @@ mod specctra_drc_evidence_tests {
                 "unconnected_items" => report.unconnected_items.as_mut().unwrap().push(finding),
                 _ => report.schematic_parity.as_mut().unwrap().push(finding),
             }
-            let evidence = specctra_drc_evidence(&report, &project_rules());
+            let evidence = specctra_drc_evidence(&report, &project_rules(), None);
             assert_eq!(evidence["complete"], true, "{evidence}");
             assert_eq!(evidence["clean"], false, "{evidence}");
             let field = if category == "schematic_parity" {
@@ -3719,6 +3989,13 @@ mod specctra_live_undo_test {
         assert_eq!(body["success"], true);
         assert_eq!(body["undo_description"], "Import Freerouting SES");
         assert!(body["created_count"].as_u64().unwrap_or(0) > 0);
+        // Step 2b: the candidate's DRC ran with the project's rules, and its
+        // findings are split by whether they name an item the import created.
+        // This live run is where the assumption that KiCad's IPC KIIDs equal
+        // the UUIDs in the saved candidate is exercised.
+        assert_eq!(body["drc_status"], "checked", "{body}");
+        assert!(body["drc"]["introduced_violations"].is_u64(), "{body}");
+        assert!(body["drc"]["import_clean"].is_boolean(), "{body}");
 
         let after = client
             .save_document_to_string_in(document.clone())

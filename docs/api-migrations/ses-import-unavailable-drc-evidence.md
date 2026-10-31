@@ -30,7 +30,21 @@ is false. When the project sets the unconnected-items check to "ignore",
 kicad-cli reports none whatever the routing; that category is then reported
 as missing, with `connectivity_diagnostic`, so `routing_clean` is false.
 `rules_source: "project"` means the project's rule files were present and
-given to kicad-cli; kicad-cli does not report a `.kicad_dru` it cannot parse. Violation counts can differ from
+given to kicad-cli; kicad-cli does not report a `.kicad_dru` it cannot parse.
+
+Findings are split into `introduced_violations` (those naming an item the
+import created) and `preexisting_violations`. `import_clean` is true when no
+finding was introduced and unconnected items were checked and are zero;
+`routing_clean` still covers the whole board.
+
+If the candidate's DRC cannot run (kicad-cli failure or timeout, temporary
+directory or copy failure), the import is no longer rolled back: it was
+already verified by IPC read-back. The response has `drc_status:
+"not_run"`, a top-level `warning`, and a `drc` object with `status:
+"not_run"`, the `reason`, every verdict false and every category missing.
+Rollback still happens for an IPC read-back mismatch or a failure to write
+the candidate. Callers that treated an error from this tool as "nothing was
+imported" must now check `drc_status`. Violation counts can differ from
 earlier releases for the same board.
 
 `clean` is false for every import, because parity is not checked for the
