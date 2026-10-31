@@ -76,3 +76,13 @@ The adaptation commit after them makes the result compile.
   After both: the simulation unit tests (453) and the count test pass.
 - Gate after the adaptation (`logs/gate-step4-adapt.summary`): 3,653 passed (+482), 1 failed (the
   known baseline failure), 108 ignored (+48, the simulation's live tests).
+- Live tests (`scripts/run_live_tests.sh`, new: fetches KiCad's demo projects for the installed
+  version, which the Arch packages do not install, and runs the ignored live tests). With ngspice 47
+  and KiCad 10.0.7 demos: 45 of 47 simulation live tests passed at first. The two failures were
+  version differences: one test required ngspice 44.2 (the contributor's macOS KiCad); and ngspice
+  47 words a non-convergence as `trouble with B-instance b1` where 44.2 wrote
+  `trouble with node "b1#branch"`, so the stopped transient named nothing. Fixed in the code, not
+  only the test: `stopped.instance` is now reported from the 47 form (`trouble_instance_in`; test
+  `both_engine_versions_name_what_the_run_stalled_on`); the live test accepts either form, and the
+  version test accepts any non-empty version. Then all 47 pass. The DRC live tests (steps 2 and 2b)
+  also pass, including step 2's parity test, which could not be run before.

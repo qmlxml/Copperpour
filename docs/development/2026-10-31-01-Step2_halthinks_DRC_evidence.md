@@ -158,3 +158,9 @@ the changed text is in `validate_for_manufacturing`); the SES migration note's d
 delta omitted the extra ignored test; the measurement script defaulted to a fixture kicad-cli
 10.0.7 rejects and still said the code searches only stderr; and the doc comment on
 `apply_parity_evidence` still said the message is always printed to stderr. All corrected.
+
+## Later: live parity test run (during plan step 4)
+
+KiCad 10.0.7's demo projects were fetched during step 4 (`scripts/run_live_tests.sh`). The live test
+`live_parity_is_checked_when_the_schematic_is_beside_the_board`, which could not be run during this
+step and whose assertion fix pass 1 changed to accept either diagnostic, passes on kicad-cli 10.0.7.

@@ -1354,10 +1354,16 @@ impl RunEnd<'_> {
     /// be repeated.
     fn trouble_node(&self) -> Option<String> {
         let (lines, _) = engine_complaints(&self.engine_log(), self.deck);
-        lines.iter().find_map(|line| {
-            let (_, rest) = line.split_once("node \"")?;
-            rest.split('"').next().map(str::to_owned)
-        })
+        lines.iter().find_map(|line| trouble_node_in(line))
+    }
+
+    /// The device instance a stopped analysis names. ngspice 47 reports
+    /// `trouble with B-instance b1` where 44.2 reported
+    /// `trouble with node "b1#branch"` (measured on this machine's ngspice 47
+    /// during plan step 4).
+    fn trouble_instance(&self) -> Option<String> {
+        let (lines, _) = engine_complaints(&self.engine_log(), self.deck);
+        lines.iter().find_map(|line| trouble_instance_in(line))
     }
 
     fn result_body(&self, plot: &Plot, analysis: Value, stopped: Option<&str>) -> Value {
@@ -1395,8 +1401,43 @@ impl RunEnd<'_> {
             if let Some(node) = self.trouble_node() {
                 body["stopped"]["node"] = json!(node);
             }
+            if let Some(instance) = self.trouble_instance() {
+                body["stopped"]["instance"] = json!(instance);
+            }
         }
         body
+    }
+}
+
+/// `trouble with node "x"` → `x` (ngspice 44.2).
+fn trouble_node_in(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("node \"")?;
+    rest.split('"').next().map(str::to_owned)
+}
+
+/// `trouble with B-instance b1` → `b1` (ngspice 47).
+fn trouble_instance_in(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("trouble with ")?;
+    let (kind, rest) = rest.split_once("-instance ")?;
+    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    rest.split_whitespace().next().map(str::to_owned)
+}
+
+#[cfg(test)]
+mod trouble_message_tests {
+    use super::*;
+
+    #[test]
+    fn both_engine_versions_name_what_the_run_stalled_on() {
+        let old = "doAnalyses: TRAN:  Timestep too small: trouble with node \"b1#branch\"";
+        let new = "doAnalyses: TRAN:  Timestep too small; time = 0.00215598, timestep = \
+                   1.875e-18: trouble with B-instance b1";
+        assert_eq!(trouble_node_in(old).as_deref(), Some("b1#branch"));
+        assert_eq!(trouble_instance_in(old), None);
+        assert_eq!(trouble_instance_in(new).as_deref(), Some("b1"));
+        assert_eq!(trouble_node_in(new), None);
     }
 }
 

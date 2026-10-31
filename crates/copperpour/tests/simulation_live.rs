@@ -461,7 +461,14 @@ fn a_real_operating_point_runs_and_leaves_the_project_untouched() {
     assert_eq!(result["outcome"]["status"], "complete", "{result}");
     assert_eq!(result["simulated_circuit"], "as_drawn");
     assert_eq!(result["analysis"]["coverage_ratio"], 1.0);
-    assert_eq!(result["engine"]["version"], "44.2");
+    // The contributor measured 44.2 (KiCad's bundled engine on macOS); the
+    // engine found on Linux may be another release, e.g. 47.
+    assert!(
+        result["engine"]["version"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty()),
+        "{result}"
+    );
     let supply = row(&result, "v(+12v)");
     assert_eq!(supply["net"], "+12V", "{result}");
     assert_eq!(supply["unit"], "V");
@@ -870,7 +877,11 @@ fn a_transient_that_loses_convergence_keeps_what_it_had_and_names_the_node() {
     );
 
     assert_eq!(result["stopped"]["reason"], "no_convergence", "{result}");
-    assert_eq!(result["stopped"]["node"], "b1#branch", "{result}");
+    // ngspice 44.2 names the node, 47 the instance (measured during plan step 4).
+    assert!(
+        result["stopped"]["node"] == "b1#branch" || result["stopped"]["instance"] == "b1",
+        "{result}"
+    );
     assert_eq!(result["outcome"]["status"], "partial");
     let reached = result["analysis"]["simulated_to_seconds"].as_f64().unwrap();
     assert!(reached > 1e-3 && reached < 3e-3, "{reached}");
