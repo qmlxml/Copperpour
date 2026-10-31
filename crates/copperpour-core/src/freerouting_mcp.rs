@@ -83,6 +83,10 @@ pub(crate) struct RouteSettings {
     /// (`get_effective_settings`), passed through as given. The named fields
     /// above are merged on top and win.
     pub router_settings: Option<Map<String, Value>>,
+    /// Settings taken from the KiCad project's design rules
+    /// (`project_route_rules`), sent under everything above. A key the JAR
+    /// does not know is reported, not refused: the caller did not ask for it.
+    pub project_rules: Map<String, Value>,
     pub poll_interval: Duration,
     pub overall_timeout: Duration,
 }
@@ -106,6 +110,9 @@ pub(crate) struct RouteEvidence {
     /// Settings sent but not found with the same value among the job's
     /// effective settings: unknown key, typo, or a value Freerouting replaced.
     pub settings_not_applied: Vec<String>,
+    /// Project design rules sent but not applied, e.g. a key an older JAR
+    /// does not have (`hole_to_hole_um` before 2.5.1).
+    pub project_rules_not_applied: Vec<String>,
     /// Freerouting's own `validation_warnings` for the effective settings.
     pub settings_warnings: Vec<Value>,
 }
@@ -451,7 +458,9 @@ async fn run_state_machine(
         .await?;
 
     let job_settings = job_settings_body(settings);
+    let requested = requested_settings(settings);
     let mut settings_not_applied = Vec::new();
+    let mut project_rules_not_applied = Vec::new();
     let mut settings_warnings = Vec::new();
     if !job_settings.is_empty() {
         if !tools.contains_key("update_job_settings") {
@@ -473,7 +482,9 @@ async fn run_state_machine(
                 )
                 .await?;
             if let Some(effective) = effective_settings(&effective) {
-                settings_not_applied = settings_mismatches(&job_settings, effective);
+                settings_not_applied = settings_mismatches(&requested, effective);
+                project_rules_not_applied =
+                    settings_mismatches(&project_only_settings(settings, &requested), effective);
                 // Known before start_job: refuse now rather than after a run
                 // that would ignore part of what was asked.
                 if !settings_not_applied.is_empty() {
@@ -572,6 +583,7 @@ async fn run_state_machine(
         unrouted: progress.read_unrouted(),
         last_activity: progress.activity,
         settings_not_applied,
+        project_rules_not_applied,
         settings_warnings,
     })
 }
@@ -1253,9 +1265,50 @@ fn temporary_output_path(output: &Path) -> Result<PathBuf> {
 /// sent before were accepted and silently ignored: routing passes stayed
 /// unlimited and the job limit at 12 hours.
 fn job_settings_body(settings: &RouteSettings) -> Map<String, Value> {
+    let mut body = settings.project_rules.clone();
+    merge_into(&mut body, requested_settings(settings));
+    body
+}
+
+/// What the caller asked for: `router_settings` with the named arguments on top.
+fn requested_settings(settings: &RouteSettings) -> Map<String, Value> {
     let mut body = settings.router_settings.clone().unwrap_or_default();
     merge_into(&mut body, named_settings(settings));
     body
+}
+
+/// The project rules the caller did not override.
+fn project_only_settings(
+    settings: &RouteSettings,
+    requested: &Map<String, Value>,
+) -> Map<String, Value> {
+    settings
+        .project_rules
+        .iter()
+        .filter(|(key, _)| !requested.contains_key(*key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Freerouting settings from a KiCad project's design rules
+/// (`board.design_settings.rules`, in mm). Freerouting does not get these
+/// from the DSN: KiCad leaves the board edge clearance out of it, and the
+/// hole rules have no Specctra form. Rules left at 0 or absent are not sent,
+/// so Freerouting keeps its own defaults for them.
+pub(crate) fn project_route_rules(project: &Value) -> Map<String, Value> {
+    const RULES: [(&str, &str); 3] = [
+        ("min_copper_edge_clearance", "copper_to_edge_clearance_um"),
+        ("min_hole_to_hole", "hole_to_hole_um"),
+        ("min_hole_clearance", "hole_clearance_um"),
+    ];
+    let rules = &project["board"]["design_settings"]["rules"];
+    RULES
+        .iter()
+        .filter_map(|(kicad, freerouting)| {
+            let mm = rules[*kicad].as_f64().filter(|mm| *mm > 0.0)?;
+            Some((freerouting.to_string(), json!((mm * 1000.0).round())))
+        })
+        .collect()
 }
 
 /// The settings that have their own route_specctra_dsn argument.
@@ -1625,6 +1678,7 @@ mod tests {
             plane_nets: None,
             plane_as_obstacle: None,
             router_settings: None,
+            project_rules: Map::new(),
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1646,6 +1700,7 @@ mod tests {
             optimize_seconds: Some(1100),
             plane_nets: None,
             router_settings: None,
+            project_rules: Map::new(),
             ..settings
         };
         let error = validate_inputs(&jar, &dsn, &ses, &optimizer_outlives_the_call)
@@ -1660,6 +1715,7 @@ mod tests {
             overall_timeout: Duration::from_secs(2000),
             plane_nets: None,
             router_settings: None,
+            project_rules: Map::new(),
             ..settings
         };
         validate_inputs(&jar, &dsn, &ses, &room_for_both).unwrap();
@@ -1711,6 +1767,7 @@ mod tests {
                 .unwrap()
                 .clone(),
             ),
+            project_rules: Map::new(),
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1721,6 +1778,64 @@ mod tests {
                 "scoring": { "via_costs": 80 },
                 "hole_clearance_um": 200.0
             })
+        );
+    }
+
+    #[test]
+    fn project_design_rules_become_freerouting_settings_in_um() {
+        let project = json!({ "board": { "design_settings": { "rules": {
+            "min_copper_edge_clearance": 0.5,
+            "min_hole_to_hole": 0.25,
+            "min_hole_clearance": 0.0,
+            "min_clearance": 0.2
+        } } } });
+        assert_eq!(
+            Value::Object(project_route_rules(&project)),
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 250.0 })
+        );
+        assert!(project_route_rules(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn project_rules_go_under_what_the_caller_asked_for() {
+        let settings = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: Some(
+                json!({ "copper_to_edge_clearance_um": 300.0 })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            project_rules: json!({
+                "copper_to_edge_clearance_um": 500.0,
+                "hole_to_hole_um": 500.0
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        assert_eq!(
+            Value::Object(job_settings_body(&settings)),
+            json!({ "copper_to_edge_clearance_um": 300.0, "hole_to_hole_um": 500.0 })
+        );
+        let requested = requested_settings(&settings);
+        assert_eq!(
+            Value::Object(requested.clone()),
+            json!({ "copper_to_edge_clearance_um": 300.0 })
+        );
+        // Only the rule the caller left alone is checked leniently.
+        assert_eq!(
+            Value::Object(project_only_settings(&settings, &requested)),
+            json!({ "hole_to_hole_um": 500.0 })
         );
     }
 
@@ -1822,6 +1937,7 @@ mod tests {
             plane_nets: Some(vec!["GND".into(), "+3V3".into()]),
             plane_as_obstacle: Some(false),
             router_settings: None,
+            project_rules: Map::new(),
             poll_interval: Duration::from_secs(3),
             overall_timeout: Duration::from_secs(900),
         };
@@ -1981,6 +2097,7 @@ mod tests {
                 plane_nets: None,
                 plane_as_obstacle: None,
                 router_settings: None,
+                project_rules: Map::new(),
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
             },
@@ -2021,6 +2138,7 @@ mod tests {
                     plane_nets: None,
                     plane_as_obstacle: None,
                     router_settings: None,
+                    project_rules: Map::new(),
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
                 },
@@ -2074,6 +2192,7 @@ mod tests {
                     plane_nets: None,
                     plane_as_obstacle: None,
                     router_settings: None,
+                    project_rules: Map::new(),
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
                 },

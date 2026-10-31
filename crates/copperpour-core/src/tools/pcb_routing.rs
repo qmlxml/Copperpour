@@ -4104,6 +4104,7 @@ mod specctra_live_undo_test {
                 plane_nets: None,
                 plane_as_obstacle: None,
                 router_settings: None,
+                project_rules: serde_json::Map::new(),
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(180),
             },

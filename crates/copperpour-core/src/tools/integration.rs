@@ -184,6 +184,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "optimizer_improvement_threshold": { "type": "number", "minimum": 0, "maximum": 100, "description": "Stop optimizing after a pass that improves the optimizer score by less than this many percent (Freerouting's default 2.5). Lower it to keep optimizing for smaller gains." },
                     "plane_nets": { "type": "array", "items": { "type": "string" }, "description": "Net names Freerouting treats as power-plane nets (its plane_nets): plane routing mode and cheaper vias to the plane. A (plane ...) declared in the DSN already marks its net the same way." },
                     "plane_as_obstacle": { "type": "boolean", "description": "Whether copper pours block foreign traces (Freerouting's plane_as_obstacle, default false)." },
+                    "project_path": { "type": "string", "description": "KiCad .kicad_pro whose design rules apply. By default, the only .kicad_pro next to the DSN, else in its parent folder. Its min_copper_edge_clearance, min_hole_to_hole and min_hole_clearance are sent as Freerouting's copper_to_edge_clearance_um, hole_to_hole_um and hole_clearance_um (rules at 0 are left to Freerouting's defaults), under router_settings and the named arguments, which win. The DSN carries none of them. A rule the JAR does not know is listed in project_rules.not_applied rather than refused." },
                     "router_settings": { "type": "object", "additionalProperties": true, "description": "Any Freerouting router setting, in its JSON shape, passed through as given; the named arguments above are merged on top and win. Groups: autorouter.{max_passes, max_threads, max_items, ignore_net_classes}, fanout.{enabled, max_passes, ripup_allowed, min_escape_length_mm, max_escape_length_mm, start_via_diameter_mm, end_via_diameter_mm, pin_sorting_order, fallback_to_board_vias}, optimizer.{enabled, max_passes, max_threads, improvement_threshold, enable_preflight_guards, max_consecutive_failures, max_autoroute_passes, trace_ripup_cost_factor}, scoring.{via_costs, plane_via_costs, start_ripup_costs, default_preferred_direction_trace_cost, default_undesired_direction_trace_cost, bend_penalty}, router_scoring.*, optimizer_scoring.*, and top level copper_to_edge_clearance_um, hole_clearance_um, clearance_tolerance_um, neck_width_um, automatic_neckdown, strict_drc, trace_pull_tight_accuracy, allowed_via_types, plane_nets, plane_as_obstacle, max_threads, layers. A setting Freerouting does not apply (unknown key, typo, value it replaced) is refused before routing starts, and named in the error. So is any negative number: no Freerouting setting means anything below zero." },
                     "optimize_seconds": { "type": "integer", "minimum": 0, "maximum": 86400, "description": "Once routing is complete and the optimizer has started (optimizer_enabled), let it run this many seconds, then keep the best board found so far and stop the job (final_state OPTIMIZATION_STOPPED). Detection reads Freerouting's log; without it the optimizer runs to its end." },
                     "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "description": "Hard limit on the whole call, routing and optimizer together; the job is killed and nothing is kept when it is reached. Default 900, plus optimize_seconds when that is given. Set explicitly, it must exceed optimize_seconds, since the optimizer window only opens once routing is done." }
@@ -3136,6 +3137,38 @@ async fn handle_check_freerouting(
     }
 }
 
+/// The KiCad project whose design rules apply to a DSN: `project_path` when
+/// given, else the only `.kicad_pro` in the DSN's folder, else in its parent
+/// (a `route/` subfolder is common). None when there is none or several.
+fn route_project(args: &serde_json::Value, dsn: &Path) -> anyhow::Result<Option<PathBuf>> {
+    if args
+        .get("project_path")
+        .is_some_and(|value| !value.is_null())
+    {
+        let project = get_path(args, "project_path")?;
+        if !project.is_file() {
+            anyhow::bail!("project_path is not a file: {}", project.display());
+        }
+        return Ok(Some(project));
+    }
+    let folder = dsn.parent().unwrap_or_else(|| Path::new("."));
+    for dir in [Some(folder), folder.parent()].into_iter().flatten() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let projects: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "kicad_pro"))
+            .collect();
+        match projects.len() {
+            0 => continue,
+            1 => return Ok(projects.into_iter().next()),
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
 async fn handle_route_specctra_dsn(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -3173,6 +3206,19 @@ async fn handle_route_specctra_dsn(
         let optimize = args["optimize_seconds"].as_u64().unwrap_or(0);
         900u64.saturating_add(optimize).min(86_400)
     });
+    // Freerouting does not find these rules in the DSN; without them it
+    // routes to its own defaults, or with none at all through its job API.
+    let project = route_project(args, &dsn)?;
+    let project_rules = match &project {
+        Some(path) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+            let parsed: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))?;
+            crate::freerouting_mcp::project_route_rules(&parsed)
+        }
+        None => serde_json::Map::new(),
+    };
     let settings = crate::freerouting_mcp::RouteSettings {
         max_passes,
         optimizer_enabled: args["optimizer_enabled"].as_bool(),
@@ -3192,6 +3238,7 @@ async fn handle_route_specctra_dsn(
         }),
         plane_as_obstacle: args["plane_as_obstacle"].as_bool(),
         router_settings: args["router_settings"].as_object().cloned(),
+        project_rules: project_rules.clone(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
@@ -3241,7 +3288,12 @@ async fn handle_route_specctra_dsn(
         "ses_bytes": evidence.ses_bytes,
         "last_activity": evidence.last_activity,
         "settings_not_applied": evidence.settings_not_applied,
-        "settings_warnings": evidence.settings_warnings
+        "settings_warnings": evidence.settings_warnings,
+        "project_rules": {
+            "project_path": project,
+            "sent": project_rules,
+            "not_applied": evidence.project_rules_not_applied
+        }
     })))
 }
 
