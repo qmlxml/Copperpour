@@ -40,7 +40,9 @@ bridge's commands and JSON fields match what the Rust side reads. Findings and w
    with content planned from the older file. Read-back passed and the later reload showed the result
    without the user's changes. Fixed: `write_atomic_unlocked_with` reads the file before the first
    lock check and refuses with a conflict if the check (which may run the hook) changed it; the same
-   comparison is repeated at the second check before the rename (`prepare_unchanged`). The function
+   comparison is repeated at the second check before the rename (`prepare_unchanged`). (Replaced
+   later: fix pass 2, finding 7, compares against the text the edit was planned from; fix pass 3,
+   item 1, refuses with `ChangedBeforeWrite` instead of `Conflict`.) The function
    that makes the editor safe is now a parameter, so tests can stand in for the hook (which is set
    once per process and cannot be installed in tests). Tests:
    `a_write_is_refused_when_making_the_editor_safe_changed_the_file`,
@@ -71,8 +73,9 @@ Committed as `48d4d93`.
 
 ## Review 2 (robustness) and fix pass 2
 
-Review 2 found ten problems, nearly all in the Windows-only code (the C# bridge and
-`live_editor.rs`), which cannot be compiled, run or tested on this machine. Two can lose design data
+Review 2 made eleven findings: ten in the Windows-only code (the C# bridge and `live_editor.rs`),
+which cannot be compiled, run or tested on this machine, and one (finding 7) in the shared Rust
+writer. Two can lose design data
 without any error (the user's Ctrl+S before the reload overwrites the agent's write; a server exit or
 a reload that always fails leaves the editor stale with nothing reported). They are listed in
 `docs/LIVE_EDITOR.md`, "Known defects".
@@ -132,4 +135,15 @@ permanent (a retry re-reads the file). Findings and what was done:
    added for the missing CI job.
 
 Gate after fix pass 3 (`logs/gate-step3-fix3.summary`): 3,171 passed (+3), 1 failed (the known
-baseline failure), 60 ignored.
+baseline failure), 60 ignored. Committed as `4ab7a13`.
+
+## Documentation review (sub-step 16)
+
+An independent check of this log, the plan entry, `docs/LIVE_EDITOR.md`, `docs/BACKLOG.md` and the
+code found eight inaccuracies, all corrected: the install condition and the enabling values were
+stated incompletely in three places; "`COPPERPOUR_LIVE_EDITOR=0` restores the refusal" was left over
+from when the feature was on by default; the description of the guard predated the planned-from
+comparison; the fix pass 1 description did not say it was later replaced; review 2's count (eleven
+findings, ten in Windows-only code, one in the shared writer) was given as ten; a missing commit
+hash; and two coined phrases ("burst", "staying upstream") replaced. The Known defects list was
+confirmed still accurate: none of the ten was fixed later.

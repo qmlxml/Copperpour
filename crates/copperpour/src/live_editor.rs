@@ -9,14 +9,14 @@
 //!
 //! 1. First write to a schematic the editor has open: the bridge saves the user's unsaved work
 //!    (File > Save) and confirms no dialog is open. The write proceeds.
-//! 2. Further writes in the same burst proceed as long as the editor stays clean.
+//! 2. Further writes before the reload proceed as long as the editor stays clean.
 //! 3. `COPPERPOUR_LIVE_EDITOR_DEBOUNCE_MS` (default 1500) after the last write, the bridge reverts
 //!    the editor to the saved file (File > Revert, answering KiCad's confirmation), so the user
 //!    sees the edit without closing anything.
 //! 4. If the user edits in KiCad between a write and the reload, nothing is reverted: the next
 //!    write is refused with instructions, because only the user can choose whose edit wins.
 //!
-//! Off unless `COPPERPOUR_LIVE_EDITOR=1` (owner ruling 2026-10-31: known defects that can lose
+//! Off unless `COPPERPOUR_LIVE_EDITOR` is `1`, `on` or `true` (owner ruling 2026-10-31: known defects that can lose
 //! design data are listed in docs/LIVE_EDITOR.md). `COPPERPOUR_EDITOR_BRIDGE` overrides the
 //! bridge path (default: `kicad-editor-bridge.exe` beside `copperpour.exe`). Each variable is
 //! also read under its `KONNECT_` name, as Copperpour's other variables are
@@ -85,7 +85,7 @@ To keep Claude's edit, use File > Revert in KiCad. To keep yours, press Ctrl+S i
             Some("1") | Some("on") | Some("true")
         ) {
             info!(
-                "live editor: off (experimental; set COPPERPOUR_LIVE_EDITOR=1 to enable, see \
+                "live editor: off (experimental; set COPPERPOUR_LIVE_EDITOR=1, on or true to enable, see \
                  docs/LIVE_EDITOR.md for its known defects)"
             );
             return;
@@ -111,7 +111,7 @@ To keep Claude's edit, use File > Revert in KiCad. To keep yours, press Ctrl+S i
                 .name("copperpour-live-editor".into())
                 .spawn(move || reload_loop(sessions, bridge, debounce))
             {
-                warn!("live editor: could not start the reload thread ({error}); staying upstream");
+                warn!("live editor: could not start the reload thread ({error}); the live editor stays off");
                 return;
             }
         }
@@ -201,7 +201,7 @@ Close it, then retry; Copperpour saves and reloads the editor itself"
         let k = key(path);
 
         if let Some(session) = map.get_mut(&k) {
-            // A burst is in progress: the editor was saved before the first write and has
+            // Writes are in progress: the editor was saved before the first write and has
             // not reloaded yet. It must still be clean, or the user has edited stale content.
             let status = run(bridge, "status", path)?;
             if !status.ok {

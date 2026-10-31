@@ -19,7 +19,7 @@ Found by review 2 of plan step 3, from reading the code (not measured):
    1.5 s before the reload, KiCad saves its older content over the agent's write, and the next write
    is allowed because the editor looks clean.
 2. **The editor can be left showing stale content with nothing reported.** If the server exits during
-   a burst, or the reload fails every time (menu item not found, repeated timeouts), the editor is
+   a sequence of writes before the reload, or the reload fails every time (menu item not found, repeated timeouts), the editor is
    never reloaded; the reload is retried every 1.7 s with only a log warning, later writes still
    succeed, and the user's next save overwrites the agent's edits.
 3. **The bridge may click a dialog that is not the Revert confirmation**: it takes the first new
@@ -58,26 +58,30 @@ you're in another window. It only clicks a dialog that appeared because of its o
 present, an installed hook may allow the write. With no hook, the write is refused as before.
 
 `crates/copperpour/src/live_editor.rs` installs that hook at startup (Windows, when
-`kicad-editor-bridge.exe` sits beside `copperpour.exe`):
+`kicad-editor-bridge.exe` sits beside `copperpour.exe` and `COPPERPOUR_LIVE_EDITOR` is `1`, `on` or
+`true`):
 
 1. First write to a locked schematic: save the user's unsaved work, check no dialog is open, allow.
-2. Further writes in the burst: allowed while the editor stays clean.
+2. Further writes before the reload: allowed while the editor stays clean.
 3. `COPPERPOUR_LIVE_EDITOR_DEBOUNCE_MS` (default 1500) after the last write: File > Revert, so the open
    editor shows the result.
 4. If the user edits in KiCad between a write and the reload, nothing is reverted and the next write
    is refused, telling them to choose (File > Revert keeps the agent's edit, Ctrl+S keeps theirs).
 
 Refusals carry a reason through every lock message (`schematic_lock_message`): a dialog is open, a
-conflict, or no editor window matches the lock (stale lock). `COPPERPOUR_LIVE_EDITOR=0` restores
-the refusal; `COPPERPOUR_EDITOR_BRIDGE` overrides the bridge path. The `KONNECT_` names of these
+conflict, or no editor window matches the lock (stale lock). Any other value of
+`COPPERPOUR_LIVE_EDITOR`, or none, keeps the refusal; `COPPERPOUR_EDITOR_BRIDGE` overrides the bridge path. The `KONNECT_` names of these
 variables are still read.
 
 ## Unsaved work in the editor (added when merged)
 
 If the editor has unsaved changes when a write arrives, the bridge saves them first. The edit the
 tool is about to write was planned from the file as it was before that save, so writing it would
-discard those changes. The writer therefore compares the file before and after the bridge runs, and
-refuses the write if the save changed it (`crates/copperpour-sexp/src/writer.rs`,
+discard those changes. The writer therefore compares the file, at both lock checks (before the
+scratch file is written and again before it replaces the document), with the text the edit was
+planned from (`write_atomic_if_unchanged`, `transact_atomic` and multi-file transactions; a plain
+`write_atomic` compares with the file as read when the write starts), and refuses the write if it
+differs (`crates/copperpour-sexp/src/writer.rs`,
 `prepare_unchanged`, error `ChangedBeforeWrite`, reported to the caller as a conflict in which
 nothing was written). The caller must re-read and plan the edit again; the second attempt is planned
 from the saved file and goes through. Nothing is lost, at the cost of one refused write.
