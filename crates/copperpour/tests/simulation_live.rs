@@ -4,15 +4,15 @@
 //! need an installed KiCad 10 that ships libngspice:
 //!
 //! ```text
-//! cargo test -p konnect --test simulation_live -- --ignored
+//! cargo test -p copperpour --test simulation_live -- --ignored
 //! ```
 
-use konnect_core::kicad_install::{find_code_models_dir, find_ngspice_library};
-use konnect_core::simulation::protocol::{
+use copperpour_core::kicad_install::{find_code_models_dir, find_ngspice_library};
+use copperpour_core::simulation::protocol::{
     HaltReason, ProbeReport, RunRequest, RunStatus, DECK_FILE, LOG_FILE, PROTOCOL_VERSION,
     RAW_FILE, REQUEST_FILE, STATUS_FILE, WORKER_SUBCOMMAND,
 };
-use konnect_core::simulation::raw;
+use copperpour_core::simulation::raw;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -159,7 +159,10 @@ fn call_over_stdio(tool: &str, arguments: Value) -> Value {
 /// IBIS models to the user's real cache. A test that needs them allows it here.
 fn call_with_config(tool: &str, arguments: Value, config: &str) -> Value {
     let home = tempfile::tempdir().unwrap();
-    for config_dir in [".config/konnect", "Library/Application Support/konnect"] {
+    for config_dir in [
+        ".config/copperpour",
+        "Library/Application Support/copperpour",
+    ] {
         let config_dir = home.path().join(config_dir);
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(config_dir.join("config.toml"), config).unwrap();
@@ -593,7 +596,7 @@ impl WorkerRun {
 /// The worked deck, as a testbench on a schematic emptied of its own parts.
 fn soft_start_lines() -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../konnect-core/tests/fixtures/simulation/soft_start.sp");
+        .join("../copperpour-core/tests/fixtures/simulation/soft_start.sp");
     let text = std::fs::read_to_string(path).unwrap();
     text.lines().map(str::to_owned).collect()
 }
@@ -1262,7 +1265,7 @@ fn a_bridge_file_in_the_project_never_reaches_the_engine() {
 
 fn protection_deck(name: &str) -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../konnect-core/tests/fixtures/simulation/protection")
+        .join("../copperpour-core/tests/fixtures/simulation/protection")
         .join(format!("{name}.sp"));
     let text = std::fs::read_to_string(path).unwrap();
     text.lines().map(str::to_owned).collect()

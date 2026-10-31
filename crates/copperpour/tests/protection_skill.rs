@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../konnect-core/tests/fixtures/simulation/protection")
+        .join("../copperpour-core/tests/fixtures/simulation/protection")
 }
 
 fn skill() -> String {

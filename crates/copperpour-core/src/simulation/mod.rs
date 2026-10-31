@@ -1,9 +1,9 @@
 //! SPICE simulation support.
 //!
-//! ngspice runs in a separate `konnect sim-worker` process, never inside the
+//! ngspice runs in a separate `copperpour sim-worker` process, never inside the
 //! server: a simulator crash must not take the MCP session down with it. This
 //! crate holds everything that needs no `unsafe`; the FFI lives with the worker
-//! in the `konnect` binary crate.
+//! in the `copperpour` binary crate.
 
 pub(crate) mod element;
 pub(crate) mod flatten;

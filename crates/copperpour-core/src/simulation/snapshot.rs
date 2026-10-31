@@ -56,7 +56,7 @@ pub(crate) fn take_snapshot(root: &Path, into: &Path) -> Result<Snapshot> {
         }
         std::fs::write(&destination, absolute_sim_libraries(&source, &project_dir))
             .with_context(|| format!("cannot copy sheet {}", sheet.display()))?;
-        if let Some(lock) = konnect_sexp::writer::kicad_editor_lock_path(&sheet) {
+        if let Some(lock) = copperpour_sexp::writer::kicad_editor_lock_path(&sheet) {
             if lock.exists() {
                 locks_present.push(lock);
             }
@@ -102,7 +102,7 @@ fn hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
             return Ok(());
         }
         active.insert(canonical.clone());
-        let schematic = konnect_schematic_editor::Schematic::load(&canonical)
+        let schematic = copperpour_schematic_editor::Schematic::load(&canonical)
             .with_context(|| format!("cannot load sheet {}", canonical.display()))?;
         files.push(canonical.clone());
         let parent = canonical.parent().unwrap_or_else(|| Path::new("."));

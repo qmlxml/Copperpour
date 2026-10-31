@@ -842,7 +842,7 @@ fn dc_groups(circuit: &Circuit) -> Groups {
     groups
 }
 
-/// An open `.if` or `.subckt` swallows the analysis line Konnect adds after it,
+/// An open `.if` or `.subckt` swallows the analysis line Copperpour adds after it,
 /// and the engine then reports a failure that says nothing of the cause.
 fn deck_structure(deck: &FlatDeck) -> Check {
     let mut open_blocks = Vec::new();

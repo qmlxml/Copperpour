@@ -657,8 +657,38 @@ pub(crate) mod test_support {
         )
     }
 
-    /// A kicad-cli that outlives its timeout must be killed, not left
-    /// running while callers delete the files it is reading.
+    /// On a live project, a kicad-cli that outlives its timeout is left
+    /// running. Not killing it is correct because a killed kicad-cli leaves
+    /// the project's lock file behind, and the project then stays locked. It
+    /// would be wrong on a private copy the caller is about to delete, which
+    /// the next test covers.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timed_out_kicad_cli_on_a_live_project_is_not_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let cli = write_script(
+            dir.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 3\n",
+                pid_file.display()
+            ),
+            "@exit /b 0\r\n",
+        );
+        let result = run_cli_captured(cli.to_str().unwrap(), &[], Duration::from_millis(300)).await;
+        assert!(
+            result.is_err(),
+            "the fake kicad-cli sleeps past the timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).unwrap();
+        assert_ne!(stat.split_whitespace().nth(2), Some("Z"), "still running");
+    }
+
+    /// On a private copy, a kicad-cli that outlives its timeout must be
+    /// killed, not left running while the caller deletes the copy.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_timed_out_kicad_cli_is_killed() {
@@ -673,7 +703,8 @@ pub(crate) mod test_support {
             ),
             "@exit /b 0\r\n",
         );
-        let result = run_cli_captured(cli.to_str().unwrap(), &[], Duration::from_millis(500)).await;
+        let result =
+            run_cli_owned(cli.to_str().unwrap(), &[], Duration::from_millis(500), true).await;
         assert!(
             result.is_err(),
             "the fake kicad-cli sleeps past the timeout"
@@ -1060,13 +1091,33 @@ fn parse_item_pos(item: &serde_json::Value) -> Option<ReportPos> {
 /// KiCAD 10: `pcb drc --output <path> --format json --schematic-parity
 /// [--refill-zones] <input>`
 pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcReport> {
+    run_drc_with(cli, pcb, refill_zones, false).await
+}
+
+/// [`run_drc`] on a private copy of a board: kicad-cli is killed if it runs
+/// past its timeout. Only for copies no user project depends on, because a
+/// killed kicad-cli leaves its project lock behind (see [`run_cli_owned`]).
+pub(crate) async fn run_drc_on_private_copy(
+    cli: &str,
+    pcb: &Path,
+    refill_zones: bool,
+) -> Result<DrcReport> {
+    run_drc_with(cli, pcb, refill_zones, true).await
+}
+
+async fn run_drc_with(
+    cli: &str,
+    pcb: &Path,
+    refill_zones: bool,
+    kill_on_timeout: bool,
+) -> Result<DrcReport> {
     let out_path = pcb.with_extension("drc.json");
     let args = drc_args(
         out_path.to_str().unwrap(),
         refill_zones,
         pcb.to_str().unwrap(),
     );
-    let output = run_cli_captured(cli, &args, LONG_TIMEOUT).await?;
+    let output = run_cli_owned(cli, &args, LONG_TIMEOUT, kill_on_timeout).await?;
 
     let json_str = tokio::fs::read_to_string(&out_path)
         .await

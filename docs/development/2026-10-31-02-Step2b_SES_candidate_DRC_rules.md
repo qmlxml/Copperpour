@@ -111,7 +111,7 @@ The reviewer measured on kicad-cli 10.0.7 with copies of `candidate_drc_project_
    a DRC failure should undo the import is a policy question passed to review 3.
 5. **kicad-cli was not stopped on timeout**, so it could keep running while the temporary copy
    was deleted. `run_cli_captured` (crates/copperpour-core/src/tools/cli.rs) now sets
-   `kill_on_drop`; this applies to every kicad-cli call. Test `a_timed_out_kicad_cli_is_killed`
+   `kill_on_drop`; this applies to every kicad-cli call. (Superseded in step 4: yuvaltal912-sys's contribution kills kicad-cli on timeout only on a private copy, because a killed kicad-cli on a live project leaves its lock file behind; the SES candidate check now uses `run_drc_on_private_copy`. See `2026-10-31-04-Step4_yuvaltal912_simulation.md`.) Test `a_timed_out_kicad_cli_is_killed`
    (Linux). Control: with `kill_on_drop` removed, it fails. A server killed by SIGKILL still
    leaves its temporary copy behind, as any temporary file would.
 

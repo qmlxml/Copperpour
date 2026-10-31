@@ -96,7 +96,7 @@ Each block below ran through `run_simulation` and matched values worked out with
 Rules for all five:
 
 - **Keep transitions smooth, as written.** A stand-in that flips back and forth stops the run with `no_convergence`: a lockout whose hysteresis is narrower than the supply sag does. Set `max_step_seconds` as each block says.
-- **Add no `.probe`, `.ic`, `.nodeset`, `K` coupling or `.options interp`.** Konnect refuses some of them and they change the circuit in the rest. The capacitor in the fuse uses `IC=` on the device, which is safe, and every block also runs with `use_initial_conditions`.
+- **Add no `.probe`, `.ic`, `.nodeset`, `K` coupling or `.options interp`.** Copperpour refuses some of them and they change the circuit in the rest. The capacitor in the fuse uses `IC=` on the device, which is safe, and every block also runs with `use_initial_conditions`.
 - **Rename what collides.** Nodes and elements carry the prefixes `sh_`, `fz_`, `ef_`, `uv_`, `rb_` and `RSHORT`, `VFZS` and so on. Change one that a part of your schematic already uses.
 - **Use `**` for powers.** `exp()` in a behavioural expression turns linear above an argument of 14, so `exp(ln(1G)*x)` quietly reads 9.3 Mohm for 1 Gohm.
 

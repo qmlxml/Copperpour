@@ -1,4 +1,4 @@
-//! The contract between the server and the `konnect sim-worker` process.
+//! The contract between the server and the `copperpour sim-worker` process.
 //!
 //! The worker and the server can come from different builds: an in-place update
 //! replaces the file `current_exe()` names while the old server keeps running.
@@ -23,7 +23,7 @@ pub const RAW_FILE: &str = "results.raw";
 pub const LOG_FILE: &str = "engine.log";
 pub const STATUS_FILE: &str = "status.json";
 
-/// What `konnect sim-worker --run-dir` was asked to do.
+/// What `copperpour sim-worker --run-dir` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRequest {
     pub protocol: u32,
@@ -66,7 +66,7 @@ pub struct RunStatus {
     pub results_written: bool,
 }
 
-/// What `konnect sim-worker --probe` observed by loading the library.
+/// What `copperpour sim-worker --probe` observed by loading the library.
 ///
 /// Every field comes from that load. A library that exists but cannot load is
 /// `load_error`, so a path alone never reads as an available engine.

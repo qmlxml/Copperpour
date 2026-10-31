@@ -193,6 +193,7 @@ column comes from `extract_error_kind()`, so JSONL logs share the vocabulary.
 | `invalid_argument` | Required argument missing/malformed |
 | `file_not_found` | Referenced file or project-discovery directory missing or unreadable |
 | `conflict` | File changed, a write would replace existing paths, or schematic project ownership is not provably unique — carries the paths; ownership conflicts include the schematic dir and all candidate roots |
+| `simulation_failed` | A simulation stopped before giving a result: the engine is missing or crashed, the export failed, preflight refused the deck, or the run left no data — carries `stage`, a fixed `reason`, `log_path`, and `items`; branch on `reason` and fix what `items` names |
 | `wrong_document` | Requested PCB is not among KiCad's positively identified open documents — carries `requested`, `open_documents`; path-bearing IPC never substitutes another board |
 | `ambiguous_target` | Several observed UUIDs, reference/units, fields, instances or PCB identities match, or instance records conflict across projects, units or hierarchy paths — carries `target`, stable `candidates`; the caller must choose |
 | `stale_target` | A bound PCB is no longer uniquely open, saved instance metadata disagrees with the proven hierarchy, or prospective state lacks the expected document, UUID/reference, unit, library, hierarchy, position, rotation or property — carries `target`, `reason`; refused before writing |
@@ -356,7 +357,7 @@ checked readers for domain rules.
 
 ## Current Stats
 
-- **21 toolsets, 245 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime
+- **22 toolsets, 245 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime
   diagnostic — see `tool-directory.md`). The standalone Unix executable adds
   `reload_server` over stdio only — not embedded, HTTP, mixed transport or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens. Full catalogue: 252 tools (245 registered + 7 meta) / ~25K tokens.

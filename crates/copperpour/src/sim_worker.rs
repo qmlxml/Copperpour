@@ -1,11 +1,11 @@
-//! The hidden `konnect sim-worker` subcommand.
+//! The hidden `copperpour sim-worker` subcommand.
 //!
 //! libngspice can segfault, call `exit`, or hang, so it never loads inside the
 //! MCP server. This process loads it, does one job, and exits. All FFI lives
-//! here; `konnect-core` stays free of `unsafe`.
+//! here; `copperpour-core` stays free of `unsafe`.
 
 use anyhow::{bail, Context, Result};
-use konnect_core::simulation::protocol::{
+use copperpour_core::simulation::protocol::{
     HaltReason, ProbeReport, RunRequest, RunStatus, DECK_FILE, LOG_FILE, PROTOCOL_VERSION,
     RAW_FILE, REQUEST_FILE, STATUS_FILE,
 };

@@ -60,7 +60,7 @@ const MODEL_LINES_NOTE: &str = "lines quoting a model file are in the log.";
 const MIN_PRIVATE_WORD: usize = 4;
 /// Progress such as gmin stepping, which says nothing about the circuit.
 const ENGINE_NOTE: &str = "Note:";
-/// The engine answering Konnect's own halt, which `stopped` already reports.
+/// The engine answering Copperpour's own halt, which `stopped` already reports.
 const HALT_NOTICES: [&str; 2] = ["doAnalyses: pause requested", "run simulation interrupted"];
 /// The engine's status variable, which ends the part of a log worth reading.
 const STATUS_NAME: &str = "sim_status";
@@ -772,7 +772,7 @@ fn sets_node_conditions(deck: &FlatDeck) -> bool {
         .any(|prefix| cards_starting(deck, prefix).next().is_some())
 }
 
-/// A caller's own `.probe` would lose the voltages that Konnect's are held back to
+/// A caller's own `.probe` would lose the voltages that Copperpour's are held back to
 /// keep, and it cannot be taken out of a deck that names it on purpose.
 fn probe_conflict(deck: &FlatDeck) -> Option<CallToolResult> {
     let items: Vec<String> = cards_starting(deck, ".probe")
@@ -792,7 +792,7 @@ fn probe_conflict(deck: &FlatDeck) -> Option<CallToolResult> {
     })
 }
 
-/// Konnect's own lines after the vetted deck. They hold nothing from a caller:
+/// Copperpour's own lines after the vetted deck. They hold nothing from a caller:
 /// the analysis is numbers formatted here, and a probe names a deck element.
 fn own_lines(analysis: &Analysis, save_currents: bool, probes: &[String]) -> Vec<String> {
     let mut lines = vec![SAVE_ALL_VOLTAGES.to_string()];
@@ -1515,7 +1515,7 @@ fn inputs_hash(mut hasher: Sha256, inlined_files: &[PathBuf]) -> std::io::Result
         hasher.update([0]);
         hasher.update(std::fs::read(path)?);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::hex::encode_hex(&hasher.finalize()))
 }
 
 /// KiCad wipes its per-user IBIS cache on every SPICE export, from any project,
@@ -1556,7 +1556,7 @@ async fn inspect_design(
     inputs: &DesignInputs<'_>,
 ) -> anyhow::Result<Design> {
     let scratch = tempfile::Builder::new()
-        .prefix("konnect-sim-export-")
+        .prefix("copperpour-sim-export-")
         .tempdir()?;
     let source = scratch.path().join("src");
     std::fs::create_dir(&source)?;
@@ -2515,7 +2515,23 @@ mod tests {
 
     mod with_fake_cli {
         use super::*;
-        use crate::tools::cli::test_support::write_script;
+        /// Copperpour's `write_script` writes the body as given. Linux does not run
+        /// a script without a `#!` line (execve fails with ENOEXEC, "Exec format
+        /// error"); these tests were written on macOS, so this adds `#!/bin/sh`
+        /// when the body has none (merge adaptation, plan step 4).
+        fn write_script(
+            dir: &std::path::Path,
+            stem: &str,
+            unix_body: &str,
+            windows_body: &str,
+        ) -> std::path::PathBuf {
+            let body = if unix_body.starts_with("#!") {
+                unix_body.to_owned()
+            } else {
+                format!("#!/bin/sh\n{unix_body}")
+            };
+            crate::tools::cli::test_support::write_script(dir, stem, &body, windows_body)
+        }
 
         const OP_FIXTURE: &str = "tests/fixtures/simulation/raw/op.ascii.raw";
         /// Good status fields, for a fake worker to write.
@@ -2856,7 +2872,7 @@ mod tests {
                             "{name} lost {line}\n{deck}"
                         );
                     }
-                    // The only probe is Konnect's own, and with no `.ic` it stays under uic.
+                    // The only probe is Copperpour's own, and with no `.ic` it stays under uic.
                     assert_eq!(deck.matches(".probe").count(), 1, "{name}: {deck}");
                     assert!(deck.contains("\n.probe alli\n"), "{name}: {deck}");
                     for refused in [".ic", ".nodeset", "\nk", ".options interp"] {

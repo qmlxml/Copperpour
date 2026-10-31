@@ -1,8 +1,8 @@
-# SPICE simulation for Konnect
+# SPICE simulation for Copperpour
 
 Planning document, kept current as the PR series lands. PRs 1 to 3 are implemented.
 
-Evidence base: KiCad 10.0.1 on macOS arm64 with its bundled ngspice-44.2; Konnect `main` at `c7e87cd8a`; KiCad source at tag `10.0.1`, commit `2db9e5a72b7c`; ngspice source at master, 44.2 and 42. Every cited KiCad file was diffed between that tag and the `10.0` branch [verified: run E71].
+Evidence base: KiCad 10.0.1 on macOS arm64 with its bundled ngspice-44.2; Copperpour `main` at `c7e87cd8a`; KiCad source at tag `10.0.1`, commit `2db9e5a72b7c`; ngspice source at master, 44.2 and 42. Every cited KiCad file was diffed between that tag and the `10.0` branch [verified: run E71].
 
 Review status: the first draft went through one adversarial review by four independent reviewers. Later revisions were checked by experiment, not by a second review.
 
@@ -12,15 +12,15 @@ Tags: `[verified: run]` was executed here. `[verified: source]` was read in sour
 
 ### Problem
 
-An assistant driving KiCad through Konnect can draw a circuit but cannot check how it behaves. KiCad has a simulator, but it is reachable only from the GUI. `kicad-cli sch` offers `erc`, `export` and `upgrade`, and KiCad's IPC API has no simulation commands [verified: run].
+An assistant driving KiCad through Copperpour can draw a circuit but cannot check how it behaves. KiCad has a simulator, but it is reachable only from the GUI. `kicad-cli sch` offers `erc`, `export` and `upgrade`, and KiCad's IPC API has no simulation commands [verified: run].
 
 ### Proposal
 
 Add an on-demand `simulation` toolset that gives an assistant what KiCad's simulator does, in four stages:
 
-1. **Snapshot and export.** Konnect copies the saved schematic into a private run folder and runs KiCad's own exporter there. Nothing touches the user's project, and there is no second netlister.
+1. **Snapshot and export.** Copperpour copies the saved schematic into a private run folder and runs KiCad's own exporter there. Nothing touches the user's project, and there is no second netlister.
 2. **Preflight.** Pure Rust inlines everything the simulator will read into one vetted deck, then refuses any deck that cannot give a trustworthy result.
-3. **Run.** A hidden `konnect sim-worker` subprocess, one per run, loads the libngspice that KiCad already installed. It is the same engine KiCad's simulator uses.
+3. **Run.** A hidden `copperpour sim-worker` subprocess, one per run, loads the libngspice that KiCad already installed. It is the same engine KiCad's simulator uses.
 4. **Report.** Pure Rust parses the raw results file, computes time-weighted measurements and returns compact JSON. Full data stays on disk and is returned by path.
 
 ### Why this shape
@@ -60,7 +60,7 @@ It does not cover noise, pole-zero, transfer function, sensitivity, FFT, S-param
 | Loading libngspice inside the MCP server | A crash would take the server down [verified: run]. KiCad needs crash handlers for this [verified: source] |
 | Linking or bundling ngspice | Adds redistribution duties for LGPL, MPL and GPL parts [verified: source] |
 | ngspice `.meas` for measurements | Text output only, and a failed measure leaves `run` returning 0 [verified: run] |
-| Running `kicad-cli` on the live project | `kicad-cli` takes a project lock on every run, and a kill strands it in the project [verified: run]. Konnect's viewer also records, on Windows, a nonzero exit after a good export with a foreign lock, and KiCad saves failing during export [verified: source]. On macOS every lock state tested still exited 0 [verified: run] |
+| Running `kicad-cli` on the live project | `kicad-cli` takes a project lock on every run, and a kill strands it in the project [verified: run]. Copperpour's viewer also records, on Windows, a nonzero exit after a good export with a foreign lock, and KiCad saves failing during export [verified: source]. On macOS every lock state tested still exited 0 [verified: run] |
 | Keeping `.include` lines and scanning files separately | More paths to resolve, and ngspice's own lookup differs from any scanner [verified: source]. A single flat deck gives one artifact to check |
 
 ### Acceptance criteria
@@ -88,7 +88,7 @@ It does reimplement some KiCad behaviour, each piece for a stated reason:
 
 ### Where this lands
 
-`mixelpixx/Konnect` is archived and read-only, so no issue or PR can go there. Its successor, Konnect-EDA, is commercial and closed source, so it can take a feature request but not this code [verified: run]. This work lands in an AGPL-3.0 fork at `c7e87cd8a`, and this summary is written for that fork's tracker.
+`mixelpixx/Copperpour` is archived and read-only, so no issue or PR can go there. Its successor, Copperpour-EDA, is commercial and closed source, so it can take a feature request but not this code [verified: run]. This work lands in an AGPL-3.0 fork at `c7e87cd8a`, and this summary is written for that fork's tracker.
 
 ## 2. Toolset
 
@@ -96,7 +96,7 @@ It does reimplement some KiCad behaviour, each piece for a stated reason:
 
 ### 2.1 Coverage of KiCad's simulator
 
-| KiCad simulator feature | Konnect coverage | Arrives |
+| KiCad simulator feature | Copperpour coverage | Arrives |
 |---|---|---|
 | DC operating point | `run_simulation`, kind `operating_point` | PR 6 |
 | Transient | kind `transient` | PR 7 |
@@ -120,11 +120,11 @@ It does reimplement some KiCad behaviour, each piece for a stated reason:
 
 ### 2.2 Pipeline rules
 
-**Snapshot and export.** `cli::export_spice_netlist` copies the root sheet, its sub-sheets and the `.kicad_pro` into `<run_dir>/src/` by plain read and write, porting the viewer's `snapshot_tree` [verified: source E48]. Project-relative `Sim.Library` values are rewritten in the copy to live absolute paths, so KiCad's resolver finds them. Across KiCad's 18 simulation demos this gave the same netlist lines as a full project copy, byte for byte on 17 and reordered on one. Without the rewrite, 15 of the 18 exit 2. No `sym-lib-table` is needed [verified: run E65]. A sheet outside the project is refused. The KiCad-format netlist is exported first and the SPICE netlist second, with stdin null and `kill_on_drop`, and flattening follows at once, because IBIS models include a cache file in KiCad's per-user folder that a later SPICE export from any project can wipe [verified: run E66]. Readiness exports are serialised within one server for the same reason. Another SPICE export, from `generate_netlist` or a second Konnect process, can still wipe the cache first; that fails closed as `model_library_missing`, and retrying clears it. Any nonzero exit is then a real failure, a timeout may kill the child, both exports read one state, and no lock or file handle touches the project: a kill strands its lock only inside the run directory [verified: run E67]. The artifacts must be non-empty, and exit 2 still writes a file, so a file alone proves nothing [verified: run E65].
+**Snapshot and export.** `cli::export_spice_netlist` copies the root sheet, its sub-sheets and the `.kicad_pro` into `<run_dir>/src/` by plain read and write, porting the viewer's `snapshot_tree` [verified: source E48]. Project-relative `Sim.Library` values are rewritten in the copy to live absolute paths, so KiCad's resolver finds them. Across KiCad's 18 simulation demos this gave the same netlist lines as a full project copy, byte for byte on 17 and reordered on one. Without the rewrite, 15 of the 18 exit 2. No `sym-lib-table` is needed [verified: run E65]. A sheet outside the project is refused. The KiCad-format netlist is exported first and the SPICE netlist second, with stdin null and `kill_on_drop`, and flattening follows at once, because IBIS models include a cache file in KiCad's per-user folder that a later SPICE export from any project can wipe [verified: run E66]. Readiness exports are serialised within one server for the same reason. Another SPICE export, from `generate_netlist` or a second Copperpour process, can still wipe the cache first; that fails closed as `model_library_missing`, and retrying clears it. Any nonzero exit is then a real failure, a timeout may kill the child, both exports read one state, and no lock or file handle touches the project: a kill strands its lock only inside the run directory [verified: run E67]. The artifacts must be non-empty, and exit 2 still writes a file, so a file alone proves nothing [verified: run E65].
 
 **Run directory.** `<state root>/simulation/<project hash>/<run_id>/`. `state root` is `KONNECT_STATE_DIR`, else `dirs::data_local_dir()/konnect`, exposed through one shared helper [verified: source E60]. It sits outside the project because raw files can reach hundreds of MB and projects may be in synced folders. `project hash` is SHA-256 of the canonical path, truncated to 12 hex. `run_id` is `<project hash>-<yyyymmddThhmmss>-<4 hex>`, so lookup needs no scan. Schemas enforce the pattern and the handler re-checks it, as `validate_transaction_id` does [verified: source E60]. The newest 20 runs per project are kept, from the first PR that creates runs.
 
-**Flattening.** Konnect reads every file the deck references and inlines it into one `deck.sp`. The engine opens no model file. That removes path quoting, nested-include lookup, and every difference between Konnect's path logic and ngspice's. Lines are matched after trimming whitespace, ignoring case, by prefix, because that is how ngspice matches them [verified: run E19, E52].
+**Flattening.** Copperpour reads every file the deck references and inlines it into one `deck.sp`. The engine opens no model file. That removes path quoting, nested-include lookup, and every difference between Copperpour's path logic and ngspice's. Lines are matched after trimming whitespace, ignoring case, by prefix, because that is how ngspice matches them [verified: run E19, E52].
 
 | Line | From netlist or schematic text | From a model file | From `spice_lines` |
 |---|---|---|---|
@@ -142,7 +142,7 @@ Why these choices:
 
 - Schematic text keeps working: 5 of KiCad's 18 simulation demos have a `.control` block, mostly housekeeping, sharing a text box with `.options` lines those circuits need [verified: source E58]. Removing the block is as safe as refusing it, because the engine never sees it. No person placed such a block in a downloaded model file, so there it is refused.
 - `*#` lines execute as commands [verified: run E20], but `*####` banners are common in real libraries [verified: run E20], so they are removed rather than refused.
-- Konnect writes one fixed `.title` as line 1, because `.title *ng_script` switches the whole deck into command mode [verified: run E51], and KiCad passes that line through from schematic text [verified: run E68].
+- Copperpour writes one fixed `.title` as line 1, because `.title *ng_script` switches the whole deck into command mode [verified: run E51], and KiCad passes that line through from schematic text [verified: run E68].
 - A `.end` in schematic text lands before the elements, so left in place it would cut the circuit off [verified: run E68].
 - KiCad passes a whole text box if any line in it qualifies, so prose beside a directive reaches the deck and fails at parse. A `*#` line or `.measure` alone in a box does not pass [verified: run E68].
 
@@ -152,7 +152,7 @@ A final pass runs on the exact text the engine receives, and states what a line 
 
 Flattened and included decks gave identical results on 13 KiCad demos, inlining 24 model files, and on a real library split into nested includes [verified: run E76].
 
-**Deck assembly.** Line 1 is the fixed `.title`, then the flattened netlist minus excluded references, testbench lines, `.save all`, `.probe alli`, a `.probe p(NAME)` for each part a signal asks about, the requested analysis, `.end`. Those last lines are Konnect's own and carry no caller text: the analysis is numbers it formats, and a probe takes its name from the deck. `.probe` splices hidden sources into the circuit, so it runs only for parts asked about, and not on a coupling, where it stops the run. Under `use_initial_conditions` a device reads its start from its own pins, which a probe has moved to a hidden node, so with a `.ic` or `.nodeset` card every probe of Konnect's stays out, and a `.probe` card from the caller is refused as `probe_loses_initial_conditions`. A device's own `IC=` is not affected [verified: run E92, E94, E95]. Stop time is limited to 1e-15 to 1e6 s, and `max_step_seconds` to the stop time: ngspice's smallest step is a fixed share of its largest, so past those it stops for no reason in the circuit [verified: run E94]. Transient `tstep` is derived as stop time divided by 2000, which keeps the crash ratio out of reach, because the crash follows `tstop/tstep` rather than `tmax` [verified: run E10, E91]. It also caps the step at that size unless `max_step_seconds` says otherwise, and the `.tran` line states the cap whenever `start_save_seconds` is set, because ngspice would otherwise size it from the saved stretch alone [verified: run E94], and a run needs a step near a hundredth of its fastest edge to place a peak in time [verified: run E93].
+**Deck assembly.** Line 1 is the fixed `.title`, then the flattened netlist minus excluded references, testbench lines, `.save all`, `.probe alli`, a `.probe p(NAME)` for each part a signal asks about, the requested analysis, `.end`. Those last lines are Copperpour's own and carry no caller text: the analysis is numbers it formats, and a probe takes its name from the deck. `.probe` splices hidden sources into the circuit, so it runs only for parts asked about, and not on a coupling, where it stops the run. Under `use_initial_conditions` a device reads its start from its own pins, which a probe has moved to a hidden node, so with a `.ic` or `.nodeset` card every probe of Copperpour's stays out, and a `.probe` card from the caller is refused as `probe_loses_initial_conditions`. A device's own `IC=` is not affected [verified: run E92, E94, E95]. Stop time is limited to 1e-15 to 1e6 s, and `max_step_seconds` to the stop time: ngspice's smallest step is a fixed share of its largest, so past those it stops for no reason in the circuit [verified: run E94]. Transient `tstep` is derived as stop time divided by 2000, which keeps the crash ratio out of reach, because the crash follows `tstop/tstep` rather than `tmax` [verified: run E10, E91]. It also caps the step at that size unless `max_step_seconds` says otherwise, and the `.tran` line states the cap whenever `start_save_seconds` is set, because ngspice would otherwise size it from the saved stretch alone [verified: run E94], and a run needs a step near a hundredth of its fastest edge to place a peak in time [verified: run E93].
 
 **Engine hardening.**
 
@@ -167,13 +167,13 @@ Flattened and included decks gave identical results on 13 KiCad demos, inlining 
 
 This is hardening, not a sandbox. See R4.
 
-**Worker.** `konnect sim-worker --protocol 1 --run-dir <dir>`, or `--probe`, hidden from help. Parent side: `kill_on_drop`, stdin null, stdout and stderr to files in the run directory, because a child must not hold the MCP pipes [verified: source E60]. Sequence: read `request.json`; `dlopen`; init, with no `nospinit` calls; load code models with `codemodel` [verified: run E34]; send `set ngbehavior=...` before the deck, from the project's `model_mode` (0 none, 1 none, 2 `psa`, 3 `lta`, 4 `ltpsa`, 5 `hsa`), default `ltpsa` when absent or when no workbook is saved, as KiCad's simulator does [verified: source E5, E82; run E32]; drop process rights; `ngSpice_Circ`; `bg_run`; wait for the exit flag; print `$sim_status` through its own `echo` marker, because the library has no getter [verified: run E15, source E11]; `write results.raw`; write `status.json` last, with the explicit `halted_reason`. Single use, then exit. The worker also exits by itself at timeout plus grace, so a dead parent cannot leave it stuck.
+**Worker.** `copperpour sim-worker --protocol 1 --run-dir <dir>`, or `--probe`, hidden from help. Parent side: `kill_on_drop`, stdin null, stdout and stderr to files in the run directory, because a child must not hold the MCP pipes [verified: source E60]. Sequence: read `request.json`; `dlopen`; init, with no `nospinit` calls; load code models with `codemodel` [verified: run E34]; send `set ngbehavior=...` before the deck, from the project's `model_mode` (0 none, 1 none, 2 `psa`, 3 `lta`, 4 `ltpsa`, 5 `hsa`), default `ltpsa` when absent or when no workbook is saved, as KiCad's simulator does [verified: source E5, E82; run E32]; drop process rights; `ngSpice_Circ`; `bg_run`; wait for the exit flag; print `$sim_status` through its own `echo` marker, because the library has no getter [verified: run E15, source E11]; `write results.raw`; write `status.json` last, with the explicit `halted_reason`. Single use, then exit. The worker also exits by itself at timeout plus grace, so a dead parent cannot leave it stuck.
 
 `--probe` loads the library, initialises it and prints version and code-model count as JSON. It is the only source of `engine.version` and `available`, so a library that exists but cannot load is never reported as available.
 
 **How konnect-core finds the worker.** A `OnceLock` on `ToolContext`, set through a `McpHandler` setter called only from `main.rs`, carries the worker path and ngspice keys [verified: source E60]. Embedded and test contexts refuse by absence, and tests inject a fake worker.
 
-**Limits.** `timeout_seconds` is a budget for the whole call, export included. Default 40, because clients on the TypeScript SDK time out at 60 s and Konnect sends no progress [verified: source E59]; maximum 600. The worker runs `bg_halt` at the budget, keeps partial data, and the parent kills 15 s later, because `bg_halt` is cooperative [verified: source E11]. `max_raw_bytes` default 256 MiB, maximum 1 GiB: ngspice's data callback counts the points on the engine's own thread, and the worker halts softly at the limit, since memory is about 8 bytes per point per vector at about 700,000 points per second [verified: run E25, E90]. The callback costs nothing measurable. Polling `ngGet_Vec_Info` from the main thread does not work [verified: run E90]. A halt lands just past the limit, so the server's read limit stands 25 percent above the maximum. Soft halt rescued a real runaway: 4 s, 173,841 points, 5.18 of 20 ms, data intact [verified: run E57].
+**Limits.** `timeout_seconds` is a budget for the whole call, export included. Default 40, because clients on the TypeScript SDK time out at 60 s and Copperpour sends no progress [verified: source E59]; maximum 600. The worker runs `bg_halt` at the budget, keeps partial data, and the parent kills 15 s later, because `bg_halt` is cooperative [verified: source E11]. `max_raw_bytes` default 256 MiB, maximum 1 GiB: ngspice's data callback counts the points on the engine's own thread, and the worker halts softly at the limit, since memory is about 8 bytes per point per vector at about 700,000 points per second [verified: run E25, E90]. The callback costs nothing measurable. Polling `ngGet_Vec_Info` from the main thread does not work [verified: run E90]. A halt lands just past the limit, so the server's read limit stands 25 percent above the maximum. Soft halt rescued a real runaway: 4 s, 173,841 points, 5.18 of 20 ms, data intact [verified: run E57].
 
 **Preflight findings,** run on the assembled deck, after exclusions and testbench lines.
 
@@ -192,7 +192,7 @@ This is hardening, not a sandbox. See R4.
 | `unreadable_model` | NUL bytes or invalid UTF-8 outside comments | Refused | [verified: run E19] |
 | `model_library_missing` | Unresolved include, or `kicad-cli` reported a missing library | Refused | [verified: run E12] |
 | `unsafe_deck_content` | Refused forms above, or a path outside the allowed roots, with file and line | Refused | [verified: run E18 to E20, E50 to E52] |
-| `unbalanced_deck_block` | A `.if` or `.subckt` left open, or a stray `.endif` or `.ends`, matched by prefix as ngspice does. An open block swallows the analysis line Konnect adds, and the engine then reports a failure that hides the cause | Refused | [verified: run E89] |
+| `unbalanced_deck_block` | A `.if` or `.subckt` left open, or a stray `.endif` or `.ends`, matched by prefix as ngspice does. An open block swallows the analysis line Copperpour adds, and the engine then reports a failure that hides the cause | Refused | [verified: run E89] |
 | `device_currents_not_saved` | Digital or event-driven parts are present, or a `.ic` or `.nodeset` card meets `use_initial_conditions`, so `.probe alli` is left out and only analog node voltages and source currents are saved | Warning, in the result | [verified: run E88, E94] |
 | `probe_loses_initial_conditions` | A `.probe` card meets `.ic` or `.nodeset` under `use_initial_conditions` | Refused | [verified: run E95] |
 | `no_point_at_start` | ngspice saved no point at time zero, as under `use_initial_conditions`, so an event at that instant is cut short. `analysis.first_point_seconds` says where the data starts | Warning, in the result | [verified: run E94] |
@@ -550,7 +550,7 @@ Renders stored signals to an SVG file and returns its path.
 
 Output: `{ path, width_px, height_px, bytes, signals_plotted, run_status, coverage_ratio, simulated_circuit, inputs_changed_since_run }`. The SVG carries a visible banner if the run was partial or modified, and envelopes are downsampled so file size stays bounded. Same errors as `measure_simulation_run`, and an absent signal is `invalid_argument`.
 
-**Rendering decision.** v1 writes SVG with a small Rust module and adds no plotting crate. `konnect_render::svg_to_png` refuses visible `<text>` [verified: source E41], so a PNG needs labels as stroke paths, which comes later with a small vector font [assumed: licence to be checked]. Inline images come later too, only on explicit request, capped at 800 px, with the JSON block first because `outcome::attach` reads the first block [verified: source E42].
+**Rendering decision.** v1 writes SVG with a small Rust module and adds no plotting crate. `copperpour_render::svg_to_png` refuses visible `<text>` [verified: source E41], so a PNG needs labels as stroke paths, which comes later with a small vector font [assumed: licence to be checked]. Inline images come later too, only on explicit request, capped at 800 px, with the JSON block first because `outcome::attach` reads the first block [verified: source E42].
 
 ### 2.4 Later analyses
 
@@ -569,46 +569,46 @@ One PR per family after v1, each adding a `oneOf` arm, an output shape and its f
 
 ## 3. Files to add or change
 
-No new workspace member, because that breaks the Nix build unless the flake changes too [verified: source E43]. `konnect-core` stays free of `unsafe` [verified: source E44].
+No new workspace member, because that breaks the Nix build unless the flake changes too [verified: source E43]. `copperpour-core` stays free of `unsafe` [verified: source E44].
 
 **Add**
 
 | File | Purpose | Pattern followed |
 |---|---|---|
-| `crates/konnect-core/src/tools/simulation.rs` | `tools()`, `tool!` registrations, `handle_*`, schema helpers | `tools/sch_export.rs`; `point_schema()` in `footprint_graphics.rs` |
-| `crates/konnect-core/src/simulation/mod.rs` | Module root | Existing modules |
-| `crates/konnect-core/src/simulation/protocol.rs` | `request.json`, `status.json`, protocol version; shared with the worker | New; both crates depend on it |
-| `crates/konnect-core/src/simulation/snapshot.rs` | Snapshot, `Sim.Library` rewrite, non-bailing hierarchy walk, lock disclosure including `.kicad_pro` | Port of `snapshot_tree`; the viewer is outside the workspace |
-| `crates/konnect-core/src/simulation/flatten.rs` | Flatten, vet, invariant | Pure parsers such as `specctra.rs` |
-| `crates/konnect-core/src/simulation/preflight.rs`, `net_names.rs`, `kicad_netlist.rs`, `element.rs` | Checks, name port, KiCad and SPICE netlist parsing, element parser | Pure parsers |
-| `crates/konnect-core/src/simulation/raw.rs` | Raw file parser | `specctra_ses.rs` |
-| `crates/konnect-core/src/simulation/measure.rs` | Measurements | Pure functions, tests beside the code |
-| `crates/konnect-core/src/simulation/worker_client.rs` | Spawn, supervise, classify | `freerouting_mcp.rs` |
-| `crates/konnect-core/src/simulation/runs.rs` | Run store, retention, id validation | `validate_transaction_id` |
-| `crates/konnect-core/src/simulation/plot.rs` | SVG plot | New |
-| `crates/konnect/src/sim_worker.rs` | Hidden worker: `libloading`, FFI, callbacks, rights drop | `transaction_cli.rs`, `ffi.rs` |
-| `crates/konnect/tests/simulation_live.rs` | Ignored live tests | `tests/e2e_kicad.rs` |
-| `crates/konnect-core/tests/fixtures/simulation/` | Real KiCad and ngspice fixtures with `<name>.README.md` | Fixture convention |
-| `crates/konnect/assets/skills/kicad-simulation/SKILL.md` | Workflow skill and stand-ins | Existing skills |
+| `crates/copperpour-core/src/tools/simulation.rs` | `tools()`, `tool!` registrations, `handle_*`, schema helpers | `tools/sch_export.rs`; `point_schema()` in `footprint_graphics.rs` |
+| `crates/copperpour-core/src/simulation/mod.rs` | Module root | Existing modules |
+| `crates/copperpour-core/src/simulation/protocol.rs` | `request.json`, `status.json`, protocol version; shared with the worker | New; both crates depend on it |
+| `crates/copperpour-core/src/simulation/snapshot.rs` | Snapshot, `Sim.Library` rewrite, non-bailing hierarchy walk, lock disclosure including `.kicad_pro` | Port of `snapshot_tree`; the viewer is outside the workspace |
+| `crates/copperpour-core/src/simulation/flatten.rs` | Flatten, vet, invariant | Pure parsers such as `specctra.rs` |
+| `crates/copperpour-core/src/simulation/preflight.rs`, `net_names.rs`, `kicad_netlist.rs`, `element.rs` | Checks, name port, KiCad and SPICE netlist parsing, element parser | Pure parsers |
+| `crates/copperpour-core/src/simulation/raw.rs` | Raw file parser | `specctra_ses.rs` |
+| `crates/copperpour-core/src/simulation/measure.rs` | Measurements | Pure functions, tests beside the code |
+| `crates/copperpour-core/src/simulation/worker_client.rs` | Spawn, supervise, classify | `freerouting_mcp.rs` |
+| `crates/copperpour-core/src/simulation/runs.rs` | Run store, retention, id validation | `validate_transaction_id` |
+| `crates/copperpour-core/src/simulation/plot.rs` | SVG plot | New |
+| `crates/copperpour/src/sim_worker.rs` | Hidden worker: `libloading`, FFI, callbacks, rights drop | `transaction_cli.rs`, `ffi.rs` |
+| `crates/copperpour/tests/simulation_live.rs` | Ignored live tests | `tests/e2e_kicad.rs` |
+| `crates/copperpour-core/tests/fixtures/simulation/` | Real KiCad and ngspice fixtures with `<name>.README.md` | Fixture convention |
+| `crates/copperpour/assets/skills/kicad-simulation/SKILL.md` | Workflow skill and stand-ins | Existing skills |
 
 **Change**
 
 | File | Change | Pattern |
 |---|---|---|
-| `crates/konnect-core/src/lib.rs`, `src/tools/mod.rs` | Module declarations, `OnceLock` on `ToolContext` | Guidance store |
-| `crates/konnect-core/src/mcp/handler.rs` | Setter for the simulation runtime | Guidance setter |
-| `crates/konnect/src/main.rs` | `sim-worker` in `SUBCOMMANDS`, dispatch, call the setter | `transaction` |
-| `crates/konnect/src/config.rs` | `ngspice_library`, `ngspice_code_models_dir`, `ngspice_model_dirs`, `ngspice_allow_digital_models` (default true) | `kicad_cli`; blank means default as `jlcpcb_db_path` does |
-| `crates/konnect-core/src/router/registry.rs` | `ToolsetMeta { name: "simulation", category: "simulation", tool_count, .. }`, `build_tools_for` arm | `sch_export`. A missing arm panics |
-| `crates/konnect-core/src/tools/cli.rs` | `export_spice_netlist`, `.stdin(Stdio::null())` in `run_cli_captured` | `verify_nonempty_file` |
-| `crates/konnect-core/src/tools/sch_export.rs` | `owning_project_root` to `pub(crate)` | Existing helper |
-| `crates/konnect-core/src/kicad_install.rs` | Library and code-model discovery | `find_cli`; order: config key, sibling of the resolved `kicad-cli`, KiCad install locations, system loader. On macOS map `Contents/MacOS` to `Contents/PlugIns/sim` |
-| `crates/konnect-core/src/runtime_info.rs` | `ngspice` block from `--probe` | `kicad` block; same resolver as the tools |
-| `crates/konnect-core/src/mcp/error.rs` | `SimulationFailed`, `short_code()` arm | Existing kinds, plus the `DEV.md` table |
-| `crates/konnect-core/src/outcome.rs`, `docs/reliability-legacy-inventory.json` | Adopt `run_simulation`, `measure_simulation_run` | Must change together |
-| `Cargo.toml`, `crates/konnect/Cargo.toml`, `Cargo.lock` | `libloading` (ISC) in `konnect` only; `libc` on Unix for `setrlimit`; `windows-sys` on Windows for the job object. Both of the latter are already in `Cargo.lock` but are not direct dependencies of `konnect` [verified: source E64] | `[workspace.dependencies]`; `cfg` target tables as `konnect-core` uses for `winreg` |
+| `crates/copperpour-core/src/lib.rs`, `src/tools/mod.rs` | Module declarations, `OnceLock` on `ToolContext` | Guidance store |
+| `crates/copperpour-core/src/mcp/handler.rs` | Setter for the simulation runtime | Guidance setter |
+| `crates/copperpour/src/main.rs` | `sim-worker` in `SUBCOMMANDS`, dispatch, call the setter | `transaction` |
+| `crates/copperpour/src/config.rs` | `ngspice_library`, `ngspice_code_models_dir`, `ngspice_model_dirs`, `ngspice_allow_digital_models` (default true) | `kicad_cli`; blank means default as `jlcpcb_db_path` does |
+| `crates/copperpour-core/src/router/registry.rs` | `ToolsetMeta { name: "simulation", category: "simulation", tool_count, .. }`, `build_tools_for` arm | `sch_export`. A missing arm panics |
+| `crates/copperpour-core/src/tools/cli.rs` | `export_spice_netlist`, `.stdin(Stdio::null())` in `run_cli_captured` | `verify_nonempty_file` |
+| `crates/copperpour-core/src/tools/sch_export.rs` | `owning_project_root` to `pub(crate)` | Existing helper |
+| `crates/copperpour-core/src/kicad_install.rs` | Library and code-model discovery | `find_cli`; order: config key, sibling of the resolved `kicad-cli`, KiCad install locations, system loader. On macOS map `Contents/MacOS` to `Contents/PlugIns/sim` |
+| `crates/copperpour-core/src/runtime_info.rs` | `ngspice` block from `--probe` | `kicad` block; same resolver as the tools |
+| `crates/copperpour-core/src/mcp/error.rs` | `SimulationFailed`, `short_code()` arm | Existing kinds, plus the `DEV.md` table |
+| `crates/copperpour-core/src/outcome.rs`, `docs/reliability-legacy-inventory.json` | Adopt `run_simulation`, `measure_simulation_run` | Must change together |
+| `Cargo.toml`, `crates/copperpour/Cargo.toml`, `Cargo.lock` | `libloading` (ISC) in `konnect` only; `libc` on Unix for `setrlimit`; `windows-sys` on Windows for the job object. Both of the latter are already in `Cargo.lock` but are not direct dependencies of `konnect` [verified: source E64] | `[workspace.dependencies]`; `cfg` target tables as `copperpour-core` uses for `winreg` |
 | `tool-directory.md` | New section, heading, rows; hand-edit the category count at line 15 | Existing rows; xtask cannot create these |
-| `crates/konnect/assets/skills/konnect/SKILL.md`, `crates/konnect/src/manifest.rs`, `crates/konnect/src/install.rs`, `README.md` | Toolset row, `SKILLS` entry, install-count test, skill count | Existing entries |
+| `crates/copperpour/assets/skills/konnect/SKILL.md`, `crates/copperpour/src/manifest.rs`, `crates/copperpour/src/install.rs`, `README.md` | Toolset row, `SKILLS` entry, install-count test, skill count | Existing entries |
 | `plugin/settings_dialog.py`, `docs/KICAD_INTEGRATION.md`, `docs/TROUBLESHOOTING.md` | New keys, client timeout advice | `kicad_cli` entries |
 | `.github/workflows/e2e-kicad.yml`, `docs/TESTING_AND_RELEASE.md` | New ignored-test step, coverage map | Existing steps |
 
@@ -665,7 +665,7 @@ Recorded here so every implementation session follows them.
   The two flags stop Homebrew from upgrading Python and Node as a side effect. `rustup` is keg-only, so the link is what puts `cargo` on PATH without shell-profile edits; it is untested on this Mac, and `brew unlink rustup` undoes it. The `default` line makes `cargo` work outside the checkout too, where `rust-toolchain.toml` does not apply. Budget about 10 GB for the toolchain and `target/`.
 - **Baseline first.** Before any code change, run on `main` what `ci.yml` runs: `cargo test --workspace --locked --lib --tests`, `cargo test --workspace --locked --doc`, `cargo clippy --workspace --locked --all-targets -- -D warnings`, `cargo deny check licenses`, `cargo fmt --all -- --check`. Nothing yet shows `main` is green on this Mac. A red baseline is reported, not fixed inside a feature PR.
 - **Docs land with the tool.** Every PR that registers a tool also lands its `tool-directory.md` row, the toolset's `tool_count`, and the output of `cargo xtask fix-doc-counts`. `tool_directory_lists_every_registered_tool` and `registry_tool_counts_match_reality` fail at the first registration, so this cannot wait for PR 11.
-- **The installed Konnect is never touched.** It is `~/.local/share/konnect/bin/konnect`, version 0.13.0, SHA-256 starting `3de188bb775ab4ce`, registered in `~/.claude.json`. Every PR's verification re-checks the hash and the entry. Never call `reload_server`: `exec_reload` in `main.rs` re-execs the validated installed binary, so it can never serve the fork, and the restart drops the live toolsets.
+- **The installed Copperpour is never touched.** It is `~/.local/share/konnect/bin/konnect`, version 0.13.0, SHA-256 starting `3de188bb775ab4ce`, registered in `~/.claude.json`. Every PR's verification re-checks the hash and the entry. Never call `reload_server`: `exec_reload` in `main.rs` re-execs the validated installed binary, so it can never serve the fork, and the restart drops the live toolsets.
 - **Dogfood the fork by pipe.** After committing, build with `cargo build --release -p konnect`, then run `target/release/konnect` with `HOME=$PWD/target/dogfood-home` and feed it `initialize` and a `tools/call` of `get_installation_info` on stdin. Trust a result only when `runtime.executable_path` is the fork binary and `build.commit` is the fork's HEAD; a local build records it from `.git` through `build.rs`.
 
 ## 5. Risks and open questions
@@ -674,7 +674,7 @@ Recorded here so every implementation session follows them.
 
 | ID | Decision | Recommendation |
 |---|---|---|
-| **D1** | Where this lands, since the AGPL repo is archived and its successor is closed source | **Decided:** your own AGPL-3.0 fork at `c7e87cd8a`. Keep `deny.toml` unchanged so the code stays portable. Optionally file the summary as a feature request on the Konnect-EDA tracker. Distributing a fork, or offering it to outside users over a network, carries AGPL duties |
+| **D1** | Where this lands, since the AGPL repo is archived and its successor is closed source | **Decided:** your own AGPL-3.0 fork at `c7e87cd8a`. Keep `deny.toml` unchanged so the code stays portable. Optionally file the summary as a feature request on the Copperpour-EDA tracker. Distributing a fork, or offering it to outside users over a network, carries AGPL duties |
 | **D2** | Digital XSPICE models | **Decided: on.** `Class-D`, the `boost` supply and `up-down-counter` then simulate [verified: run E72]. `d_process` and `d_cosim` are refused by the deck scan, because they can start programs or load libraries. `ngspice_allow_digital_models` can turn all digital models off, and no tool can change it. Remaining risk: R4 and Q16 |
 | **D3** | Fidelity on real boards. On a real power distribution board, 102 of 116 elements had no model, mostly connectors, fuses and jumpers [verified: run E75], and many vendor models are encrypted. Results then depend on excluded boundary parts and behavioural stand-ins | **Decided:** accept for v1, with `simulated_circuit: "modified"` on every such result. Typed fault helpers can come later if free text proves limiting |
 
@@ -682,7 +682,7 @@ Recorded here so every implementation session follows them.
 
 | ID | Risk | Mitigation |
 |---|---|---|
-| R1 | A fork drifts with no upstream | Keep `simulation/` free of Konnect internals, so it can move to a standalone server, which would also work beside Konnect-EDA |
+| R1 | A fork drifts with no upstream | Keep `simulation/` free of Copperpour internals, so it can move to a standalone server, which would also work beside Copperpour-EDA |
 | R2 | Models unavailable or encrypted [verified: run E32, source E46] | Detect and say so. Never guess |
 | R3 | ngspice varies by platform, from 42 to 47, with behaviour changes [verified: source E8, E46] | Report the runtime version in every result; `pulse_period_defaulted` |
 | R4 | Vetting and hardening are not a sandbox. Three review rounds found nine routes past the flattener between them [verified: run E82, E83], so a further route is likely. An unknown route would run with the user's rights, and Linux lacks the second barrier in v1. With digital models on, only the deck scan stops `d_cosim`, which can load any library it can name. The scan now has two layers: the two names anywhere, and a literal `.model` type | Test the known list, keep the flat-deck invariant, consider a full OS sandbox later |
@@ -701,7 +701,7 @@ Recorded here so every implementation session follows them.
 | Q1 | Does Windows KiCad provide `ngspice.dll` and `lib\ngspice\*.cm`, and does `LoadLibrary` find dependencies? If not, does the official DLL archive work? | Windows e2e, PR 1 |
 | Q2 | Minimum ngspice version. `sim_status` exists at 42 [verified: source E15], but 42 lacks some exports [verified: source E11] | Live test against Ubuntu's 42 |
 | Q3 | Do S-parameters and distortion run through this path? | Their PRs |
-| Q4 | Does a hardened Konnect build still load KiCad's library? | Only if releases become hardened |
+| Q4 | Does a hardened Copperpour build still load KiCad's library? | Only if releases become hardened |
 | Q5 | How do embedded simulation libraries behave in a snapshot? | Scratch project |
 | Q6 | Can the host load a Flatpak `libngspice`? | Linux test |
 | Q7 | Does a Windows job object block `shell`? What should Linux use, given threads count against `RLIMIT_NPROC`? | PR 6 |
@@ -735,17 +735,17 @@ Recorded here so every implementation session follows them.
 - **Served dispatch:** partial and error results through `McpHandler`, as `RELIABILITY_CONTRACT.md` requires. One test asserts `analysis.stop_time_seconds` is named for a transient with no stop time.
 - **Catalogue gates** apply automatically: `registry_tool_counts_match_reality`, `tool_directory_lists_every_registered_tool`, `every_declared_parameter_is_read_by_its_registered_handler`, `calling_any_tool_with_no_arguments_names_its_first_required_one`, `doc_tool_counts`.
 
-**Ignored live tests,** `crates/konnect/tests/simulation_live.rs`, `#[ignore = "needs KiCad 10 with libngspice"]`, through `env!("CARGO_BIN_EXE_konnect")`:
+**Ignored live tests,** `crates/copperpour/tests/simulation_live.rs`, `#[ignore = "needs KiCad 10 with libngspice"]`, through `env!("CARGO_BIN_EXE_konnect")`:
 
 - Operating point, transient and AC on KiCad's `demos/simulation`, including `rectifier` and `amplifier-ac`. `sallen_key` checks that its `.control` block is dropped and reported. `Q17ng` must return `netlist_export_failed`, because KiCad's own library parser rejects it at 10.0.1 [verified: run E65].
 - Flattening: flattened and included decks match on the KiCad demos, as in E76. `v_i_sources` is left out because it uses random sources and differs from itself between runs.
 - Worker crash: drive `sim-worker` directly with a `.tran 1n 10` deck, then confirm the server answers its next call.
 - Non-convergence with partial data, using the behavioural-source deck from E14.
 - Runaway: a step small enough to outrun the budget halts softly and keeps data; a stuck worker is hard-killed and leaves no process. E57's hard-edged deck was not kept and its runaway was not reproduced [verified: run E98].
-- Rights drop: a hand-built deck bypassing Konnect's vetting cannot start a process on macOS.
+- Rights drop: a hand-built deck bypassing Copperpour's vetting cannot start a process on macOS.
 - Power scenarios: soft-start inrush and load step against E31, and the protection scenarios against `protection/reference.py`, which stands in for E56 [verified: run E97].
 
-**`e2e-kicad.yml`.** Windows, KiCad 10.0.5 through Chocolatey. If Q1 holds, no ngspice install is needed, and the change is one more `cargo test -p konnect --test simulation_live -- --ignored` step. This job gates releases, so a failure blocks publication [verified: source E49]. If Q1 fails, the Chocolatey `ngspice` package is not enough, because it appears to carry the program and not the DLL [verified: source E8]. The fallback is a pinned download of the official DLL archive [assumed]. Linux is not covered by this job. A manual workflow installing Ubuntu's `libngspice0` and `ngspice` gives a version 42 lower bound for Q2.
+**`e2e-kicad.yml`.** Windows, KiCad 10.0.5 through Chocolatey. If Q1 holds, no ngspice install is needed, and the change is one more `cargo test -p copperpour --test simulation_live -- --ignored` step. This job gates releases, so a failure blocks publication [verified: source E49]. If Q1 fails, the Chocolatey `ngspice` package is not enough, because it appears to carry the program and not the DLL [verified: source E8]. The fallback is a pinned download of the official DLL archive [assumed]. Linux is not covered by this job. A manual workflow installing Ubuntu's `libngspice0` and `ngspice` gives a version 42 lower bound for Q2.
 
 **Nix.** Stays hermetic: no new required environment variable, live tests stay ignored [verified: source E43].
 
@@ -759,7 +759,7 @@ Recorded here so every implementation session follows them.
 
 **3. Scope.** See section 4. Smallest useful slice is PR 6; first slice for the first user is PR 7; protection is PR 8. No `Sim.*` tool in v1.
 
-**4. Results.** Compact JSON, measurements in Rust, full data on disk. Plots are SVG files by path in v1. Inline images later, on request only. `konnect-render` rasterises SVG but refuses visible text and has no plotting code [verified: source E41].
+**4. Results.** Compact JSON, measurements in Rust, full data on disk. Plots are SVG files by path in v1. Inline images later, on request only. `copperpour-render` rasterises SVG but refuses visible text and has no plotting code [verified: source E41].
 
 **5. Failures.** One new error kind, plus `outcome` on every result. See the matrix in section 2.3.
 
@@ -777,7 +777,7 @@ Recorded here so every implementation session follows them.
 | E6 | Read `sim_lib_mgr.cpp`, `filename_resolver.cpp` | Library resolution order |
 | E7 | Ran `find`, `otool`, `codesign`, `nm`; loaded the library | `PlugIns/sim/libngspice.0.dylib`, six `.cm` files, no executable, no spinit, banner ngspice-44.2 |
 | E8 | Read build scripts and package indexes, not executed | Library-only on most platforms; versions 42 to 47; `libngspice0` lacks `.cm`; Chocolatey package appears to lack the DLL |
-| E9 | Loaded the library from an ad-hoc-signed host; `codesign` on the installed Konnect | Same signing state: ad-hoc, no hardened runtime |
+| E9 | Loaded the library from an ad-hoc-signed host; `codesign` on the installed Copperpour | Same signing state: ad-hoc, no hardened runtime |
 | E10 | Ran decks under `bg_run` | `.tran 1n 10` and `1n 2.2` exit 139; `1n 1` and `.tran 5m 10 0 1n` survive; blocking `run` hits the exit callback |
 | E11 | Read `sharedspice.c/h`, `ngspice.cpp`, `outitf.c` | `bg_halt` cooperative; raw `exit` and `abort` remain; KiCad traps SIGSEGV; no variable getter; some exports absent at 42; KiCad calls `ngCM_Input_Path` |
 | E12 | Ran a missing `.include` | Exit callback status 1, rc 1, `cannot recover and awaits to be reset or detached` |
@@ -806,13 +806,13 @@ Recorded here so every implementation session follows them.
 | E35 | Ran `.noise`, `.tf`, `.pz`, `.sens`, `linearize` plus `fft`, `alter` | All completed with `sim_status=0` or rc 0 |
 | E36 | Read ngspice `COPYING` | Modified BSD plus LGPL, MPL and GPL parts (`table.cm`) |
 | E37 | Read crates.io and repo metadata | `libloading` ISC, 0.9.0, maintained. Existing bindings stale |
-| E38 | GitHub API; read README | `archived: true`; Konnect-EDA commercial, closed source |
+| E38 | GitHub API; read README | `archived: true`; Copperpour-EDA commercial, closed source |
 | E39 | Read `sch_export.rs`, `tools/mod.rs`, `pcb_sync.rs`, `board_source.rs` | Ownership check, lock handling, source evidence |
 | E40 | Read `tools/mod.rs`, `router/mod.rs`, `footprint_graphics.rs` | Schema closure, Draft 2020-12, `oneOf` precedent |
 | E41 | Read `konnect-render/src/lib.rs` | `svg_to_png` refuses visible text; no plotting crate |
 | E42 | Read `outcome.rs`, `mcp/error.rs`, `sch_components.rs` | Four statuses; `Failed` attached to refusals; count assertion; no process or timeout kind |
 | E43 | Read `DEV.md:55-61`, `xtask`, `doc_tool_counts.rs` | Workspace-member and env-var hazard; doc gates |
-| E44 | Searched the tree | No `unsafe` in `konnect-core`; no lints forbid it |
+| E44 | Searched the tree | No `unsafe` in `copperpour-core`; no lints forbid it |
 | E45 | Read `sch_components.rs`, `sch_batch.rs`, `sim_lib_mgr.cpp` | Arbitrary field writes; five properties on placement; KiCad reads instance fields |
 | E46 | Read forum, vendor and commit sources | Encrypted models unreadable; `PULSE` default change at 46 |
 | E47 | Read `transport/stdio.rs`, `handler.rs` | Serial loop; `notifications/cancelled` unhandled |
@@ -827,8 +827,8 @@ Recorded here so every implementation session follows them.
 | E56 | Ran stand-ins | Fuse: 343 A peak, opened at 5.0275 ms for a 5 ms short, 2.06 A²s. eFuse: 5.0 A. UVLO: 10.005 and 9.001 V. Reverse: -1 µA, 11.59 V at 12 V |
 | E57 | Ran a hard-edged stand-in | Blocking `run` exceeded 2 minutes at 500 MB; `bg_halt` at 4 s kept 173,841 points to 5.18 of 20 ms, `sim_status=0` |
 | E58 | Searched `demos/simulation` at tag 10.0.1 | `.control` in `sallen_key`, `Class-D`, `smps-com`, `royer1`, `Q17ng`: 5 of 18 |
-| E59 | Review read the MCP TypeScript SDK | `DEFAULT_REQUEST_TIMEOUT_MSEC = 60_000`; no progress in Konnect |
-| E60 | Review read Konnect source | Guidance `OnceLock` pattern, `validate_transaction_id`, state-root logic, dangling `$ref` panic path, oneOf error selection, parameter-usage scan depth, `design_hash` set, stdio rule for children, schema catalogue cost, gnu Linux target |
+| E59 | Review read the MCP TypeScript SDK | `DEFAULT_REQUEST_TIMEOUT_MSEC = 60_000`; no progress in Copperpour |
+| E60 | Review read Copperpour source | Guidance `OnceLock` pattern, `validate_transaction_id`, state-root logic, dangling `$ref` panic path, oneOf error selection, parameter-usage scan depth, `design_hash` set, stdio rule for children, schema catalogue cost, gnu Linux target |
 | E61 | Read `deny.toml` | Allow list includes ISC; no GPL or LGPL |
 | E62 | Review read `Device.kicad_symdir`, `Simulation_SPICE.sp` | Varistor default threshold 1 kV; Fuse and TVS have no `Sim.` fields |
 | E63 | Ran a mistyped source node and a `.dc` on an absent source | Mistyped node: `sim_status=0`, no warnings, `v(out)` 0.0. Absent target: `no such device`, `sim_status=1` |
@@ -854,7 +854,7 @@ Recorded here so every implementation session follows them.
 | E96 | Third independent review of PR 7, each case run through `run_simulation`, on `buck_conv`, `LM317` and `boost` among others | Fixed: the last sample stood in for the final level, so `settling_time` on `buck_conv` read 1.145, 1.365 or 2.390 ms by where the window ended. An inrush back to zero had no band and read `no_transition`. No route to a lost start voltage reproduced, and removing `interp` breaks no demo or shipped library. Accepted: a window ending just past a crest passes the checks, a sag that stays down reads as overshoot, the drift check refuses some finished signals at some window lengths, every `.probe` is refused under `uic` though `v()` and `i()` of some parts hold, and a 500 fA step reads as noise |
 | E97 | Rebuilt the five E56 stand-ins as decks, ran each through `run_simulation` at 0.1 to 10 µs steps and under `uic`, and compared with `protection/reference.py`: closed forms, bisection for the nonlinear loads, RK4 at 1 ns for the fuse | Short 480.03998667 A and 2.39920027 V, to every digit. Fuse opens at 5.020535 ms against 5.020498 ms from the reference, passes 399.5497 A at its peak against 399.5503 A, and carries 12 µA after. eFuse 11.97976185 V against 11.97976188 V, 5.000 A into the short. UVLO on within 3 mV of 10 V and off within 1 mV of 9 V, at a 10 µs step: a crossing is interpolated inside the one-step jump, so the level moves it by half a step. Reverse -1.0 µA and 11.97000081 V. E56 differed where its decks did: 343 A, 2.06 A²s and 11.59 V came from other resistances and a coarser step. A fuse with no latch settled half open at 1.07 A, because the current falls as the resistance rises. The integral overshoots the trip by up to the current squared times the step: 2.0059 A²s at 0.1 µs and 2.0174 at 0.2 µs, against a trip at 2.002 and a bound of 0.016 and 0.032 above it. All five also run under `uic`, keeping device currents. Net names like `/rect_out` work inside expressions. An independent review found three limits, now in the skill: a 1 µH ahead of the fuse gave a 21.9 kV spike and -5 mA ringing after it opened, with the run still `complete`; `rb_ron` is the resistance only where its drop is above about 30 mV, because of the 10 mV knee; and the reverse stand-in leaks 45 mA at 5 mV in reverse and reaches `rb_roff` only past about 100 mV |
 | E98 | Compared the engine with the reference on a 1 GΩ off state, then probed `exp()`, `**` and `pow()` in a B source. Rebuilt hard-edged shorts: a vertical PWL edge, a 1 ns edge, a zero-rise pulse and a behavioural step, with and without 1 µH and 100 µF. Ran a lockout behind 0.5 and 3 Ω of source | `exp(x)` is exact to 14 and linear above it: `exp(15)` reads 2.4052e6, twice `exp(14)`, so `exp(ln(1G))` read 9.288e6 and the off state leaked 1.3 µA more than the reference. `**` and `pow()` are exact. Every hard-edged short completed at the default step and at 0.1 µs, so E57's runaway was not reproduced with these. The 0.5 Ω lockout ran and shifted its off point to 18.63 ms. The 3 Ω lockout sagged from 10 V to 8 V, chattered and stopped with `no_convergence` at 10.00000003 ms |
-| E64 | Read `Cargo.toml`, `Cargo.lock`, and the `konnect` and `konnect-core` manifests | `dirs` and `sha2` already in `konnect-core`. `libc` 0.2.189 and `windows-sys` 0.61.2 are in the lock, not direct dependencies of `konnect` |
+| E64 | Read `Cargo.toml`, `Cargo.lock`, and the `konnect` and `copperpour-core` manifests | `dirs` and `sha2` already in `copperpour-core`. `libc` 0.2.189 and `windows-sys` 0.61.2 are in the lock, not direct dependencies of `konnect` |
 | E65 | Ran both netlist formats on all 18 demos at tag 10.0.1: full copy, snapshot with `Sim.Library` rewrite, snapshot without | Snapshot matched byte for byte on 17; `laser_driver` had the same lines in a different order. Without the rewrite 15 exit 2 and still write a file, with `Simulation model library not found`. `Q17ng` exits 2 either way: KiCad's parser rejects `all_devices.lib` |
 | E66 | Ran the `ibis` demo repeatedly and after other projects' exports; read the cache cleanup in `netlist_exporter_spice.cpp` at the tag | Includes `~/Library/Caches/KiCad/10.0/ibis/U1.cache`. Present after its own exports; missing after later exports from other projects |
 | E67 | Ran locks on scratch copies: clean run, same-user, foreign, unparseable, sheet lock, SIGKILL | Clean run removes its lock. All lock states exit 0 with a good file; unparseable also prints an error. SIGKILL strands the lock |

@@ -25,7 +25,7 @@ pub(crate) struct RunFolder {
 fn project_hash(schematic: &Path) -> std::io::Result<String> {
     let canonical = schematic.canonicalize()?;
     let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-    let mut hash = format!("{digest:x}");
+    let mut hash = crate::hex::encode_hex(&digest);
     hash.truncate(HASH_CHARS);
     Ok(hash)
 }

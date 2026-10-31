@@ -39,7 +39,7 @@ const SUBCOMMANDS: &[&str] = &[
     "skill",
     "hook",
     "transaction",
-    konnect_core::simulation::protocol::WORKER_SUBCOMMAND,
+    copperpour_core::simulation::protocol::WORKER_SUBCOMMAND,
 ];
 
 fn classify(args: &[String]) -> Cli<'_> {
@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
             return install::print_hook_output(name);
         }
         Cli::Subcommand("transaction") => return transaction_cli::run(&args[2..]),
-        Cli::Subcommand(konnect_core::simulation::protocol::WORKER_SUBCOMMAND) => {
+        Cli::Subcommand(copperpour_core::simulation::protocol::WORKER_SUBCOMMAND) => {
             return sim_worker::run(&args[2..]);
         }
         Cli::Subcommand(_) | Cli::Server => {}
@@ -195,8 +195,8 @@ async fn main() -> Result<()> {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
     }
-    match konnect_core::simulation::SimulationRuntime::for_current_executable(
-        konnect_core::simulation::SimulationSettings {
+    match copperpour_core::simulation::SimulationRuntime::for_current_executable(
+        copperpour_core::simulation::SimulationSettings {
             ngspice_library: config.ngspice_library.clone(),
             ngspice_code_models_dir: config.ngspice_code_models_dir.clone(),
             allow_digital_models: config.ngspice_allow_digital_models,

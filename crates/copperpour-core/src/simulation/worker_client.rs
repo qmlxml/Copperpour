@@ -1,4 +1,4 @@
-//! Start and supervise the `konnect sim-worker` process.
+//! Start and supervise the `copperpour sim-worker` process.
 
 use super::protocol::{
     HaltReason, ProbeReport, RunStatus, PROTOCOL_VERSION, RAW_FILE, STATUS_FILE, WORKER_SUBCOMMAND,
@@ -65,12 +65,12 @@ impl SimulationRuntime {
         self.worker_exe = worker_exe;
     }
 
-    pub(crate) fn state_root(&self) -> Result<PathBuf, konnect_sexp::SexpError> {
+    pub(crate) fn state_root(&self) -> Result<PathBuf, copperpour_sexp::SexpError> {
         #[cfg(test)]
         if let Some(root) = &self.state_root {
             return Ok(root.clone());
         }
-        konnect_sexp::writer::state_root()
+        copperpour_sexp::writer::state_root()
     }
 
     pub(crate) fn model_dirs(&self) -> &[PathBuf] {
@@ -182,7 +182,7 @@ async fn run_probe(
     // calls meant to disable these files crash on ngspice-44.2, so point
     // `spinit` lookup at this empty folder instead.
     let scratch = tempfile::Builder::new()
-        .prefix("konnect-sim-probe-")
+        .prefix("copperpour-sim-probe-")
         .tempdir()
         .context("Failed to create a working directory for the simulation worker")?;
     std::fs::write(scratch.path().join(".spiceinit"), "")
@@ -437,7 +437,23 @@ fn display(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::cli::test_support::write_script;
+    /// Copperpour's `write_script` writes the body as given. Linux does not run
+    /// a script without a `#!` line (execve fails with ENOEXEC, "Exec format
+    /// error"); these tests were written on macOS, so this adds `#!/bin/sh`
+    /// when the body has none (merge adaptation, plan step 4).
+    fn write_script(
+        dir: &std::path::Path,
+        stem: &str,
+        unix_body: &str,
+        windows_body: &str,
+    ) -> std::path::PathBuf {
+        let body = if unix_body.starts_with("#!") {
+            unix_body.to_owned()
+        } else {
+            format!("#!/bin/sh\n{unix_body}")
+        };
+        crate::tools::cli::test_support::write_script(dir, stem, &body, windows_body)
+    }
 
     fn report(protocol: u32) -> ProbeReport {
         ProbeReport {

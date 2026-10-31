@@ -1118,7 +1118,7 @@ async fn candidate_drc(
             applied.push(library_table);
         }
     }
-    let mut report = cli::run_drc(cli_path, &copy, false).await?;
+    let mut report = cli::run_drc_on_private_copy(cli_path, &copy, false).await?;
     let mut connectivity_diagnostic = None;
     let project_file = source.with_extension("kicad_pro");
     if let Ok(project) = tokio::fs::read(&project_file).await {

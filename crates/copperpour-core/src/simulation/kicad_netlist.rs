@@ -6,7 +6,7 @@
 
 use super::net_names;
 use anyhow::{Context, Result};
-use konnect_sexp::{parse_sexp, SexpNode};
+use copperpour_sexp::{parse_sexp, SexpNode};
 use serde::Serialize;
 use std::collections::HashSet;
 

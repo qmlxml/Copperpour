@@ -3,7 +3,7 @@
 //! A deck can run commands while it loads: through `.control` blocks, `*#` lines,
 //! a `.title *ng_script` line, and files pulled in by anything starting `.inc` or
 //! `.lib`. XSPICE models can start programs or load libraries from an ordinary
-//! `.model` line. So the engine never reads a file: Konnect inlines every
+//! `.model` line. So the engine never reads a file: Copperpour inlines every
 //! include here, and a final check covers the exact lines the engine receives.
 //!
 //! ngspice rewrites lines as it reads them, so that check does not list bad
@@ -292,7 +292,7 @@ impl FlatDeck {
         self.render_with(&[])
     }
 
-    /// The deck with lines Konnect wrote itself, such as the analysis. They go
+    /// The deck with lines Copperpour wrote itself, such as the analysis. They go
     /// after the vetting, so they must never carry text from a caller.
     pub(crate) fn render_with(&self, own_lines: &[&str]) -> String {
         let mut deck = format!("{DECK_TITLE}\n");
@@ -515,7 +515,7 @@ impl Flattener<'_> {
                     RefusalCode::UnsupportedLibraryForm,
                     origin,
                     number,
-                    "Konnect does not follow a line ending in two backslashes, because ngspice \
+                    "Copperpour does not follow a line ending in two backslashes, because ngspice \
                      joins the next line differently by context. Use a + line.",
                 ));
             }
@@ -1055,7 +1055,7 @@ fn check_options(card: &str) -> Result<(), String> {
         let name = name.to_lowercase();
         if !KNOWN_OPTIONS.contains(&name.as_str()) {
             return Err(format!(
-                "The option {} is not one Konnect allows, because some options set file \
+                "The option {} is not one Copperpour allows, because some options set file \
                  paths or change what a run saves.",
                 shown_name(&name)
             ));
@@ -1144,7 +1144,7 @@ pub(crate) fn verify_deck(deck: &str) -> Result<(), Refusal> {
             code: RefusalCode::UnsafeDeckContent,
             origin: "deck".to_string(),
             line: None,
-            detail: "A deck starts with Konnect's title and ends with .end.".to_string(),
+            detail: "A deck starts with Copperpour's title and ends with .end.".to_string(),
         });
     }
     lines.remove(0);
