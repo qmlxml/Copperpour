@@ -40,7 +40,7 @@ dirs.workspace = true
 fs4.workspace = true
 libloading.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 libc.workspace = true
 
 [build-dependencies]

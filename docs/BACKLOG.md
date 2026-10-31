@@ -43,6 +43,32 @@ Each entry names where it was found, what is wrong, and the condition that close
   (`manufacturing.rs`, snapshot mode, through `run_cli`), although the snapshot is a private copy.
   Same as Copperpour before this work. Closing condition: those calls use the private-copy runner.
 
+## SPICE simulation (plan step 4)
+
+- **On Linux and Windows, deck vetting is the only barrier against a schematic's SPICE text running
+  commands.** macOS also drops the worker's right to start processes (`RLIMIT_NPROC`); that cannot
+  be used on Linux (threads count against it) and nothing replaces it. Measured on Linux: ngspice
+  runs a `.control` `shell` command when nothing else stops it. Closing condition: a second barrier
+  on Linux (for example a seccomp filter that refuses `execve`/`execveat`, and possibly Landlock for
+  file reads) and on Windows (for example a job object limited to one process), each tested.
+- **No total limit on kept simulation results.** Twenty runs per project, each up to `max_raw_bytes`
+  (256 MiB default, 1 GiB maximum), with no limit across projects; runs for deleted or moved
+  projects are never removed. Closing condition: a total limit or a cleanup of runs whose project
+  no longer exists.
+- **The server reads a whole results file into memory** (up to 1.25 GiB) before parsing it.
+  Closing condition: a streaming or bounded read.
+- **The worker's own stdout/stderr file (`worker.out`) has no size limit** (the engine log is capped
+  at 4 MiB). Closing condition: a cap.
+- **A `filesource` reading `/dev/zero` spins until the worker's deadline**, reported only as
+  `timed_out`; with the stdio transport this blocks other tool calls for the whole budget. Part of
+  the known limit Q17 (data files named in a deck). Closing condition: data-file paths vetted like
+  includes, or the cause named in the error.
+- **A code-model path is placed inside an engine command** (`codemodel '<path>'`), against the
+  contributor's own recorded rule; the quoting is untested for `$`, `{`, backticks and Windows
+  backslashes. Closing condition: tested, or the path passed another way.
+- **Between the include size check and the read a file could be swapped** past the 64 MiB inline
+  limit. Closing condition: read with a bound instead of checking first.
+
 ## Custom-shape pads (plan step 1, not merged)
 
 - **Footprints with custom-shape pads cannot be placed** (about 3.9% of KiCad's library). KiCad's

@@ -9,7 +9,8 @@
 //! ngspice rewrites lines as it reads them, so that check does not list bad
 //! lines. It states what a line must look like, and refuses the rest.
 //!
-//! This is a filter, not a sandbox. The worker drops its own rights as well.
+//! This is a filter, not a sandbox. On macOS the worker drops its own rights as
+//! well; on Linux and Windows this filter is the only barrier.
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};

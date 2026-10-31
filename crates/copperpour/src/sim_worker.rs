@@ -347,6 +347,7 @@ fn prepare_and_simulate(run_dir: &Path) -> Result<RunStatus> {
     )
     .context("Failed to parse the run request")?;
     let budget = Duration::from_millis(request.budget_ms);
+    exit_with_parent();
     start_deadline(budget + WORKER_GRACE)?;
     let deck =
         std::fs::read_to_string(run_dir.join(DECK_FILE)).context("Failed to read the deck")?;
@@ -423,10 +424,35 @@ fn drop_process_rights() -> Result<()> {
     Ok(())
 }
 
+/// Linux and Windows have no second barrier: deck vetting is the only one.
+/// `RLIMIT_NPROC` cannot be used on Linux, where threads count against it and
+/// `bg_run` would fail. Recorded in docs/BACKLOG.md (a seccomp filter refusing
+/// `execve` is one candidate).
 #[cfg(not(target_os = "macos"))]
 fn drop_process_rights() -> Result<()> {
     Ok(())
 }
+
+/// Linux: exit when the server that started this worker dies, instead of
+/// running on until the worker's own deadline (up to the budget plus
+/// `WORKER_GRACE`). `kill_on_drop` cannot help when the server is killed with
+/// SIGKILL. Added when merged (plan step 4, review 2). Best effort: a failure
+/// leaves the deadline as the bound.
+#[cfg(target_os = "linux")]
+fn exit_with_parent() {
+    // SAFETY: prctl with PR_SET_PDEATHSIG takes a signal number and no pointers.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+    }
+    // The parent may already have died before the call took effect.
+    // SAFETY: getppid has no preconditions.
+    if unsafe { libc::getppid() } == 1 {
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exit_with_parent() {}
 
 struct Engine {
     command: NgSpiceCommand,

@@ -122,3 +122,32 @@ Nothing found would stop a normal simulation run. Findings and what was done:
 
 Gate after fix pass 1 (`logs/gate-step4-fix1.summary`): 3,654 passed (+1), 1 failed (the known
 baseline failure), 108 ignored. Simulation live tests (`logs/live-simulation.log`): 47 passed.
+Committed as `b4df684`.
+
+## Review 2 (robustness, Linux) and fix pass 2
+
+The reviewer measured on this machine (Arch Linux, ngspice 47). Nothing found stops a normal run.
+
+1. **On Linux and Windows, deck vetting is the only barrier** against a schematic's SPICE text
+   running commands: the worker drops its right to start processes (`RLIMIT_NPROC` = 0) on macOS
+   only. Measured: `env -i ngspice -b` with a `.control` `shell touch` block created the file. This
+   was recorded by the contributor as risk R4 for Linux; the documents said Windows had a barrier,
+   which the code does not have. Not built in this pass (new security code for two platforms):
+   recorded in `docs/BACKLOG.md` with a closing condition. The documents and the code comments now
+   say plainly that vetting is the only barrier on Linux and Windows.
+2. **The documents claimed a Windows barrier that does not exist** (SIMULATION_PLAN.md goal list;
+   flatten.rs header). Corrected.
+3. Library and code-model discovery: measured working on Arch; Debian and Fedora layouts covered
+   by reading. No change.
+4. A `filesource` reading `/dev/zero` spins until the worker's deadline; 6, 7, 8: no total disk
+   limit on kept runs, the whole results file read into memory, no cap on the worker's own output
+   file; 10: a code-model path placed in an engine command; and a time gap between the include size
+   check and the read. All recorded in `docs/BACKLOG.md`.
+9. **A worker orphaned by a killed server ran on until its own deadline** (up to 610 s). On Linux
+   it now asks the kernel to kill it when the server dies (`exit_with_parent`, `PR_SET_PDEATHSIG`),
+   and exits at once if the server is already gone. `libc` became a Linux dependency of the binary
+   crate as well (already in `Cargo.lock`). Not covered by a test: it needs the server process to be
+   killed during a run.
+
+Gate after fix pass 2 (`logs/gate-step4-fix2.summary`): 3,654 passed, 1 failed (the known baseline
+failure), 108 ignored. Simulation live tests: 47 passed.

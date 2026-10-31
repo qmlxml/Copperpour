@@ -76,7 +76,7 @@ It does not cover noise, pole-zero, transfer function, sensitivity, FFT, S-param
 - On a stock macOS KiCad 10 install, simulation works with nothing else installed. Windows has the same target, pending confirmation.
 - A worker crash leaves the MCP server running and returns a typed error.
 - A run that failed, aborted or stopped early never reads as complete.
-- A `.control` block never reaches the engine. The worker cannot start a process on macOS or Windows.
+- A `.control` block never reaches the engine. The worker cannot start a process on macOS. (Merge note: Windows and Linux have no such barrier in the code; deck vetting is the only one there. See `docs/BACKLOG.md`.)
 - Any result from a circuit with excluded or added parts says so in its body.
 - Short circuit, I²t fuse, eFuse limit, undervoltage lockout and reversed battery scenarios have working stand-ins and live tests.
 - A typical result is under 2 KB of JSON, with full data on disk.
