@@ -22,7 +22,10 @@ no longer blocks the import. `rules_source` is `"project"` when a
 `.kicad_pro` or `.kicad_dru` was applied and `"kicad_defaults"` when the
 source project has neither, and `rules_applied` lists the source files used.
 The parity diagnostic now says that parity is not checked for an SES
-candidate. Violation counts can differ from
+candidate. `library_diagnostic` says when the library table could not be
+applied (its directory contains a double quote, which cannot be written into
+a library URI); footprint-library findings may then differ from the source
+board's. Violation counts can differ from
 earlier releases for the same board.
 
 `clean` is false for every import, because parity is not checked for the

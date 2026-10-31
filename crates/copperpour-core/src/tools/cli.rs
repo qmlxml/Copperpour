@@ -398,6 +398,10 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
     let exe = resolve_cli_executable(cli);
     let mut cmd = Command::new(&exe);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // A timeout drops the wait below; without this, kicad-cli would keep
+    // running with nobody waiting for it, still holding files a caller may
+    // be about to delete (e.g. the SES candidate's temporary DRC copy).
+    cmd.kill_on_drop(true);
 
     #[cfg(test)]
     let child = test_support::spawn_cli(&mut cmd)
@@ -635,6 +639,44 @@ pub(crate) mod test_support {
             "#!/bin/sh\nif [ \"$1\" = \"sch\" ]; then\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"--output\" ]; then\n      shift\n      printf '%s' 'PDF-test' > \"$1\"\n      break\n    fi\n    shift\n  done\nfi\nexit 0\n",
             "@echo off\r\nif not \"%1\"==\"sch\" exit /b 0\r\n:loop\r\nif \"%1\"==\"\" goto done\r\nif not \"%1\"==\"--output\" goto next\r\nshift\r\necho PDF-test>\"%1\"\r\ngoto done\r\n:next\r\nshift\r\ngoto loop\r\n:done\r\nexit /b 0\r\n",
         )
+    }
+
+    /// A kicad-cli that outlives its timeout must be killed, not left
+    /// running while callers delete the files it is reading.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timed_out_kicad_cli_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let cli = write_script(
+            dir.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 30\n",
+                pid_file.display()
+            ),
+            "@exit /b 0\r\n",
+        );
+        let result = run_cli_captured(cli.to_str().unwrap(), &[], Duration::from_millis(500)).await;
+        assert!(
+            result.is_err(),
+            "the fake kicad-cli sleeps past the timeout"
+        );
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let proc = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+        for _ in 0..50 {
+            let gone = !proc.exists()
+                || std::fs::read_to_string(proc.join("stat"))
+                    .is_ok_and(|stat| stat.split_whitespace().nth(2) == Some("Z"));
+            if gone {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "kicad-cli (pid {}) still runs after its timeout",
+            pid.trim()
+        );
     }
 
     #[test]

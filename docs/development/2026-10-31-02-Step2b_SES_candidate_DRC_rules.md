@@ -87,3 +87,39 @@ enrichment reads a byte-identical copy; `routing_clean` matches its documentatio
 
 Gate after fix pass 1 (`logs/gate-step2b-fix1.summary`): 3,148 passed, 1 failed (the known
 baseline failure), 60 ignored (+1: the library live test).
+Committed as `9f5d843`.
+
+## Review 2 (robustness) and fix pass 2
+
+The reviewer measured on kicad-cli 10.0.7 with copies of `candidate_drc_project_lib`.
+
+1. **A double quote in the project directory** made the expanded table unreadable, giving a
+   `lib_footprint_issues` the source does not have, with no warning (measured). KiCad reads a
+   backslash literally, so the quote cannot be escaped. The table is now not applied in that
+   case, and the new evidence field `library_diagnostic` says why. Spaces, parentheses,
+   non-ASCII and backslash sequences were measured to work. Test
+   `a_library_table_that_cannot_be_expanded_is_reported_not_applied`.
+2. **`$KIPRJMOD` without braces** is accepted by KiCad (measured) and was not replaced. All
+   three forms are now replaced. The fake-cli test covers it.
+3. **Windows paths**: `canonicalize` gives `\\?\C:\...`, and KiCad URIs use forward slashes
+   (inferred; not testable here). The directory is now written through the existing
+   `portable_uri` (crates/copperpour-core/src/tools/library.rs, made `pub(crate)`).
+4. **Any failure in the DRC setup undoes a correct routing import.** This was Copperpour's
+   policy for DRC failures before this step; the step added causes. The avoidable new cause is
+   removed: the table is read and expanded as bytes (new `replace_bytes`), so a table that is
+   not UTF-8 no longer fails (test `a_library_table_that_is_not_utf8_is_still_applied`). Whether
+   a DRC failure should undo the import is a policy question passed to review 3.
+5. **kicad-cli was not stopped on timeout**, so it could keep running while the temporary copy
+   was deleted. `run_cli_captured` (crates/copperpour-core/src/tools/cli.rs) now sets
+   `kill_on_drop`; this applies to every kicad-cli call. Test `a_timed_out_kicad_cli_is_killed`
+   (Linux). Control: with `kill_on_drop` removed, it fails. A server killed by SIGKILL still
+   leaves its temporary copy behind, as any temporary file would.
+
+Measured and found correct by the reviewer: kicad-cli run on the copy writes nothing into the
+source project (it writes `.kicad_prl` beside the copy only); the renamed `.kicad_pro` gives the
+same results; `.kicad_dru` without `.kicad_pro` is applied (rules raised a count from 5 to 10),
+so `rules_source: "project"` is right; with only `fp-lib-table`, `"kicad_defaults"` with the
+table in `rules_applied` is correct because the table carries no rules.
+
+Gate after fix pass 2 (`logs/gate-step2b-fix2.summary`): 3,152 passed (+4), 1 failed (the known
+baseline failure), 60 ignored.

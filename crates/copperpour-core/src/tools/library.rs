@@ -2354,7 +2354,7 @@ async fn handle_list_footprint_libraries(
 /// resolve when the project is opened on Linux or macOS.
 /// Credit to @anyn99 (#163), whose PR carried this and the lexical fallback
 /// below.
-fn portable_uri(path: &Path) -> String {
+pub(crate) fn portable_uri(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
     stripped.replace('\\', "/")

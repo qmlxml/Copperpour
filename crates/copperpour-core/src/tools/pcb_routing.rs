@@ -983,6 +983,24 @@ struct CandidateRules {
     /// Empty when the source project has none, in which case kicad-cli's
     /// defaults are also what the source board itself is checked with.
     applied: Vec<std::path::PathBuf>,
+    /// Why the project's footprint library table was not applied, if it
+    /// exists and could not be.
+    library_diagnostic: Option<String>,
+}
+
+/// Replace every occurrence of `from` in `haystack`. The braced and
+/// parenthesised `KIPRJMOD` forms are replaced before the bare one, so the
+/// bare form never matches inside them.
+fn replace_bytes(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(at) = rest.windows(from.len()).position(|window| window == from) {
+        out.extend_from_slice(&rest[..at]);
+        out.extend_from_slice(to);
+        rest = &rest[at + from.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
 }
 
 /// Run kicad-cli DRC on the candidate with the source project's rules.
@@ -1034,18 +1052,36 @@ async fn candidate_drc(
         .parent()
         .context("the source board path names no directory")?;
     let library_table = source_dir.join("fp-lib-table");
+    let mut library_diagnostic = None;
     if library_table.is_file() {
-        let text = tokio::fs::read_to_string(&library_table)
-            .await
-            .with_context(|| format!("read {}", library_table.display()))?;
-        let project_dir = source_dir.display().to_string();
-        let expanded = text
-            .replace("${KIPRJMOD}", &project_dir)
-            .replace("$(KIPRJMOD)", &project_dir);
-        tokio::fs::write(dir.path().join("fp-lib-table"), expanded)
-            .await
-            .context("write the footprint library table for the candidate's DRC")?;
-        applied.push(library_table);
+        // KiCad URIs use forward slashes; `portable_uri` also drops the
+        // Windows `\\?\` prefix that canonicalisation adds.
+        let project_dir = crate::tools::library::portable_uri(source_dir);
+        if project_dir.contains('"') {
+            // The URI is a quoted s-expression string, and KiCad reads a
+            // backslash literally, so a quote cannot be escaped. Measured on
+            // kicad-cli 10.0.7: such a table is not read, and the copy gets a
+            // `lib_footprint_issues` the source does not have.
+            library_diagnostic = Some(format!(
+                "the project's footprint library table was not applied to the candidate: its \
+                 directory {} contains a double quote, which cannot be written into a library \
+                 URI; footprint-library findings may differ from the source board's",
+                source_dir.display()
+            ));
+        } else {
+            // Bytes, not text: a table that is not UTF-8 must not stop the check.
+            let table = tokio::fs::read(&library_table)
+                .await
+                .with_context(|| format!("read {}", library_table.display()))?;
+            let mut expanded = table;
+            for variable in ["${KIPRJMOD}", "$(KIPRJMOD)", "$KIPRJMOD"] {
+                expanded = replace_bytes(&expanded, variable.as_bytes(), project_dir.as_bytes());
+            }
+            tokio::fs::write(dir.path().join("fp-lib-table"), expanded)
+                .await
+                .context("write the footprint library table for the candidate's DRC")?;
+            applied.push(library_table);
+        }
     }
     let mut report = cli::run_drc(cli_path, &copy, false).await?;
     if report.schematic_parity.is_none() {
@@ -1067,7 +1103,13 @@ async fn candidate_drc(
             *diagnostic = diagnostic.replace(&from, &to);
         }
     }
-    Ok((report, CandidateRules { applied }))
+    Ok((
+        report,
+        CandidateRules {
+            applied,
+            library_diagnostic,
+        },
+    ))
 }
 
 /// Keep unavailable DRC categories distinct from checked zero findings.
@@ -1103,6 +1145,7 @@ fn specctra_drc_evidence(report: &cli::DrcReport, rules: &CandidateRules) -> ser
             "kicad_defaults"
         },
         "rules_applied": rules_applied,
+        "library_diagnostic": rules.library_diagnostic,
         "violations": report.violations.len(),
         "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
         "schematic_parity_violations": report.schematic_parity.as_ref().map(Vec::len),
@@ -2937,6 +2980,7 @@ mod specctra_drc_evidence_tests {
     fn project_rules() -> CandidateRules {
         CandidateRules {
             applied: vec![std::path::PathBuf::from("/project/amp.kicad_pro")],
+            library_diagnostic: None,
         }
     }
 
@@ -2956,6 +3000,7 @@ mod specctra_drc_evidence_tests {
             &checked_zero(),
             &CandidateRules {
                 applied: Vec::new(),
+                library_diagnostic: None,
             },
         );
         assert_eq!(evidence["rules_source"], "kicad_defaults");
@@ -2987,7 +3032,8 @@ mod specctra_drc_evidence_tests {
         .unwrap();
         std::fs::write(
             project.join("fp-lib-table"),
-            "(fp_lib_table (lib (name \"mylib\")(uri \"${KIPRJMOD}/mylib.pretty\")))",
+            "(fp_lib_table (lib (name \"mylib\")(uri \"${KIPRJMOD}/mylib.pretty\"))\
+             (lib (name \"bare\")(uri \"$KIPRJMOD/bare.pretty\")))",
         )
         .unwrap();
         let candidate = out.join("amp.routed.kicad_pcb");
@@ -3042,6 +3088,10 @@ mod specctra_drc_evidence_tests {
             contents.contains(&format!("{}/mylib.pretty", project.display())),
             "KIPRJMOD must name the source project's directory: {contents}"
         );
+        assert!(
+            contents.contains(&format!("{}/bare.pretty", project.display())),
+            "the unbraced $KIPRJMOD form is replaced too: {contents}"
+        );
         assert!(!contents.contains("KIPRJMOD"), "{contents}");
         let checked_in = std::fs::read_to_string(observed.with_extension("dir")).unwrap();
         assert!(
@@ -3058,6 +3108,109 @@ mod specctra_drc_evidence_tests {
                  alone would lose its hierarchical sheets"
             )
         );
+    }
+
+    #[test]
+    fn replace_bytes_replaces_every_occurrence_and_keeps_other_bytes() {
+        let table = b"a ${KIPRJMOD}/x \xff ${KIPRJMOD}/y";
+        assert_eq!(
+            replace_bytes(table, b"${KIPRJMOD}", b"/p"),
+            b"a /p/x \xff /p/y".to_vec()
+        );
+        assert_eq!(
+            replace_bytes(b"none", b"${KIPRJMOD}", b"/p"),
+            b"none".to_vec()
+        );
+    }
+
+    /// A project directory containing a double quote cannot be written into
+    /// a quoted library URI. Not applying the table is correct here only
+    /// because the evidence says so (`library_diagnostic`); it would be
+    /// wrong to skip it silently, or to skip it for a directory without a
+    /// quote, which the test above covers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_library_table_that_cannot_be_expanded_is_reported_not_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("quo\"te");
+        std::fs::create_dir(&project).unwrap();
+        let source = project.join("amp.kicad_pcb");
+        std::fs::write(&source, "(kicad_pcb)").unwrap();
+        std::fs::write(project.join("fp-lib-table"), "(fp_lib_table)").unwrap();
+        let candidate = tmp.path().join("amp.routed.kicad_pcb");
+        std::fs::write(&candidate, "(kicad_pcb)").unwrap();
+        let report = tmp.path().join("report.json");
+        std::fs::write(
+            &report,
+            r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
+        )
+        .unwrap();
+        let observed = tmp.path().join("observed");
+        let script = format!(
+            "#!/bin/sh\nfor last; do :; done\nls \"$(dirname \"$last\")\" > \"{o}\"\n\
+             while [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    \
+             shift\n    cp \"{r}\" \"$1\"\n  fi\n  shift\ndone\nexit 0\n",
+            o = observed.display(),
+            r = report.display()
+        );
+        let cli = crate::tools::cli::test_support::write_script(
+            tmp.path(),
+            "fake-kicad-cli",
+            &script,
+            "@echo off\r\nexit /b 1\r\n",
+        );
+
+        let (_, rules) = candidate_drc(cli.to_str().unwrap(), &candidate, &source)
+            .await
+            .unwrap();
+
+        assert!(rules.applied.is_empty(), "{:?}", rules.applied);
+        let reason = rules.library_diagnostic.as_deref().unwrap();
+        assert!(reason.contains("double quote"), "{reason}");
+        let beside = std::fs::read_to_string(&observed).unwrap();
+        assert!(!beside.contains("fp-lib-table"), "{beside}");
+        let evidence = specctra_drc_evidence(&checked_zero(), &rules);
+        assert_eq!(evidence["library_diagnostic"], reason);
+    }
+
+    /// A library table that is not UTF-8 is still expanded and applied.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_library_table_that_is_not_utf8_is_still_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let source = project.join("amp.kicad_pcb");
+        std::fs::write(&source, "(kicad_pcb)").unwrap();
+        std::fs::write(
+            project.join("fp-lib-table"),
+            b"(fp_lib_table (lib (name \"\xe9\")(uri \"${KIPRJMOD}/l.pretty\")))".as_slice(),
+        )
+        .unwrap();
+        let candidate = tmp.path().join("amp.routed.kicad_pcb");
+        std::fs::write(&candidate, "(kicad_pcb)").unwrap();
+        let report = tmp.path().join("report.json");
+        std::fs::write(
+            &report,
+            r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
+        )
+        .unwrap();
+        let script = format!(
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    \
+             shift\n    cp \"{}\" \"$1\"\n  fi\n  shift\ndone\nexit 0\n",
+            report.display()
+        );
+        let cli = crate::tools::cli::test_support::write_script(
+            tmp.path(),
+            "fake-kicad-cli",
+            &script,
+            "@echo off\r\nexit /b 1\r\n",
+        );
+        let (_, rules) = candidate_drc(cli.to_str().unwrap(), &candidate, &source)
+            .await
+            .unwrap();
+        assert_eq!(rules.applied, [project.join("fp-lib-table")]);
+        assert!(rules.library_diagnostic.is_none());
     }
 
     /// Live check of the footprint library table: a project-local library
