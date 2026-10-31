@@ -146,14 +146,14 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is checked only if <candidate stem>.kicad_sch exists beside the candidate, so it is normally reported as missing. For complete evidence, run run_drc on the source board with sync_live_board: true; note that this saves the live board over the source file, which this tool itself avoids. drc.rules_source says whether kicad-cli applied the project's rules to the candidate or its own defaults.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is not checked for the candidate and is reported as missing. For complete evidence, run run_drc on the source board with sync_live_board: true; note that this saves the live board over the source file, which this tool itself avoids. The candidate's DRC runs on a temporary copy beside the source project's .kicad_pro and .kicad_dru, so the project's rules apply; drc.rules_applied names them.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
                     "ses_path": { "type": "string", "description": "Freerouting .ses result" },
                     "manifest_path": { "type": "string", "description": "Copperpour reverse manifest written with the DSN" },
-                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced. KiCad checks schematic parity only against <candidate stem>.kicad_sch beside it." }
+                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." }
                 },
                 "required": ["board", "ses_path", "manifest_path", "candidate_output_path"]
             }),
@@ -969,69 +969,86 @@ struct ApplyEvidence {
 ///
 /// kicad-cli reads severities, clearances and net classes from
 /// `<board stem>.kicad_pro`, and custom rules from `<board stem>.kicad_dru`.
-/// The candidate is a new file with its own stem, so unless a
-/// `<candidate stem>.kicad_pro` exists beside it, kicad-cli checks it with
-/// its default rules. Measured on kicad-cli 10.0.7
+/// The candidate is a new file with its own stem, so checked where it is it
+/// would get kicad-cli's default rules. Measured on kicad-cli 10.0.7
 /// (scripts/measure_candidate_drc_rules.sh): a project severity of "ignore"
-/// gave 0 violations on the source board and 1 on the candidate.
-///
-/// Running the candidate's DRC with the source project's rules is recorded
-/// as a separate plan step (docs/development/2026-10-31-00-Fork_Survey.md);
-/// until then the evidence says which rules were applied.
+/// gave 0 violations on the source board, 1 on the candidate alone, and 0 on
+/// the candidate with the project file copied under its stem.
+/// [`candidate_drc`] therefore checks a copy beside the source project's
+/// rule files.
 #[derive(Debug, Clone, PartialEq)]
 struct CandidateRules {
-    /// True when `<candidate stem>.kicad_pro` existed beside the candidate.
-    from_project: bool,
-    /// The source project's rule files that were not applied, if any.
-    unapplied: Vec<std::path::PathBuf>,
+    /// The source project's rule files that were applied to the candidate.
+    /// Empty when the source project has none, in which case kicad-cli's
+    /// defaults are also what the source board itself is checked with.
+    applied: Vec<std::path::PathBuf>,
 }
 
-fn candidate_rules(candidate: &Path, source: &Path) -> CandidateRules {
-    let from_project = candidate.with_extension("kicad_pro").is_file();
-    let unapplied = if from_project {
-        Vec::new()
-    } else {
-        ["kicad_pro", "kicad_dru"]
-            .iter()
-            .map(|extension| source.with_extension(extension))
-            .filter(|path| path.is_file())
-            .collect()
-    };
-    CandidateRules {
-        from_project,
-        unapplied,
+/// Run kicad-cli DRC on the candidate with the source project's rules.
+///
+/// The candidate is copied into a temporary directory together with the
+/// source's `.kicad_pro` and `.kicad_dru`, renamed to the candidate's stem,
+/// so the user's directory gains no project files. The temporary directory
+/// is removed when this returns. Diagnostics that name the temporary copy
+/// are rewritten to name the candidate. Schematic parity stays unchecked:
+/// no `<candidate stem>.kicad_sch` is placed beside the copy, because a
+/// root schematic copied alone would lose its hierarchical sheets.
+async fn candidate_drc(
+    cli_path: &str,
+    candidate: &Path,
+    source: &Path,
+) -> anyhow::Result<(cli::DrcReport, CandidateRules)> {
+    let dir = tempfile::tempdir().context("create a directory for the candidate's DRC")?;
+    let name = candidate
+        .file_name()
+        .context("the candidate path names no file")?;
+    let copy = dir.path().join(name);
+    tokio::fs::copy(candidate, &copy)
+        .await
+        .with_context(|| format!("copy {} for DRC", candidate.display()))?;
+    let mut applied = Vec::new();
+    for extension in ["kicad_pro", "kicad_dru"] {
+        let rules = source.with_extension(extension);
+        if rules.is_file() {
+            tokio::fs::copy(&rules, copy.with_extension(extension))
+                .await
+                .with_context(|| format!("copy {} for the candidate's DRC", rules.display()))?;
+            applied.push(rules);
+        }
     }
+    let mut report = cli::run_drc(cli_path, &copy, false).await?;
+    if let Some(candidate_dir) = candidate.parent() {
+        let from = dir.path().display().to_string();
+        let to = candidate_dir.display().to_string();
+        for diagnostic in [
+            &mut report.schematic_parity_diagnostic,
+            &mut report.ownership_diagnostic,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *diagnostic = diagnostic.replace(&from, &to);
+        }
+    }
+    Ok((report, CandidateRules { applied }))
 }
 
 /// Keep unavailable DRC categories distinct from checked zero findings.
 /// Import completion describes the mutation; a clean verdict additionally
-/// requires every DRC category to have been evaluated under the source
-/// project's rules. When the source project has rule files that kicad-cli
-/// did not apply to the candidate, `project_rules` is a missing category.
+/// requires every DRC category to have been evaluated.
 fn specctra_drc_evidence(report: &cli::DrcReport, rules: &CandidateRules) -> serde_json::Value {
-    let mut missing_categories = report.missing_categories();
-    let rules_diagnostic = if rules.unapplied.is_empty() {
-        None
-    } else {
-        missing_categories.push("project_rules");
-        let files: Vec<String> = rules
-            .unapplied
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect();
-        Some(format!(
-            "kicad-cli checked the candidate with its default rules: the candidate has no \
-             project file of its own name beside it, so the source project's {} were not \
-             applied and the violation count may differ from the project's",
-            files.join(" and ")
-        ))
-    };
+    let missing_categories = report.missing_categories();
+    let rules_applied: Vec<String> = rules
+        .applied
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
     let complete = missing_categories.is_empty();
     json!({
         "clean": complete && report.all().next().is_none(),
         "complete": complete,
-        "rules_source": if rules.from_project { "project" } else { "kicad_defaults" },
-        "rules_diagnostic": rules_diagnostic,
+        "rules_source": if rules.applied.is_empty() { "kicad_defaults" } else { "project" },
+        "rules_applied": rules_applied,
         "violations": report.violations.len(),
         "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
         "schematic_parity_violations": report.schematic_parity.as_ref().map(Vec::len),
@@ -1261,8 +1278,11 @@ async fn handle_apply_specctra_ses(
             let candidate_source = client.save_document_to_string_in(document.clone())?;
             copperpour_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
-            let drc = runtime.block_on(cli::run_drc(&cli_path, &candidate_for_ipc, false))?;
-            let rules = candidate_rules(&candidate_for_ipc, &source_for_rules);
+            let (drc, rules) = runtime.block_on(candidate_drc(
+                &cli_path,
+                &candidate_for_ipc,
+                &source_for_rules,
+            ))?;
             Ok(ApplyEvidence {
                 source_sha256: plan.source_sha256.clone(),
                 session_id: plan.session_id.clone(),
@@ -2867,65 +2887,141 @@ async fn handle_route_diff_pair(
 mod specctra_drc_evidence_tests {
     use super::*;
 
-    /// Rules as they are when the candidate has its own project file.
+    /// Rules as they are when the source project has a project file.
     fn project_rules() -> CandidateRules {
         CandidateRules {
-            from_project: true,
-            unapplied: Vec::new(),
+            applied: vec![std::path::PathBuf::from("/project/amp.kicad_pro")],
         }
     }
 
     #[test]
-    fn a_candidate_beside_its_own_project_file_uses_project_rules() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("amp.kicad_pcb");
-        let candidate = tmp.path().join("amp.routed.kicad_pcb");
-        std::fs::write(source.with_extension("kicad_pro"), "{}").unwrap();
-        std::fs::write(candidate.with_extension("kicad_pro"), "{}").unwrap();
-        assert_eq!(candidate_rules(&candidate, &source), project_rules());
-    }
-
-    #[test]
-    fn source_rule_files_not_applied_to_the_candidate_make_the_evidence_incomplete() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("amp.kicad_pcb");
-        let candidate = tmp.path().join("amp.routed.kicad_pcb");
-        std::fs::write(source.with_extension("kicad_pro"), "{}").unwrap();
-        std::fs::write(source.with_extension("kicad_dru"), "(version 1)").unwrap();
-        let rules = candidate_rules(&candidate, &source);
-        assert!(!rules.from_project);
-        assert_eq!(
-            rules.unapplied,
-            [
-                source.with_extension("kicad_pro"),
-                source.with_extension("kicad_dru")
-            ]
-        );
-
-        let evidence = specctra_drc_evidence(&checked_zero(), &rules);
-        assert_eq!(evidence["rules_source"], "kicad_defaults");
-        assert_eq!(evidence["complete"], false);
-        assert_eq!(evidence["clean"], false);
-        assert_eq!(evidence["missing_categories"], json!(["project_rules"]));
-        let reason = evidence["rules_diagnostic"].as_str().unwrap();
-        assert!(reason.contains("amp.kicad_pro"), "{reason}");
-        assert!(reason.contains("amp.kicad_dru"), "{reason}");
+    fn applied_project_rules_are_named_in_the_evidence() {
+        let evidence = specctra_drc_evidence(&checked_zero(), &project_rules());
+        assert_eq!(evidence["rules_source"], "project");
+        assert_eq!(evidence["rules_applied"], json!(["/project/amp.kicad_pro"]));
+        assert_eq!(evidence["complete"], true);
     }
 
     /// With no rule files in the source project, kicad-cli's defaults are
     /// what the source board itself is checked with, so nothing is missing.
     #[test]
-    fn a_source_without_rule_files_leaves_nothing_unapplied() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("amp.kicad_pcb");
-        let candidate = tmp.path().join("amp.routed.kicad_pcb");
-        let rules = candidate_rules(&candidate, &source);
-        assert!(!rules.from_project);
-        assert!(rules.unapplied.is_empty());
-        let evidence = specctra_drc_evidence(&checked_zero(), &rules);
+    fn a_source_without_rule_files_is_checked_with_kicads_defaults() {
+        let evidence = specctra_drc_evidence(
+            &checked_zero(),
+            &CandidateRules {
+                applied: Vec::new(),
+            },
+        );
         assert_eq!(evidence["rules_source"], "kicad_defaults");
+        assert_eq!(evidence["rules_applied"], json!([]));
         assert_eq!(evidence["complete"], true);
-        assert!(evidence["rules_diagnostic"].is_null());
+    }
+
+    /// The candidate's DRC must see the source project's rule files under the
+    /// candidate's stem, and must leave nothing in the candidate's directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_candidates_drc_runs_beside_the_source_projects_rule_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let out = tmp.path().join("out");
+        let tools = tmp.path().join("tools");
+        for dir in [&project, &out, &tools] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let source = project.join("amp.kicad_pcb");
+        std::fs::write(&source, "(kicad_pcb)").unwrap();
+        std::fs::write(source.with_extension("kicad_pro"), "{}").unwrap();
+        std::fs::write(source.with_extension("kicad_dru"), "(version 1)").unwrap();
+        let candidate = out.join("amp.routed.kicad_pcb");
+        std::fs::write(&candidate, "(kicad_pcb)").unwrap();
+        let report = tools.join("report.json");
+        std::fs::write(
+            &report,
+            r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
+        )
+        .unwrap();
+        let observed = tools.join("observed");
+        // The board is kicad-cli's last argument; record what sits beside it.
+        let cli = crate::tools::cli::test_support::write_script(
+            &tools,
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\nfor last; do :; done\nls \"$(dirname \"$last\")\" > \"{}\"\n\
+                 while [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    \
+                 shift\n    cp \"{}\" \"$1\"\n  fi\n  shift\ndone\nexit 0\n",
+                observed.display(),
+                report.display()
+            ),
+            "@echo off\r\nexit /b 1\r\n",
+        );
+
+        let (drc, rules) = candidate_drc(cli.to_str().unwrap(), &candidate, &source)
+            .await
+            .unwrap();
+
+        let beside = std::fs::read_to_string(&observed).unwrap();
+        assert!(beside.contains("amp.routed.kicad_pcb"), "{beside}");
+        assert!(beside.contains("amp.routed.kicad_pro"), "{beside}");
+        assert!(beside.contains("amp.routed.kicad_dru"), "{beside}");
+        assert_eq!(
+            rules.applied,
+            [
+                source.with_extension("kicad_pro"),
+                source.with_extension("kicad_dru")
+            ]
+        );
+        let left: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1, "only the candidate remains in its directory");
+        // Parity has no root beside the copy; the diagnostic names the
+        // candidate's directory, not the deleted temporary one.
+        let reason = drc.schematic_parity_diagnostic.as_deref().unwrap();
+        assert!(reason.contains(&out.display().to_string()), "{reason}");
+    }
+
+    /// Live check against a real kicad-cli on the fixture measured by
+    /// scripts/measure_candidate_drc_rules.sh: with the project severity of
+    /// `invalid_outline` set to "ignore", the candidate checked where it is
+    /// reports that violation and the candidate checked by `candidate_drc`
+    /// does not.
+    ///
+    ///     KICAD_CLI=/usr/bin/kicad-cli cargo test -p copperpour-core --lib \
+    ///         candidate_drc_live -- --ignored
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli (measured on 10.0.7)"]
+    async fn candidate_drc_live_applies_the_project_severity() {
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("netclass_diff_pair_kicad10.kicad_pcb");
+        std::fs::copy(
+            fixtures.join("netclass_diff_pair_kicad10.kicad_pcb"),
+            &source,
+        )
+        .unwrap();
+        let project: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(fixtures.join("netclass_diff_pair_kicad10.kicad_pro"))
+                .unwrap(),
+        )
+        .unwrap();
+        let mut project = project;
+        project["board"]["design_settings"]["rule_severities"]["invalid_outline"] = json!("ignore");
+        std::fs::write(source.with_extension("kicad_pro"), project.to_string()).unwrap();
+        let candidate = tmp.path().join("candidate.kicad_pcb");
+        std::fs::copy(&source, &candidate).unwrap();
+
+        let alone = cli::run_drc(&cli, &candidate, false).await.unwrap();
+        assert!(
+            alone.violations.iter().any(|v| v.rule == "invalid_outline"),
+            "control: the candidate checked alone gets kicad-cli's default severity"
+        );
+        let (drc, rules) = candidate_drc(&cli, &candidate, &source).await.unwrap();
+        assert_eq!(rules.applied, [source.with_extension("kicad_pro")]);
+        assert!(
+            !drc.violations.iter().any(|v| v.rule == "invalid_outline"),
+            "{:?}",
+            drc.violations
+        );
     }
 
     fn checked_zero() -> cli::DrcReport {

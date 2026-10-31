@@ -10,21 +10,23 @@ own message when it printed one, otherwise Copperpour's statement that the
 expected root schematic is missing. `ownership_diagnostic` says when
 Copperpour could not name what owns each violation item.
 
-`rules_source` says which DRC rules kicad-cli applied to the candidate:
-`"project"` when `<candidate stem>.kicad_pro` exists beside it, otherwise
-`"kicad_defaults"`. When the candidate has no project file and the source
-project has a `.kicad_pro` or `.kicad_dru`, `project_rules` is listed in `missing_categories`,
-`complete` is false, and `rules_diagnostic` names the files: the violation
-count was computed with KiCad's default severities, clearances and net
-classes, not the project's.
+The candidate's DRC now runs with the source project's rules. Previously
+kicad-cli checked the candidate with its default severities, clearances and
+net classes, because the candidate is a new file with no project file of its
+own name. It is now checked as a temporary copy beside the source's
+`.kicad_pro` and `.kicad_dru`, renamed to the candidate's stem; the candidate's
+directory gains no files. `rules_source` is `"project"` when either file was
+applied and `"kicad_defaults"` when the source project has neither, and
+`rules_applied` lists the source files used. Violation counts can differ from
+earlier releases for the same board.
 
 `drc.clean` requires complete evidence and zero findings in every category.
 Top-level `success` still describes completion of the import, not design
 acceptance. An incomplete check does not discard an imported candidate;
 restore the matching schematic/project context and rerun verification before
-relying on it: KiCad checks the candidate's parity only against
-`<candidate stem>.kicad_sch` beside it, which normally does not exist, so
-parity is normally reported as missing. For complete evidence, run
+relying on it. Parity is not checked for the candidate: no schematic is
+placed beside the temporary copy, because a root schematic copied alone
+would lose its hierarchical sheets. It is reported as missing. For complete evidence, run
 `run_drc` on the source board with `sync_live_board: true`; it saves the live
 board, which now holds the imported routing, over the source file first. Import mutation, candidate persistence, and rollback semantics
 are unchanged. Clients must handle nullable counts and require `drc.complete`
