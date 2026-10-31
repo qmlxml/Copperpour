@@ -219,3 +219,36 @@ editor: the item IDs KiCad returns over IPC are the UUIDs it writes into the sav
   `check_specctra_candidate_reports_the_candidates_drc_or_why_it_did_not_run`.
 - Gate (`logs/gate-step2b-rulings.summary`): 3,160 passed (+5), 1 failed (the known baseline
   failure), 60 ignored. A first run failed `no_toolset_exceeds_max_size` until the tool moved.
+Committed as `9d5ddc1`.
+
+### Review of the ruling implementation, and fixes
+
+An extra independent review of commit `9d5ddc1` (all three stances) confirmed that rollback now
+happens exactly for the import-side failures (the post-commit `get_items_in` calls, the count
+mismatch, `save_document_to_string_in`, `write_new_atomic`) and that every DRC failure keeps the
+import. Its findings and the fixes:
+
+1. **After a check that did not run, the import verdict could never be obtained** (likely
+   defect, liveness): the re-check did not know the created items. The apply response now
+   returns `created_item_ids`, and `check_specctra_candidate` accepts them.
+2. **A timeout warning advised a re-check that would time out again.** Whether the failure was a
+   timeout is now read from the error chain (tokio's `Elapsed`, function `is_timeout`), and the
+   warning then names `run_drc` with `sync_live_board` (which saves over the source) or DRC in
+   the KiCad editor.
+3. **Nothing tied the candidate to the import.** Both tools report `candidate_sha256`; the
+   re-check refuses a candidate path that resolves to the source board.
+4. **`import_clean` could be true without the footprint library table.** It now also requires
+   the table to have been applied.
+5. **A rollback could delete a candidate another process created** between the conflict check
+   and the write. The candidate is now removed only if this call wrote it.
+6. **The migration note stated the behaviour change backwards.** Corrected: an error still means
+   nothing was imported; `success: true` no longer means a DRC ran.
+
+Tests added: `a_timeout_is_recognised_through_the_error_chain`,
+`the_not_run_warning_names_the_next_action_for_each_cause`,
+`import_clean_requires_the_library_table_to_have_been_applied`, and the re-check test now covers
+`created_item_ids`, `candidate_sha256` and the same-path refusal. Still not covered by a unit
+test: building the apply response when the check did not run; it needs the live test.
+
+Gate (`logs/gate-step2b-ruling-review.summary`): 3,163 passed (+3), 1 failed (the known baseline
+failure), 60 ignored.

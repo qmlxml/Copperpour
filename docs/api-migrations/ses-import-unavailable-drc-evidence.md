@@ -43,8 +43,12 @@ already verified by IPC read-back. The response has `drc_status:
 "not_run"`, a top-level `warning`, and a `drc` object with `status:
 "not_run"`, the `reason`, every verdict false and every category missing.
 Rollback still happens for an IPC read-back mismatch or a failure to write
-the candidate. Callers that treated an error from this tool as "nothing was
-imported" must now check `drc_status`. Violation counts can differ from
+the candidate, so an error still means nothing was imported. What changed is
+that `success: true` no longer means a DRC ran: check `drc_status`. The
+response also carries `candidate_sha256` and `created_item_ids`; pass the
+latter to `check_specctra_candidate` to get `import_clean` from a re-check.
+`import_clean` also requires the footprint library table to have been
+applied. Violation counts can differ from
 earlier releases for the same board.
 
 `clean` is false for every import, because parity is not checked for the

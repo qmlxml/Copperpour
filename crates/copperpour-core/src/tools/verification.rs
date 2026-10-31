@@ -31,12 +31,13 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "check_specctra_candidate",
-            "Run KiCad DRC on an existing apply_specctra_ses candidate .kicad_pcb with the source project's rules: the candidate is checked as a temporary copy beside the source project's .kicad_pro, .kicad_dru and fp-lib-table (with ${KIPRJMOD} expanded); neither file is modified. Use it when apply_specctra_ses reported drc_status not_run. Returns the same drc object as apply_specctra_ses, except that import_clean, introduced_violations and preexisting_violations are null: which items the import created is not known after the fact. A board on which kicad-cli exceeds its 600 s limit will time out again.",
+            "Run KiCad DRC on an existing apply_specctra_ses candidate .kicad_pcb with the source project's rules: the candidate is checked as a temporary copy beside the source project's .kicad_pro, .kicad_dru and fp-lib-table (with ${KIPRJMOD} expanded); neither file is modified. Use it when apply_specctra_ses reported drc_status not_run. Returns the same drc object as apply_specctra_ses. Pass created_item_ids from the apply_specctra_ses response to get import_clean and the introduced/preexisting split; without them those fields are null. candidate_sha256 lets the caller confirm the candidate is the file the import wrote. A board on which kicad-cli exceeds its 600 s limit will time out again.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Source .kicad_pcb whose project rules apply (the board given to apply_specctra_ses)" },
-                    "candidate_output_path": { "type": "string", "description": "Candidate .kicad_pcb written by apply_specctra_ses" }
+                    "candidate_output_path": { "type": "string", "description": "Candidate .kicad_pcb written by apply_specctra_ses" },
+                    "created_item_ids": { "type": "array", "items": { "type": "string" }, "description": "created_item_ids from the apply_specctra_ses response" }
                 },
                 "required": ["board", "candidate_output_path"]
             }),

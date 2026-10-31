@@ -965,8 +965,18 @@ struct ApplyEvidence {
     /// itself keeps the verified import (owner ruling 2026-10-31): it says
     /// nothing about the routing, and rolling back would make a board on
     /// which kicad-cli always fails impossible to import.
-    drc: Result<(cli::DrcReport, CandidateRules), String>,
+    drc: Result<(cli::DrcReport, CandidateRules), DrcNotRun>,
     created_ids: Vec<String>,
+    candidate_sha256: String,
+}
+
+/// Why the candidate's DRC did not run. `timed_out` is read from the error
+/// chain (tokio's `Elapsed`), not from its text, so the warning can say that
+/// a re-check will time out again.
+#[derive(Debug)]
+struct DrcNotRun {
+    reason: String,
+    timed_out: bool,
 }
 
 /// Which DRC rules kicad-cli applied to the candidate board.
@@ -1150,6 +1160,35 @@ async fn candidate_drc(
     ))
 }
 
+/// Whether an error was caused by a tokio timeout anywhere in its chain.
+fn is_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+}
+
+/// The top-level warning for an import whose DRC did not run, naming the
+/// next action. A timeout will recur on a re-check, so it names the other
+/// way to check instead.
+fn not_run_warning(failure: &DrcNotRun) -> String {
+    if failure.timed_out {
+        format!(
+            "the routing was imported and verified by IPC read-back, but its DRC did not run \
+             ({}). check_specctra_candidate would time out again on this board; to check it, run \
+             run_drc on the source board with sync_live_board: true, which saves the live board \
+             over the source file, or run DRC in the KiCad editor",
+            failure.reason
+        )
+    } else {
+        format!(
+            "the routing was imported and verified by IPC read-back, but its DRC did not run \
+             ({}); run check_specctra_candidate with created_item_ids from this response to check \
+             the candidate",
+            failure.reason
+        )
+    }
+}
+
 /// DRC evidence when the candidate's check could not run: every category is
 /// missing and no verdict is true.
 fn drc_not_run_evidence(reason: &str) -> serde_json::Value {
@@ -1194,8 +1233,9 @@ fn specctra_drc_evidence(
                     })
                 })
                 .count();
-            let clean =
-                introduced == 0 && report.unconnected_items.as_ref().is_some_and(Vec::is_empty);
+            let clean = introduced == 0
+                && report.unconnected_items.as_ref().is_some_and(Vec::is_empty)
+                && rules.library_diagnostic.is_none();
             (
                 json!(introduced),
                 json!(report.violations.len() - introduced),
@@ -1448,6 +1488,9 @@ async fn handle_apply_specctra_ses(
         // any post-commit gate fails, delete only the KIIDs returned by
         // CreateItems in a compensating transaction and prove the original
         // serialized board was restored.
+        // Set only once this call has written the candidate, so a rollback
+        // never deletes a file another process created at that path.
+        let mut candidate_written = false;
         let operation = (|| {
             let read_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
             let read_arcs = client.get_items_in(document.clone(), ObjectType::KotPcbArc)?;
@@ -1467,6 +1510,8 @@ async fn handle_apply_specctra_ses(
             let candidate_source = client.save_document_to_string_in(document.clone())?;
             copperpour_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
+            candidate_written = true;
+            let candidate_sha256 = crate::hex::sha256_hex(candidate_source.as_bytes());
             // Everything above says something about the import, and a
             // failure rolls it back. A failure from here on is a failure of
             // the check, and keeps the import.
@@ -1476,7 +1521,10 @@ async fn handle_apply_specctra_ses(
                     &candidate_for_ipc,
                     &source_for_rules,
                 ))
-                .map_err(|error| format!("{error:#}"));
+                .map_err(|error| DrcNotRun {
+                    timed_out: is_timeout(&error),
+                    reason: format!("{error:#}"),
+                });
             Ok(ApplyEvidence {
                 source_sha256: plan.source_sha256.clone(),
                 session_id: plan.session_id.clone(),
@@ -1488,6 +1536,7 @@ async fn handle_apply_specctra_ses(
                 preserved_locked_via_count: plan.locked_via_count,
                 drc,
                 created_ids: created_ids.clone(),
+                candidate_sha256,
             })
         })();
         match operation {
@@ -1507,7 +1556,7 @@ async fn handle_apply_specctra_ses(
                         "SES import failed ({error}); compensating deletion completed but the live board did not return to its exact pre-import serialization"
                     );
                 }
-                if candidate_for_ipc.exists() {
+                if candidate_written && candidate_for_ipc.exists() {
                     std::fs::remove_file(&candidate_for_ipc).with_context(|| {
                         format!(
                             "SES import failed ({error}); also failed to remove candidate {}",
@@ -1540,14 +1589,13 @@ async fn handle_apply_specctra_ses(
                 "vias": evidence.preserved_locked_via_count
             },
             "ipc_readback": "exact_count_match",
+            "candidate_sha256": evidence.candidate_sha256,
+            "created_item_ids": evidence.created_ids,
             "drc_status": if evidence.drc.is_ok() { "checked" } else { "not_run" },
-            "warning": evidence.drc.as_ref().err().map(|reason| format!(
-                "the routing was imported and verified by IPC read-back, but its DRC did not run \
-                 ({reason}); run check_specctra_candidate to check the candidate"
-            )),
+            "warning": evidence.drc.as_ref().err().map(not_run_warning),
             "drc": match &evidence.drc {
                 Ok((report, rules)) => specctra_drc_evidence(report, rules, Some(&evidence.created_ids)),
-                Err(reason) => drc_not_run_evidence(reason),
+                Err(failure) => drc_not_run_evidence(&failure.reason),
             }
         }))),
         Err(failure) => {
@@ -1589,18 +1637,56 @@ pub(crate) async fn handle_check_specctra_candidate(
     let board = board
         .canonicalize()
         .with_context(|| format!("resolve board {}", board.display()))?;
+    let candidate = candidate
+        .canonicalize()
+        .with_context(|| format!("resolve candidate {}", candidate.display()))?;
+    if candidate == board {
+        return Ok(invalid_specctra_argument(
+            "candidate_output_path",
+            "names the source board itself, not a candidate",
+        ));
+    }
+    let created_ids: Option<Vec<String>> = match args.get("created_item_ids") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(ids)) => {
+            let Some(ids) = ids
+                .iter()
+                .map(|id| id.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(invalid_specctra_argument(
+                    "created_item_ids",
+                    "must be an array of strings",
+                ));
+            };
+            Some(ids)
+        }
+        Some(_) => {
+            return Ok(invalid_specctra_argument(
+                "created_item_ids",
+                "must be an array of strings",
+            ))
+        }
+    };
+    let candidate_sha256 = crate::hex::sha256_hex(
+        &tokio::fs::read(&candidate)
+            .await
+            .with_context(|| format!("read {}", candidate.display()))?,
+    );
     match candidate_drc(&ctx.config.kicad_cli, &candidate, &board).await {
         Ok((report, rules)) => Ok(CallToolResult::json(&json!({
             "success": true,
             "board": board,
             "candidate_output_path": candidate,
+            "candidate_sha256": candidate_sha256,
             "drc_status": "checked",
-            "drc": specctra_drc_evidence(&report, &rules, None)
+            "drc": specctra_drc_evidence(&report, &rules, created_ids.as_deref())
         }))),
         Err(error) => Ok(CallToolResult::json(&json!({
             "success": false,
             "board": board,
             "candidate_output_path": candidate,
+            "candidate_sha256": candidate_sha256,
             "drc_status": "not_run",
             "drc": drc_not_run_evidence(&format!("{error:#}"))
         }))),
@@ -3525,6 +3611,44 @@ mod specctra_drc_evidence_tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_timeout_is_recognised_through_the_error_chain() {
+        let elapsed = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let error = anyhow::Error::from(elapsed).context("kicad-cli timed out after 600s");
+        assert!(is_timeout(&error));
+        assert!(!is_timeout(&anyhow::anyhow!("kicad-cli exited with 7")));
+    }
+
+    #[test]
+    fn the_not_run_warning_names_the_next_action_for_each_cause() {
+        let timeout = not_run_warning(&DrcNotRun {
+            reason: "kicad-cli timed out after 600s".into(),
+            timed_out: true,
+        });
+        assert!(timeout.contains("would time out again"), "{timeout}");
+        assert!(timeout.contains("sync_live_board"), "{timeout}");
+        let other = not_run_warning(&DrcNotRun {
+            reason: "kicad-cli exited with 7".into(),
+            timed_out: false,
+        });
+        assert!(other.contains("check_specctra_candidate"), "{other}");
+        assert!(other.contains("created_item_ids"), "{other}");
+    }
+
+    #[test]
+    fn import_clean_requires_the_library_table_to_have_been_applied() {
+        let created = vec!["aaaa-1".to_string()];
+        let rules = CandidateRules {
+            applied: vec![std::path::PathBuf::from("/project/amp.kicad_pro")],
+            library_diagnostic: Some("not applied".into()),
+            connectivity_diagnostic: None,
+        };
+        let evidence = specctra_drc_evidence(&checked_zero(), &rules, Some(&created));
+        assert_eq!(evidence["import_clean"], false);
+    }
+
     fn file_only_ctx(kicad_cli: &str) -> ToolContext {
         ToolContext::new(
             ServerConfig {
@@ -3576,6 +3700,25 @@ mod specctra_drc_evidence_tests {
         assert_eq!(body["drc"]["rules_source"], "project");
         assert_eq!(body["drc"]["routing_clean"], true);
         assert!(body["drc"]["import_clean"].is_null());
+        assert_eq!(
+            body["candidate_sha256"],
+            crate::hex::sha256_hex(b"(kicad_pcb)")
+        );
+
+        let with_ids = json!({
+            "board": source,
+            "candidate_output_path": candidate,
+            "created_item_ids": ["aaaa-1"]
+        });
+        let ctx = file_only_ctx(working.to_str().unwrap());
+        let result = handle_check_specctra_candidate(&with_ids, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(response_json(&result)["drc"]["import_clean"], true);
+
+        let same = json!({"board": source, "candidate_output_path": source});
+        let result = handle_check_specctra_candidate(&same, &ctx).await.unwrap();
+        assert!(result.is_error, "the source board is not a candidate");
 
         let failing = crate::tools::cli::test_support::write_script(
             tmp.path(),
