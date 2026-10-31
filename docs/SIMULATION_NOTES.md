@@ -19,7 +19,7 @@ Decisions already made by the owner:
 | D2 | Digital XSPICE models are on. Vetting refuses `d_process` and `d_cosim` |
 | D3 | Marked behavioural stand-ins are accepted. Such a result always reads `simulated_circuit: "modified"` |
 | Scope | The first version simulates schematics only |
-| Platforms | macOS first. Windows and Linux are validated at the end of the series |
+| Platforms | Developed on macOS; validated on Linux (ngspice 47, KiCad 10.0.7) when merged into this fork; Windows not yet validated |
 
 ## Where things are
 

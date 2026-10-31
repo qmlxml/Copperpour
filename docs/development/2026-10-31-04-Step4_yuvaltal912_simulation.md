@@ -86,3 +86,39 @@ The adaptation commit after them makes the result compile.
   `both_engine_versions_name_what_the_run_stalled_on`); the live test accepts either form, and the
   version test accepts any non-empty version. Then all 47 pass. The DRC live tests (steps 2 and 2b)
   also pass, including step 2's parity test, which could not be run before.
+- Committed as `6cd887a` (adaptation) and `050f14d` (ngspice 47 and live tests).
+
+## Review 1 (implementation, focused on the merge) and fix pass 1
+
+Nothing found would stop a normal simulation run. Findings and what was done:
+
+1. **`set_custom_rule`'s DRC on a temporary copy was no longer killed on timeout**
+   (`custom_rules.rs`, `kicad_verdict`): when the adaptation made killing opt-in, only the SES
+   candidate check was moved to the private-copy runner. Now uses `run_drc_on_private_copy`.
+   Manufacturing exports on a staged snapshot have the same property, as they did in Copperpour
+   before this work; recorded in `docs/BACKLOG.md`.
+2. **The live tests still started `CARGO_BIN_EXE_konnect` and set `KONNECT_STATE_DIR`.** The
+   adaptation section above said they had been renamed; that was wrong (the replacement covered
+   other names). They worked only through the `konnect` stand-in binary and the old variable's
+   fallback, and a developer's `COPPERPOUR_STATE_DIR` would have taken precedence and sent test
+   runs into the real state folder. Both renamed now.
+3. **The skill named only `stopped.node`**, which ngspice 47 does not fill. It now names
+   `stopped.node` (44) and `stopped.instance` (47). The parser's comment says only a `B` source
+   was measured.
+4. **No migration note** for the new toolset, error kind, `get_installation_info` block and
+   configuration keys: added `docs/api-migrations/simulation-toolset.md`.
+5. **docs/TROUBLESHOOTING.md** named the state folder after the product; it now states the folder.
+6. **docs/SIMULATION_PLAN.md** gave the old variable name and the fork's own commands as if they
+   applied here: the variable corrected, and a merge note added at the top that the fork's commands
+   are history and where this repository's checks are. `SIMULATION_NOTES.md` no longer says Linux
+   is unvalidated.
+7. **docs/RELIABILITY_CONTRACT.md** did not list `run_simulation` among the tools using the shared
+   outcome envelope: added.
+8. **`allowed_roots` used `dirs::home_dir()`**, bypassing Copperpour's refusal of a relative
+   `HOME` (#171): now `app_dirs::home_dir()`.
+9. **The note on `a_timed_out_kicad_cli_on_a_live_project_is_not_killed`** did not name the other
+   state in which not killing is wrong (a kicad-cli that never exits). Named, and recorded in
+   `docs/BACKLOG.md` for review 3 and later work.
+
+Gate after fix pass 1 (`logs/gate-step4-fix1.summary`): 3,654 passed (+1), 1 failed (the known
+baseline failure), 108 ignored. Simulation live tests (`logs/live-simulation.log`): 47 passed.

@@ -33,6 +33,16 @@ Each entry names where it was found, what is wrong, and the condition that close
 - **`run_drc` panics on a non-UTF-8 board path** (`pcb.to_str().unwrap()` in cli.rs; predates this
   work). Closing condition: an error instead of a panic.
 
+## kicad-cli processes (plan step 4)
+
+- **A kicad-cli that never exits on a live project runs on with nothing reporting it** after the
+  timeout error. It is not killed on purpose, because a killed kicad-cli leaves the project's lock
+  file behind. Closing condition: a bounded cleanup that kills it and removes only the lock it
+  created, or the hung process reported outward.
+- **Manufacturing exports on a staged snapshot are not killed on timeout**
+  (`manufacturing.rs`, snapshot mode, through `run_cli`), although the snapshot is a private copy.
+  Same as Copperpour before this work. Closing condition: those calls use the private-copy runner.
+
 ## Custom-shape pads (plan step 1, not merged)
 
 - **Footprints with custom-shape pads cannot be placed** (about 3.9% of KiCad's library). KiCad's

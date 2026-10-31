@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 fn worker(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_konnect"))
+    Command::new(env!("CARGO_BIN_EXE_copperpour"))
         .arg(WORKER_SUBCOMMAND)
         .args(args)
         .stdin(Stdio::null())
@@ -90,7 +90,7 @@ fn a_bad_request_exits_nonzero() {
 
 #[test]
 fn the_worker_is_not_advertised_in_help() {
-    let output = Command::new(env!("CARGO_BIN_EXE_konnect"))
+    let output = Command::new(env!("CARGO_BIN_EXE_copperpour"))
         .arg("--help")
         .stdin(Stdio::null())
         .output()
@@ -176,9 +176,9 @@ fn call_with_config(tool: &str, arguments: Value, config: &str) -> Value {
         json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
             "name": tool, "arguments": arguments}}),
     ];
-    let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_copperpour"))
         .env("HOME", home.path())
-        .env("KONNECT_STATE_DIR", home.path())
+        .env("COPPERPOUR_STATE_DIR", home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -565,7 +565,7 @@ impl WorkerRun {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_copperpour"));
         command
             .args(["sim-worker", "--protocol", &PROTOCOL_VERSION.to_string()])
             .arg("--run-dir")

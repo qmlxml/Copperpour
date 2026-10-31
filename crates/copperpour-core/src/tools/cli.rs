@@ -661,7 +661,9 @@ pub(crate) mod test_support {
     /// running. Not killing it is correct because a killed kicad-cli leaves
     /// the project's lock file behind, and the project then stays locked. It
     /// would be wrong on a private copy the caller is about to delete, which
-    /// the next test covers.
+    /// the next test covers. It is also wrong for a kicad-cli that never exits:
+    /// that process then runs with nothing reporting it after the timeout
+    /// error. Recorded as deferred work in docs/BACKLOG.md.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_timed_out_kicad_cli_on_a_live_project_is_not_killed() {

@@ -1415,7 +1415,9 @@ fn trouble_node_in(line: &str) -> Option<String> {
     rest.split('"').next().map(str::to_owned)
 }
 
-/// `trouble with B-instance b1` → `b1` (ngspice 47).
+/// `trouble with B-instance b1` → `b1` (ngspice 47). Measured only for a `B`
+/// source; other device letters are accepted on the assumption that ngspice
+/// words them the same way.
 fn trouble_instance_in(line: &str) -> Option<String> {
     let (_, rest) = line.split_once("trouble with ")?;
     let (kind, rest) = rest.split_once("-instance ")?;
@@ -1567,7 +1569,9 @@ static EXPORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// and any configured folder that was left out. A root that holds the user's
 /// home folder would stop the check meaning anything, so it is never used.
 fn allowed_roots(project_dir: &Path, model_dirs: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
-    let home = dirs::home_dir().and_then(|home| home.canonicalize().ok());
+    // Copperpour's helper refuses a relative HOME (#171), which would make this
+    // check compare against a folder under the working directory.
+    let home = crate::app_dirs::home_dir().and_then(|home| home.canonicalize().ok());
     let usable = |path: &Path| {
         path.parent().is_some() && !home.as_ref().is_some_and(|home| home.starts_with(path))
     };

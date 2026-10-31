@@ -241,6 +241,6 @@ Branch on `error.reason`, and show `error.items`.
 | `unbalanced_deck_block` | A `.if` or `.subckt` is left open | Close it. Check `spice_lines` first |
 | `engine_not_found` | No libngspice was found | Set `ngspice_library`, using the listed locations |
 
-A run that stops early with data is not an error. For `stopped.reason: "size_limit"`, raise `max_raw_bytes`, shorten the run or raise `max_step_seconds`. For `timeout`, do the same with `timeout_seconds`. For `no_convergence`, `stopped.node` names where it failed.
+A run that stops early with data is not an error. For `stopped.reason: "size_limit"`, raise `max_raw_bytes`, shorten the run or raise `max_step_seconds`. For `timeout`, do the same with `timeout_seconds`. For `no_convergence`, `stopped.node` (ngspice 44) or `stopped.instance` (ngspice 47) names where it failed; either may be absent if the engine named neither.
 
 MCP clients often stop waiting at 60 seconds, which is why the default budget is 40.

@@ -480,10 +480,11 @@ back to project-local sidecars, and so is a relative default (a relative
 run halts softly and keeps its data, which reads as `partial` with
 `stopped.reason: timeout`. With no data it fails with reason `timed_out`.
 
-Many MCP clients stop waiting at 60 seconds, and Konnect sends no progress during a
+Many MCP clients stop waiting at 60 seconds, and Copperpour sends no progress during a
 run, so the default budget is 40. Raise it only as far as the client allows. If the
-client gave up first, the run still finished and its files are under Konnect's
-state folder, in `simulation/`.
+client gave up first, the run still finished and its files are in `simulation/` under
+the state folder: `COPPERPOUR_STATE_DIR` if set, otherwise the platform's local data
+folder followed by `konnect` (for example `~/.local/share/konnect` on Linux).
 
 A run also stops at `max_raw_bytes`, 256 MiB by default, which reads as `partial` with
 `stopped.reason: size_limit` and keeps its data. A very small `max_step_seconds` is the
