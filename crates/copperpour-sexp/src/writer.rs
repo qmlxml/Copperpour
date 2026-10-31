@@ -111,15 +111,39 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
 }
 
 pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
-    write_atomic_unlocked_with(path, content, || {})
+    write_atomic_unlocked_with(path, content, || {}, ensure_closed_or_prepared_for_write)
+}
+
+/// Make the document safe to replace, and refuse if doing so changed it.
+///
+/// The live-editor hook saves the user's unsaved work in KiCad's Schematic
+/// Editor before allowing a write. The content being written was planned from
+/// the file as it was before that save, so replacing the file now would
+/// discard the user's work without any error. The file is therefore compared
+/// before and after: if the save changed it, the write is refused as a
+/// conflict, and the caller must plan its edit again from the saved file.
+fn prepare_unchanged(
+    path: &Path,
+    before: &Option<Vec<u8>>,
+    prepare: &impl Fn(&Path) -> Result<(), SexpError>,
+) -> Result<(), SexpError> {
+    prepare(path)?;
+    if &std::fs::read(path).ok() != before {
+        return Err(SexpError::Conflict {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn write_atomic_unlocked_with(
     path: &Path,
     content: &str,
     before_replace: impl FnOnce(),
+    prepare: impl Fn(&Path) -> Result<(), SexpError>,
 ) -> Result<(), SexpError> {
-    ensure_kicad_design_document_is_closed(path)?;
+    let before = std::fs::read(path).ok();
+    prepare_unchanged(path, &before, &prepare)?;
     let (tmp_path, mut file) = create_scratch_file(path)?;
 
     // Remove the scratch file unless the rename below succeeds.
@@ -137,7 +161,7 @@ fn write_atomic_unlocked_with(
     // A lock may have appeared while the scratch file was being written.
     // Recheck at the last refusal point before replacing the document.
     before_replace();
-    ensure_kicad_design_document_is_closed(path)?;
+    prepare_unchanged(path, &before, &prepare)?;
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
     sync_parent_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
@@ -227,13 +251,43 @@ pub fn ensure_kicad_design_document_is_closed(path: &Path) -> Result<(), SexpErr
     let Some(lock_path) = kicad_editor_lock_path(path) else {
         return Ok(());
     };
+    ensure_kicad_design_document_is_closed_with(path, &lock_path, |path| {
+        std::fs::symlink_metadata(path).map(|_| ())
+    })
+}
+
+/// [`ensure_kicad_design_document_is_closed`] for a content write: an
+/// observed lock on a schematic may be handed to the live-editor hook, which
+/// can make the open Schematic Editor safe to write under (it saves the
+/// user's work first).
+///
+/// Only the content-write paths in this module call this. Callers that need
+/// the document to be really closed (renaming a project, journal recovery)
+/// call [`ensure_kicad_design_document_is_closed`], which never consults the
+/// hook: an open editor would recreate the old file or overwrite the
+/// recovered one on its next save.
+fn ensure_closed_or_prepared_for_write(path: &Path) -> Result<(), SexpError> {
+    let Some(lock_path) = kicad_editor_lock_path(path) else {
+        return Ok(());
+    };
 
     let result = ensure_kicad_design_document_is_closed_with(path, &lock_path, |path| {
         std::fs::symlink_metadata(path).map(|_| ())
     });
+    if matches!(
+        &result,
+        Err(SexpError::KiCadEditorLocked {
+            inspection_error: Some(_),
+            ..
+        })
+    ) {
+        // The hook is not consulted for an unreadable lock; a reason it gave
+        // for an earlier attempt no longer describes this one.
+        forget_editor_lock_refusal(path);
+    }
 
-    // Fork: an observed (not unreadable) lock on a schematic may be handed to the
-    // live-editor hook, which can make the open Schematic Editor safe to write under.
+    // An observed (not unreadable) lock on a schematic may be handed to the
+    // live-editor hook.
     let observed_schematic_lock = matches!(
         &result,
         Err(SexpError::KiCadEditorLocked {
@@ -317,6 +371,14 @@ fn is_schematic_path(path: &Path) -> bool {
 
 fn refusal_key(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn forget_editor_lock_refusal(path: &Path) {
+    if let Some(refusals) = EDITOR_LOCK_REFUSALS.get() {
+        if let Ok(mut refusals) = refusals.lock() {
+            refusals.remove(&refusal_key(path));
+        }
+    }
 }
 
 fn consult_editor_lock_hook(path: &Path, lock_path: &Path) -> Option<Result<(), String>> {
@@ -575,7 +637,7 @@ fn write_new_atomic_unlocked_with_mode(
     content: &str,
     _mode: NewFileMode,
 ) -> Result<(), SexpError> {
-    ensure_kicad_design_document_is_closed(path)?;
+    ensure_closed_or_prepared_for_write(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut builder = tempfile::Builder::new();
     builder.prefix(".konnect-");
@@ -607,7 +669,7 @@ fn write_new_atomic_unlocked_with_mode(
     temporary.write_all(content.as_bytes())?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
-    ensure_kicad_design_document_is_closed(path)?;
+    ensure_closed_or_prepared_for_write(path)?;
     temporary
         .persist_noclobber(path)
         .map_err(|error| SexpError::Io(error.error))?;
@@ -1736,14 +1798,103 @@ mod atomic_write_tests {
         let lock = directory.path().join("~design.kicad_pcb.lck");
         std::fs::write(&path, "expected").unwrap();
 
-        let error = write_atomic_unlocked_with(&path, "replacement", || {
-            std::fs::write(&lock, "appeared during write").unwrap();
-        })
+        let error = write_atomic_unlocked_with(
+            &path,
+            "replacement",
+            || {
+                std::fs::write(&lock, "appeared during write").unwrap();
+            },
+            ensure_closed_or_prepared_for_write,
+        )
         .unwrap_err();
 
         assert!(matches!(error, SexpError::KiCadEditorLocked { .. }));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "expected");
         assert!(lock.exists());
+    }
+
+    /// The live-editor hook saves the user's unsaved work before allowing a
+    /// write. The replacement was planned from the file before that save, so
+    /// writing it would discard the user's work. Refusing here is correct
+    /// because the file changed under the planned edit; it would be wrong if
+    /// the preparation changed nothing, which the next test covers.
+    #[test]
+    fn a_write_is_refused_when_making_the_editor_safe_changed_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, "planned from").unwrap();
+
+        let error = write_atomic_unlocked_with(
+            &path,
+            "replacement",
+            || {},
+            |path| {
+                std::fs::write(path, "the user's saved work").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SexpError::Conflict { .. }), "{error:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "the user's saved work"
+        );
+    }
+
+    #[test]
+    fn a_write_proceeds_when_making_the_editor_safe_changed_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, "planned from").unwrap();
+
+        write_atomic_unlocked_with(&path, "replacement", || {}, |_| Ok(())).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
+    }
+
+    /// The second check, just before the rename, must catch a save made
+    /// while the scratch file was being written.
+    #[test]
+    fn a_change_between_the_two_checks_also_refuses_the_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, "planned from").unwrap();
+
+        let error = write_atomic_unlocked_with(
+            &path,
+            "replacement",
+            || std::fs::write(&path, "saved during the write").unwrap(),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SexpError::Conflict { .. }), "{error:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "saved during the write"
+        );
+    }
+
+    /// Callers that need the document closed (renaming, journal recovery) use
+    /// the strict check, which a schematic lock always refuses whether or not
+    /// a live-editor hook is installed.
+    #[test]
+    fn the_strict_check_refuses_an_observed_schematic_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, "design").unwrap();
+        std::fs::write(directory.path().join("~design.kicad_sch.lck"), "").unwrap();
+
+        let error = ensure_kicad_design_document_is_closed(&path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SexpError::KiCadEditorLocked {
+                inspection_error: None,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -170,7 +170,7 @@ the stale ~*.lck only after confirming no KiCad owns it, then retry"
                     .to_owned()
             }
             "dialog_open" => "a dialog is open in KiCad's Schematic Editor (for example Plot or Properties). \
-Close it, then retry; Konnect saves and reloads the editor itself"
+Close it, then retry; Copperpour saves and reloads the editor itself"
                 .to_owned(),
             "unexpected_dialog" => format!(
                 "KiCad opened a dialog while saving ({}); answer it in KiCad, then retry",
@@ -189,13 +189,19 @@ Close it, then retry; Konnect saves and reloads the editor itself"
     fn prepare(sessions: &Sessions, bridge: &Path, path: &Path) -> Result<(), String> {
         let mut map = sessions
             .lock()
-            .map_err(|_| "live editor state is poisoned; restart Konnect".to_owned())?;
+            .map_err(|_| "live editor state is poisoned; restart Copperpour".to_owned())?;
         let k = key(path);
 
         if let Some(session) = map.get_mut(&k) {
             // A burst is in progress: the editor was saved before the first write and has
             // not reloaded yet. It must still be clean, or the user has edited stale content.
             let status = run(bridge, "status", path)?;
+            if !status.ok {
+                // e.g. ambiguous_editor: two windows match. Report the bridge's
+                // own reason, not "no editor", which would suggest a stale lock.
+                map.remove(&k);
+                return Err(explain(&status));
+            }
             if !status.flag("editor") {
                 map.remove(&k);
                 return Err(explain(&Reply {

@@ -39,6 +39,19 @@ conflict, or no editor window matches the lock (stale lock). `COPPERPOUR_LIVE_ED
 the refusal; `COPPERPOUR_EDITOR_BRIDGE` overrides the bridge path. The `KONNECT_` names of these
 variables are still read.
 
+## Unsaved work in the editor (added when merged)
+
+If the editor has unsaved changes when a write arrives, the bridge saves them first. The edit the
+tool is about to write was planned from the file as it was before that save, so writing it would
+discard those changes. The writer therefore compares the file before and after the bridge runs, and
+refuses the write as a conflict if the save changed it (`crates/copperpour-sexp/src/writer.rs`,
+`prepare_unchanged`). The caller must re-read and plan the edit again; the second attempt is planned
+from the saved file and goes through. Nothing is lost, at the cost of one refused write.
+
+Operations that need the schematic to be really closed, not just safe to write under, still refuse
+while the editor has it open: renaming a project (`rename_project`; KiCad's next save would recreate
+the old file name) and journal recovery. Only the content-write paths consult the hook.
+
 ## Limits
 
 - Windows only. Matches the editor by window title (`<root sheet> — Schematic Editor`) and English
@@ -46,6 +59,14 @@ variables are still read.
 - Hierarchical sub-sheet files have no KiCad lock of their own, so writes to them are not
   coordinated (as before this feature).
 - PCB editing is unchanged: it already goes through KiCad's live IPC API.
+- Annotation (`sch_annotate`) checks for locks itself and does not consult the hook, so it is still
+  refused while the editor is open.
+- Each write runs the bridge twice (before writing the scratch file and again before replacing the
+  file), each as a new process, and a write can wait behind a reload. Expect writes under an open
+  editor to take noticeably longer.
+- The Rust module `crates/copperpour/src/live_editor.rs` is Windows-only. When it was merged into
+  this fork it was not compiled for Windows, because the build machine had no MinGW cross-compiler;
+  it was read for API mismatches instead. Build it on Windows before relying on it.
 
 ## Build
 
