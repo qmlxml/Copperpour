@@ -3,8 +3,8 @@
 `apply_specctra_ses` no longer reports unavailable unconnected-item or
 schematic-parity checks as zero findings. In its `drc` object, unavailable
 category counts are now `null`; checked counts remain integers. The new
-`complete` flag is true only when both categories were reported, and
-`missing_categories` names those that were unavailable. The
+`complete` flag is true only when every category was checked, and
+`missing_categories` names the rest. The
 `schematic_parity_diagnostic` field says why parity could not run: KiCad's
 own message when it printed one, otherwise Copperpour's statement that the
 expected root schematic is missing. `ownership_diagnostic` says when
@@ -12,8 +12,8 @@ Copperpour could not name what owns each violation item.
 
 `rules_source` says which DRC rules kicad-cli applied to the candidate:
 `"project"` when `<candidate stem>.kicad_pro` exists beside it, otherwise
-`"kicad_defaults"`. When the source project has a `.kicad_pro` or `.kicad_dru`
-that was not applied, `project_rules` is listed in `missing_categories`,
+`"kicad_defaults"`. When the candidate has no project file and the source
+project has a `.kicad_pro` or `.kicad_dru`, `project_rules` is listed in `missing_categories`,
 `complete` is false, and `rules_diagnostic` names the files: the violation
 count was computed with KiCad's default severities, clearances and net
 classes, not the project's.

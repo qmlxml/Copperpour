@@ -108,7 +108,7 @@ non-UTF-8 board path still panics at `pcb.to_str().unwrap()` in `run_drc`; that 
 change and is not part of this step.
 
 Gate after fix pass 2 (`logs/gate-step2-fix2.summary`): 3,142 passed (the two new tests),
-1 failed (the known baseline failure), 58 ignored.
+1 failed (the known baseline failure), 58 ignored. Committed as `ff8c657`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -126,7 +126,10 @@ Review 3 asked whether the intended behaviour is right, not whether the code imp
    project has a `.kicad_pro` or `.kicad_dru` that was not applied, `project_rules` is a missing
    category, `complete` and `clean` are false, and `rules_diagnostic` names the files. When the
    source project has no rule files, the defaults are what the source itself is checked with and
-   nothing is marked missing. Three tests added. The real fix is plan step 2b (Fork Survey
+   nothing is marked missing. Limit: the source's rule files are listed only when the candidate
+has no `.kicad_pro` of its own; a candidate with a `.kicad_pro` but no `.kicad_dru` is reported
+as `"project"` even if the source has custom rules. Step 2b removes this case by copying both
+files. Three tests added. The real fix is plan step 2b (Fork Survey
    section 7).
 2. **`clean` is always false for this tool, so callers may learn to ignore it.** Not changed in
    this step: reporting parity as "not applicable to an import" would reverse the position taken
@@ -135,7 +138,7 @@ Review 3 asked whether the intended behaviour is right, not whether the code imp
 3. **The recommended way out did not name Copperpour's tools.** The tool description,
    tool-directory row and migration note now name `run_drc` with `sync_live_board: true` and say
    that it saves the live board over the source file, which `apply_specctra_ses` itself avoids.
-4. **A board designed without a schematic can never pass `audit_manufacturing` on 10.0.7.** The
+4. **A board designed without a schematic can never pass `validate_for_manufacturing` on 10.0.7.** The
    fix text told the user to save a schematic that does not exist. It now also says that such a
    board cannot be shown READY by the audit. A recorded opt-out for board-only projects is not
    added: it is a new feature, recorded here as deferred work.
@@ -144,4 +147,14 @@ Review 3 asked whether the intended behaviour is right, not whether the code imp
    directory. Not pursued.
 
 Gate after fix pass 3 (`logs/gate-step2-fix3.summary`): 3,145 passed (the three new rules
-tests), 1 failed (the known baseline failure), 58 ignored.
+tests), 1 failed (the known baseline failure), 58 ignored. Committed as `3115795`.
+
+## Documentation review (sub-step 16)
+
+An independent check of this log, the plan entry and the migration notes against the
+repository found: the manufacturing tool was misnamed (`audit_manufacturing`, which runs no DRC;
+the changed text is in `validate_for_manufacturing`); the SES migration note's description of
+`complete` predated `project_rules`; the `.kicad_dru` limit above was not stated; the test-count
+delta omitted the extra ignored test; the measurement script defaulted to a fixture kicad-cli
+10.0.7 rejects and still said the code searches only stderr; and the doc comment on
+`apply_parity_evidence` still said the message is always printed to stderr. All corrected.

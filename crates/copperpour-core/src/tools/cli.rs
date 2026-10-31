@@ -1090,8 +1090,8 @@ fn parity_root_schematic(pcb: &Path) -> std::path::PathBuf {
 /// Turn kicad-cli's "nothing to compare" back into "not checked".
 ///
 /// With `--schematic-parity` and no root schematic for the board's project,
-/// kicad-cli exits 0, prints [`PARITY_NOT_RUN`] to stderr, and writes
-/// `"schematic_parity": []` — the same silent zero #245 removed from Copperpour's
+/// kicad-cli exits 0, writes `"schematic_parity": []` and, in some releases,
+/// prints [`PARITY_NOT_RUN`] — the same silent zero #245 removed from Copperpour's
 /// side (then Konnect), now produced by KiCad. KiCad's own statement is the signal, not a
 /// filesystem guess when KiCad reports failure; an absent exact root is also
 /// sufficient to withhold an empty result when KiCad stays silent.

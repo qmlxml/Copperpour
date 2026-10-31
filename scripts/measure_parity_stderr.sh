@@ -4,14 +4,16 @@
 #
 # Why this exists: Copperpour's `apply_parity_evidence` (crates/copperpour-core/src/tools/cli.rs)
 # decides whether an empty `schematic_parity` array is a checked zero or "not checked". It relies
-# on kicad-cli printing "Failed to fetch schematic netlist for parity tests" on stderr when it had
-# no schematic to compare. A contributed change (halthinks, 2026-10-20) says KiCad 10.0.7 can stay
+# on kicad-cli printing "Failed to fetch schematic netlist for parity tests" (searched on stderr
+# and stdout) when it had no schematic to compare, and on a file check when it prints nothing. A contributed change (halthinks, 2026-10-20) says KiCad 10.0.7 can stay
 # silent instead. Which is true decides whether the code's fallback (checking for the file
 # itself) is needed, and whether the live test that expects the message can pass. The answer can
 # change with each KiCad release, so it is measured, not assumed.
 #
 # Usage: scripts/measure_parity_stderr.sh [board.kicad_pcb]
-#   Default board: crates/copperpour-core/tests/fixtures/test.kicad_pcb (has test.kicad_sch).
+#   Default board: crates/copperpour-core/tests/fixtures/board_outline_kicad10.kicad_pcb (no
+#   schematic of its own, so the first two cases equal the third). test.kicad_pcb, which has a
+#   schematic, is rejected by kicad-cli 10.0.7 (exit 3).
 #   Runs these cases in temporary directories: board with its schematic and project, board with
 #   its schematic only, the board alone, and the board beside a root schematic that exists but
 #   cannot be used (empty file, unparsable text, unreadable permissions, a directory). Prints, per case, the exit status, whether the
@@ -22,7 +24,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 cli="${KICAD_CLI:-kicad-cli}"
-board="${1:-crates/copperpour-core/tests/fixtures/test.kicad_pcb}"
+board="${1:-crates/copperpour-core/tests/fixtures/board_outline_kicad10.kicad_pcb}"
 stem="$(basename "${board%.kicad_pcb}")"
 src_dir="$(dirname "$board")"
 msg="Failed to fetch schematic netlist for parity tests"
