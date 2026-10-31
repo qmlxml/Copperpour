@@ -146,7 +146,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is not checked for the candidate and is reported as missing. For complete evidence, run run_drc on the source board with sync_live_board: true; note that this saves the live board over the source file, which this tool itself avoids. The candidate's DRC runs on a temporary copy beside the source project's .kicad_pro and .kicad_dru, so the project's rules apply; drc.rules_applied names them.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is not checked for the candidate and is reported as missing. For complete evidence, run run_drc on the source board with sync_live_board: true; note that this saves the live board over the source file, which this tool itself avoids. The candidate's DRC runs on a temporary copy beside the source project's .kicad_pro and .kicad_dru, so the project's rules apply; drc.rules_applied names them. drc.routing_clean is true when design-rule violations and unconnected items were both checked and are zero; it does not cover schematic parity, so it is not design acceptance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1036,6 +1036,13 @@ async fn candidate_drc(
 /// Keep unavailable DRC categories distinct from checked zero findings.
 /// Import completion describes the mutation; a clean verdict additionally
 /// requires every DRC category to have been evaluated.
+///
+/// `clean` is false for every import, because schematic parity is never
+/// checked for the candidate (see [`candidate_drc`]). `routing_clean` (owner
+/// ruling 2026-10-31) answers the narrower question the import changes:
+/// design-rule violations and unconnected items were both checked and both
+/// are zero. It is false when the unconnected-items category is missing.
+/// `routing_clean_excludes` names what it does not cover.
 fn specctra_drc_evidence(report: &cli::DrcReport, rules: &CandidateRules) -> serde_json::Value {
     let missing_categories = report.missing_categories();
     let rules_applied: Vec<String> = rules
@@ -1047,6 +1054,9 @@ fn specctra_drc_evidence(report: &cli::DrcReport, rules: &CandidateRules) -> ser
     json!({
         "clean": complete && report.all().next().is_none(),
         "complete": complete,
+        "routing_clean": report.violations.is_empty()
+            && report.unconnected_items.as_ref().is_some_and(Vec::is_empty),
+        "routing_clean_excludes": ["schematic_parity"],
         "rules_source": if rules.applied.is_empty() { "kicad_defaults" } else { "project" },
         "rules_applied": rules_applied,
         "violations": report.violations.len(),
@@ -3088,6 +3098,58 @@ mod specctra_drc_evidence_tests {
         assert_eq!(
             evidence["schematic_parity_diagnostic"],
             "the expected root schematic is unavailable"
+        );
+    }
+
+    fn one_finding() -> Vec<cli::DrcViolation> {
+        vec![cli::DrcViolation {
+            severity: "error".into(),
+            description: "observed design finding".into(),
+            rule: "clearance".into(),
+            pos: None,
+            items: Vec::new(),
+        }]
+    }
+
+    /// Parity is always missing for an import, so `clean` is false; the
+    /// routing verdict still reports what was checked.
+    #[test]
+    fn routing_is_clean_when_rules_and_connectivity_were_checked_and_pass() {
+        let mut report = checked_zero();
+        report.schematic_parity = None;
+        let evidence = specctra_drc_evidence(&report, &project_rules());
+        assert_eq!(evidence["clean"], false);
+        assert_eq!(evidence["routing_clean"], true);
+        assert_eq!(
+            evidence["routing_clean_excludes"],
+            json!(["schematic_parity"])
+        );
+    }
+
+    /// Not acting (routing_clean false) is correct here because connectivity
+    /// was not checked; it would be wrong only if unconnected items had been
+    /// reported as an empty list, which the test above covers.
+    #[test]
+    fn routing_is_not_clean_when_connectivity_was_not_checked() {
+        let mut report = checked_zero();
+        report.unconnected_items = None;
+        let evidence = specctra_drc_evidence(&report, &project_rules());
+        assert_eq!(evidence["routing_clean"], false);
+    }
+
+    #[test]
+    fn routing_is_not_clean_with_a_violation_or_an_unconnected_item() {
+        let mut with_violation = checked_zero();
+        with_violation.violations = one_finding();
+        assert_eq!(
+            specctra_drc_evidence(&with_violation, &project_rules())["routing_clean"],
+            false
+        );
+        let mut with_unconnected = checked_zero();
+        with_unconnected.unconnected_items = Some(one_finding());
+        assert_eq!(
+            specctra_drc_evidence(&with_unconnected, &project_rules())["routing_clean"],
+            false
         );
     }
 

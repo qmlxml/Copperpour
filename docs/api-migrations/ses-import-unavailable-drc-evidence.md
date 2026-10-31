@@ -20,6 +20,13 @@ applied and `"kicad_defaults"` when the source project has neither, and
 `rules_applied` lists the source files used. Violation counts can differ from
 earlier releases for the same board.
 
+`clean` is false for every import, because parity is not checked for the
+candidate. `routing_clean` answers what the import changes: it is true when
+design-rule violations and unconnected items were both checked and are zero,
+and false when the unconnected-items category is missing.
+`routing_clean_excludes` is `["schematic_parity"]`. `routing_clean` is not
+design acceptance.
+
 `drc.clean` requires complete evidence and zero findings in every category.
 Top-level `success` still describes completion of the import, not design
 acceptance. An incomplete check does not discard an imported candidate;
