@@ -183,3 +183,12 @@ Both models recommended option C; the owner chose it. To implement:
 - Add a way to re-check an existing candidate with the source project's rules (reusing
   `candidate_drc`). The tool description must say that a board on which kicad-cli always
   exceeds its 600 s limit will time out again.
+
+### Ruling on finding 3 (owner, 2026-10-31): classify findings by the items they name
+
+Both models recommended this (the second reviewer proposed it; the first had listed only a second DRC run and
+agreed after checking the code). To implement: a finding is `introduced` if any item it names
+is one the import created (`created_ids`), otherwise `preexisting`. Add `import_clean` (no
+introduced findings, and unconnected items checked and zero); keep `routing_clean` as the
+whole-board verdict. No second DRC run. Assumption to verify in a live run with the KiCad
+editor: the item IDs KiCad returns over IPC are the UUIDs it writes into the saved candidate.
