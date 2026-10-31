@@ -109,3 +109,39 @@ change and is not part of this step.
 
 Gate after fix pass 2 (`logs/gate-step2-fix2.summary`): 3,142 passed (the two new tests),
 1 failed (the known baseline failure), 58 ignored.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+Review 3 asked whether the intended behaviour is right, not whether the code implements it.
+
+1. **The candidate's DRC runs against KiCad's default rules, not the project's** (defect in the
+   specification; Copperpour's existing behaviour, not introduced by the contribution).
+   `apply_specctra_ses` writes the candidate with no `<candidate stem>.kicad_pro` or `.kicad_dru`
+   beside it. Measured on kicad-cli 10.0.7 with `scripts/measure_candidate_drc_rules.sh` (project
+   severity `invalid_outline: ignore`): source board 0 violations; candidate alone 1; candidate
+   with the project file copied under its stem 0.
+   **Owner ruling 2026-10-31** (both models consulted; the second reviewer recommended this, the first leaned
+   to fixing it inside this step and then agreed): label it now, fix it as a separate plan step.
+   Done: the `drc` object has `rules_source` (`"project"` or `"kicad_defaults"`); when the source
+   project has a `.kicad_pro` or `.kicad_dru` that was not applied, `project_rules` is a missing
+   category, `complete` and `clean` are false, and `rules_diagnostic` names the files. When the
+   source project has no rule files, the defaults are what the source itself is checked with and
+   nothing is marked missing. Three tests added. The real fix is plan step 2b (Fork Survey
+   section 7).
+2. **`clean` is always false for this tool, so callers may learn to ignore it.** Not changed in
+   this step: reporting parity as "not applicable to an import" would reverse the position taken
+   in fix pass 1 (a check that did not run is not a pass). Left to step 2b, which changes how the
+   candidate's DRC runs and can propose a routing verdict for the owner to rule on.
+3. **The recommended way out did not name Copperpour's tools.** The tool description,
+   tool-directory row and migration note now name `run_drc` with `sync_live_board: true` and say
+   that it saves the live board over the source file, which `apply_specctra_ses` itself avoids.
+4. **A board designed without a schematic can never pass `audit_manufacturing` on 10.0.7.** The
+   fix text told the user to save a schematic that does not exist. It now also says that such a
+   board cannot be shown READY by the audit. A recorded opt-out for board-only projects is not
+   added: it is a new feature, recorded here as deferred work.
+5. **Putting the candidate beside the source's root schematic** to get parity would break
+   hierarchical sheets in a temporary directory, or leave a second project in the user's
+   directory. Not pursued.
+
+Gate after fix pass 3 (`logs/gate-step2-fix3.summary`): 3,145 passed (the three new rules
+tests), 1 failed (the known baseline failure), 58 ignored.
