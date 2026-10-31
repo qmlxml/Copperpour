@@ -34,7 +34,8 @@ given to kicad-cli; kicad-cli does not report a `.kicad_dru` it cannot parse.
 
 Findings are split into `introduced_violations` (those naming an item the
 import created) and `preexisting_violations`. `import_clean` is true when no
-finding was introduced and unconnected items were checked and are zero;
+finding was introduced, unconnected items were checked and are zero, and the
+footprint library table was applied;
 `routing_clean` still covers the whole board.
 
 If the candidate's DRC cannot run (kicad-cli failure or timeout, temporary
@@ -66,6 +67,6 @@ relying on it. Parity is not checked for the candidate: no schematic is
 placed beside the temporary copy, because a root schematic copied alone
 would lose its hierarchical sheets. It is reported as missing. For complete evidence, run
 `run_drc` on the source board with `sync_live_board: true`; it saves the live
-board, which now holds the imported routing, over the source file first. Import mutation, candidate persistence, and rollback semantics
-are unchanged. Clients must handle nullable counts and require `drc.complete`
+board, which now holds the imported routing, over the source file first. Import mutation and candidate persistence are unchanged; rollback now covers
+only import-side failures, as described above. Clients must handle nullable counts and require `drc.complete`
 before treating zero counts as complete verification evidence.

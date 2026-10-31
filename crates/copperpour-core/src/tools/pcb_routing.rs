@@ -146,7 +146,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is not checked for the candidate and is reported as missing. For complete evidence, run run_drc on the source board with sync_live_board: true; note that this saves the live board over the source file, which this tool itself avoids. The candidate's DRC runs on a temporary copy beside the source project's .kicad_pro, .kicad_dru and fp-lib-table (with ${KIPRJMOD} expanded), so the project's rules and footprint libraries apply; drc.rules_applied names the files used. drc.routing_clean is true when design-rule violations and unconnected items were both checked and are zero; it does not cover schematic parity, so it is not design acceptance. Findings are split into drc.introduced_violations (naming an item the import created) and drc.preexisting_violations; drc.import_clean is true when none was introduced and connectivity was checked and is zero. If the DRC itself cannot run (kicad-cli failure or timeout), the verified import is kept, drc_status is not_run with the reason, and check_specctra_candidate can check the candidate later.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is not checked for the candidate and is reported as missing. For complete evidence, run run_drc on the source board with sync_live_board: true; note that this saves the live board over the source file, which this tool itself avoids. The candidate's DRC runs on a temporary copy beside the source project's .kicad_pro, .kicad_dru and fp-lib-table (with ${KIPRJMOD} expanded), so the project's rules and footprint libraries apply; drc.rules_applied names the files used. drc.routing_clean is true when design-rule violations and unconnected items were both checked and are zero; it does not cover schematic parity, so it is not design acceptance. Findings are split into drc.introduced_violations (naming an item the import created) and drc.preexisting_violations; drc.import_clean is true when none was introduced, connectivity was checked and is zero, and the footprint library table was applied. If the DRC itself cannot run (kicad-cli failure or timeout), the verified import is kept, drc_status is not_run with the reason, and check_specctra_candidate can check the candidate later.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1348,7 +1348,7 @@ async fn handle_apply_specctra_ses(
                 paths: conflicts.clone(),
             },
             format!(
-                "Specctra import is non-destructive; candidate or DRC output already exists: {}",
+                "Specctra import is non-destructive; the candidate already exists: {}",
                 conflicts.join(", ")
             ),
         ));
@@ -4139,6 +4139,19 @@ mod specctra_live_undo_test {
         assert_eq!(body["drc_status"], "checked", "{body}");
         assert!(body["drc"]["introduced_violations"].is_u64(), "{body}");
         assert!(body["drc"]["import_clean"].is_boolean(), "{body}");
+        // The introduced/preexisting split assumes the KIIDs KiCad returned
+        // over IPC are the UUIDs it wrote into the saved candidate.
+        let saved = std::fs::read_to_string(&candidate).expect("read the candidate");
+        for id in body["created_item_ids"]
+            .as_array()
+            .expect("created_item_ids")
+        {
+            let id = id.as_str().expect("created item ID is a string");
+            assert!(
+                saved.contains(id),
+                "created item {id} is not named in the saved candidate"
+            );
+        }
 
         let after = client
             .save_document_to_string_in(document.clone())

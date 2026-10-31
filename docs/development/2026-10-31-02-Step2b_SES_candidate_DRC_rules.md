@@ -64,8 +64,8 @@ Routing verdict committed as `59733ab`. Gate (`logs/gate-step2b-verdict.summary`
    with `${KIPRJMOD}` expanded to the source directory, the same 4 as the source. Fixed:
    `candidate_drc` writes the table with `${KIPRJMOD}` (and the legacy `$(KIPRJMOD)`) expanded
    and lists it in `rules_applied`; `rules_source` stays `"project"` only when a `.kicad_pro`
-   or `.kicad_dru` was applied. New fixture `tests/fixtures/candidate_drc_project_lib` (with a
-   README recording the measurement) and ignored live test
+   or `.kicad_dru` was applied. New fixture `crates/copperpour-core/tests/fixtures/candidate_drc_project_lib/` (its README,
+   recording the measurement, is the sibling file `candidate_drc_project_lib.README.md`) and ignored live test
    `candidate_drc_live_finds_project_local_footprint_libraries`, which passes here. Control:
    with the table copy disabled, the live test fails.
 2. **The parity diagnostic described a file in the temporary directory** under the candidate's
@@ -137,7 +137,7 @@ Fixed in this pass:
   `connectivity_diagnostic`, so `routing_clean` is false. Tests
   `an_ignored_unconnected_check_is_recognised_in_the_project_file` and
   `an_ignored_connectivity_check_is_not_evidence_of_routing` (states why not acting is correct
-  and when it would be wrong). The same silent zero exists in plain `run_drc` for a project that
+  and when it would be wrong). Plain `run_drc` likewise reports zero unconnected items, without saying the check was ignored, for a project that
   ignores unconnected items; that predates this work and is recorded here as deferred.
 - **Finding 5: a library table that was not applied left the evidence complete.**
   `footprint_library` is now a missing category in that case. Test
@@ -166,9 +166,11 @@ Put to the owner (see the rulings below):
   boards `routing_clean` can never be true.
 
 Gate after fix pass 3 (`logs/gate-step2b-fix3.summary`): 3,155 passed (+3), 1 failed (the known
-baseline failure), 60 ignored.
+baseline failure), 60 ignored. Committed as `4eaeb50`.
 
 ### Ruling on finding 1 (owner, 2026-10-31): keep the import when only the check failed, and add a re-check
+
+Recorded in commit `6210e02`.
 
 Both models recommended option C; the owner chose it. To implement:
 - Roll back only for failures that say something about the import: IPC read-back mismatch and
@@ -186,6 +188,8 @@ Both models recommended option C; the owner chose it. To implement:
 
 ### Ruling on finding 3 (owner, 2026-10-31): classify findings by the items they name
 
+Recorded in commit `d280165`.
+
 Both models recommended this (the second reviewer proposed it; the first had listed only a second DRC run and
 agreed after checking the code). To implement: a finding is `introduced` if any item it names
 is one the import created (`created_ids`), otherwise `preexisting`. Add `import_clean` (no
@@ -195,7 +199,9 @@ editor: the item IDs KiCad returns over IPC are the UUIDs it writes into the sav
 
 ### Implementation of the two rulings
 
-- **Finding 1 ruling.** `ApplyEvidence.drc` is now `Result<(DrcReport, CandidateRules), String>`:
+- **Finding 1 ruling.** `ApplyEvidence.drc` is now a `Result` whose error is the reason the check
+  did not run (a `String` at first; `DrcNotRun`, with `reason` and `timed_out`, after the review
+  of this implementation):
   everything up to and including writing the candidate is still inside the closure whose error
   rolls the import back; the `candidate_drc` result is captured instead of propagated. The
   response gains `drc_status` (`"checked"` or `"not_run"`) and a top-level `warning` when the
@@ -210,9 +216,11 @@ editor: the item IDs KiCad returns over IPC are the UUIDs it writes into the sav
   New fields `introduced_violations`, `preexisting_violations`, `import_clean`; they are
   `null` from `check_specctra_candidate`, which does not know the created items.
 - **Not testable here:** the keep-the-import path inside `apply_specctra_ses`, and the
-  assumption that IPC KIIDs equal the saved UUIDs, need a running KiCad editor. Assertions for
-  both were added to Copperpour's existing live test (`specctra_live_undo_test`, needs KiCad and
-  Freerouting). Unit tests added: `findings_are_split_by_whether_they_name_an_item_the_import_created`,
+  assumption that IPC KIIDs equal the saved UUIDs, need a running KiCad editor. Copperpour's
+  existing live test (`specctra_live_undo_test`, needs KiCad and Freerouting) now asserts the
+  second (each created item ID appears in the saved candidate; added during the documentation
+  review) and that the DRC ran with the classification. Nothing asserts the keep-the-import
+  path. Unit tests added: `findings_are_split_by_whether_they_name_an_item_the_import_created`,
   `import_clean_requires_connectivity_to_have_been_checked`,
   `without_the_created_items_the_split_is_unknown_not_zero`,
   `a_check_that_did_not_run_passes_nothing`,
@@ -251,4 +259,18 @@ Tests added: `a_timeout_is_recognised_through_the_error_chain`,
 test: building the apply response when the check did not run; it needs the live test.
 
 Gate (`logs/gate-step2b-ruling-review.summary`): 3,163 passed (+3), 1 failed (the known baseline
+failure), 60 ignored. Committed as `2f4d194`.
+
+## Documentation review (sub-step 16)
+
+An independent check of this log, the plan entry, both migration notes, the tool descriptions
+and the tool directory against the code found eight errors, all corrected: wrong review and
+ruling counts in the plan; the live test was said to assert two properties it did not (it now
+asserts that every created item ID appears in the saved candidate; nothing asserts the
+keep-the-import path); an out-of-date type for `ApplyEvidence.drc`; missing commit hashes; the
+tool-directory row for `check_specctra_candidate` predating `created_item_ids`; a migration-note
+sentence saying rollback was unchanged; and a coined phrase replaced by a plain description.
+Also corrected: the `import_clean` definition everywhere now includes the library-table
+condition, the fixture README path, and the conflict message, which still mentioned a DRC
+output file. Gate (`logs/gate-step2b-docs.summary`): 3,163 passed, 1 failed (the known baseline
 failure), 60 ignored.
