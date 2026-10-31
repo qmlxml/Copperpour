@@ -1098,15 +1098,19 @@ pub(crate) fn replace_outcome(
     let shown = path.display().to_string();
     match written {
         Ok(true) => Ok(None),
-        Ok(false) => Ok(Some(CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::Conflict {
-                paths: vec![shown.clone()],
-            },
-            format!(
-                "The {what} '{shown}' changed after Copperpour read it, so {operation} wrote \
+        // Refused before anything was written: the same outcome as a file
+        // that changed since the read.
+        Ok(false) | Err(copperpour_sexp::SexpError::ChangedBeforeWrite { .. }) => {
+            Ok(Some(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::Conflict {
+                    paths: vec![shown.clone()],
+                },
+                format!(
+                    "The {what} '{shown}' changed after Copperpour read it, so {operation} wrote \
                  nothing. Reload it and retry."
-            ),
-        ))),
+                ),
+            )))
+        }
         Err(copperpour_sexp::SexpError::Conflict { .. }) => {
             let reason =
                 format!("the {what} no longer held the edit when read back after the write");
@@ -3379,5 +3383,57 @@ mod ipc_failure_evidence_tests {
         });
         assert_eq!(evidence["kind"], "request_failed");
         assert_eq!(evidence["message"], "AS_NOT_READY");
+    }
+}
+
+#[cfg(test)]
+mod replace_outcome_tests {
+    use super::*;
+
+    fn text(result: &CallToolResult) -> String {
+        serde_json::to_string(result).unwrap()
+    }
+
+    /// A write refused before anything was written (the live-editor guard)
+    /// must be reported like a file that changed since the read, not as an
+    /// uncertain outcome that would tell the caller the edit may be applied.
+    #[test]
+    fn a_change_before_the_write_is_reported_as_nothing_written() {
+        let path = std::path::Path::new("/project/amp.kicad_sch");
+        let refused = replace_outcome(
+            path,
+            "schematic",
+            "add_wire",
+            Err(copperpour_sexp::SexpError::ChangedBeforeWrite {
+                path: path.to_path_buf(),
+            }),
+        )
+        .unwrap()
+        .expect("a refusal");
+        let unchanged = replace_outcome(path, "schematic", "add_wire", Ok(false))
+            .unwrap()
+            .expect("a refusal");
+        assert_eq!(text(&refused), text(&unchanged));
+        assert!(
+            text(&refused).contains("wrote nothing"),
+            "{}",
+            text(&refused)
+        );
+
+        let readback = replace_outcome(
+            path,
+            "schematic",
+            "add_wire",
+            Err(copperpour_sexp::SexpError::Conflict {
+                path: path.to_path_buf(),
+            }),
+        )
+        .unwrap()
+        .expect("a refusal");
+        assert_ne!(
+            text(&readback),
+            text(&refused),
+            "a failed read-back stays uncertain"
+        );
     }
 }

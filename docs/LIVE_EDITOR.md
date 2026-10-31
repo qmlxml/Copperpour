@@ -3,12 +3,12 @@
 Contributed by AryanSenthil (fork `AryanSenthil/Konnect`, branch `live-editor`, commit `97dbaa4`,
 2026-10-28), merged into this fork in plan step 3 (`docs/development/2026-10-31-00-Fork_Survey.md`).
 **Copperpour can edit a schematic while KiCad's Schematic Editor has it open**, on Windows, when the
-helper `kicad-editor-bridge.exe` is installed beside `copperpour.exe` **and `COPPERPOUR_LIVE_EDITOR=1`
-is set**.
+helper `kicad-editor-bridge.exe` is installed beside `copperpour.exe` **and `COPPERPOUR_LIVE_EDITOR`
+is set to `1`, `on` or `true`**.
 
 **Experimental, off by default** (owner ruling 2026-10-31). The defects listed under "Known defects"
 below can lose design data. They are in Windows-only code that has not been compiled or tested since
-the merge. Without `COPPERPOUR_LIVE_EDITOR=1`, Copperpour refuses schematic writes while the editor
+the merge. Without `COPPERPOUR_LIVE_EDITOR` set to `1`, `on` or `true`, Copperpour refuses schematic writes while the editor
 has the file open, as before.
 
 ## Known defects (not fixed; recorded in `docs/BACKLOG.md`)
@@ -77,8 +77,9 @@ variables are still read.
 If the editor has unsaved changes when a write arrives, the bridge saves them first. The edit the
 tool is about to write was planned from the file as it was before that save, so writing it would
 discard those changes. The writer therefore compares the file before and after the bridge runs, and
-refuses the write as a conflict if the save changed it (`crates/copperpour-sexp/src/writer.rs`,
-`prepare_unchanged`). The caller must re-read and plan the edit again; the second attempt is planned
+refuses the write if the save changed it (`crates/copperpour-sexp/src/writer.rs`,
+`prepare_unchanged`, error `ChangedBeforeWrite`, reported to the caller as a conflict in which
+nothing was written). The caller must re-read and plan the edit again; the second attempt is planned
 from the saved file and goes through. Nothing is lost, at the cost of one refused write.
 
 Operations that need the schematic to be really closed, not just safe to write under, still refuse
@@ -110,5 +111,6 @@ then compile the bridge:
 %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /optimize /out:kicad-editor-bridge.exe tools\kicad-editor-bridge\KicadEditorBridge.cs
 ```
 
-and put `kicad-editor-bridge.exe` beside `copperpour.exe`. `tools/kicad-editor-bridge/test-bridge.ps1`
+and put `kicad-editor-bridge.exe` beside `copperpour.exe`, then set `COPPERPOUR_LIVE_EDITOR=1` (the
+feature is off without it). `tools/kicad-editor-bridge/test-bridge.ps1`
 proves the mechanism on a demo copy: an outside edit is lost without the reload and kept with it.

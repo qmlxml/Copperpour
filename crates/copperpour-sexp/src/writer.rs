@@ -117,7 +117,7 @@ pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), Se
 /// [`write_atomic_unlocked`] for a caller that planned `content` from
 /// `planned_from`: the guard against a save made while preparing the editor
 /// then compares against that text, not against a fresh read.
-fn write_atomic_unlocked_planned(
+pub(crate) fn write_atomic_unlocked_planned(
     path: &Path,
     planned_from: &str,
     content: &str,
@@ -131,14 +131,32 @@ fn write_atomic_unlocked_planned(
     )
 }
 
+/// [`write_atomic_unlocked_planned`] that never consults the live-editor
+/// hook, for journal recovery: an open editor would overwrite the recovered
+/// file on its next save.
+pub(crate) fn write_atomic_unlocked_strict(
+    path: &Path,
+    planned_from: &str,
+    content: &str,
+) -> Result<(), SexpError> {
+    write_atomic_unlocked_from(
+        path,
+        Some(planned_from.as_bytes().to_vec()),
+        content,
+        || {},
+        ensure_kicad_design_document_is_closed,
+    )
+}
+
 /// Make the document safe to replace, and refuse if doing so changed it.
 ///
 /// The live-editor hook saves the user's unsaved work in KiCad's Schematic
 /// Editor before allowing a write. The content being written was planned from
 /// the file as it was before that save, so replacing the file now would
 /// discard the user's work without any error. The file is therefore compared
-/// before and after: if the save changed it, the write is refused as a
-/// conflict, and the caller must plan its edit again from the saved file.
+/// before and after: if the save changed it, the write is refused with
+/// [`SexpError::ChangedBeforeWrite`] (nothing written), and the caller must
+/// plan its edit again from the saved file.
 fn prepare_unchanged(
     path: &Path,
     before: &Option<Vec<u8>>,
@@ -146,7 +164,7 @@ fn prepare_unchanged(
 ) -> Result<(), SexpError> {
     prepare(path)?;
     if &std::fs::read(path).ok() != before {
-        return Err(SexpError::Conflict {
+        return Err(SexpError::ChangedBeforeWrite {
             path: path.to_path_buf(),
         });
     }
@@ -303,13 +321,15 @@ fn ensure_closed_or_prepared_for_write(path: &Path) -> Result<(), SexpError> {
     });
     if matches!(
         &result,
-        Err(SexpError::KiCadEditorLocked {
-            inspection_error: Some(_),
-            ..
-        })
+        Ok(())
+            | Err(SexpError::KiCadEditorLocked {
+                inspection_error: Some(_),
+                ..
+            })
     ) {
-        // The hook is not consulted for an unreadable lock; a reason it gave
-        // for an earlier attempt no longer describes this one.
+        // The hook is not consulted when there is no lock or the lock cannot
+        // be read; a reason it gave for an earlier attempt no longer
+        // describes this one.
         forget_editor_lock_refusal(path);
     }
 
@@ -648,7 +668,26 @@ enum NewFileMode {
 }
 
 pub(crate) fn write_new_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
-    write_new_atomic_unlocked_with_mode(path, content, NewFileMode::Ordinary)
+    write_new_atomic_unlocked_with_mode(
+        path,
+        content,
+        NewFileMode::Ordinary,
+        ensure_closed_or_prepared_for_write,
+    )
+}
+
+/// [`write_new_atomic_unlocked`] that never consults the live-editor hook,
+/// for journal recovery.
+pub(crate) fn write_new_atomic_unlocked_strict(
+    path: &Path,
+    content: &str,
+) -> Result<(), SexpError> {
+    write_new_atomic_unlocked_with_mode(
+        path,
+        content,
+        NewFileMode::Ordinary,
+        ensure_kicad_design_document_is_closed,
+    )
 }
 
 /// Create-only atomic write for content that must not leave the owner.
@@ -656,15 +695,21 @@ pub(crate) fn write_new_atomic_unlocked_private(
     path: &Path,
     content: &str,
 ) -> Result<(), SexpError> {
-    write_new_atomic_unlocked_with_mode(path, content, NewFileMode::Private)
+    write_new_atomic_unlocked_with_mode(
+        path,
+        content,
+        NewFileMode::Private,
+        ensure_closed_or_prepared_for_write,
+    )
 }
 
 fn write_new_atomic_unlocked_with_mode(
     path: &Path,
     content: &str,
     _mode: NewFileMode,
+    prepare: fn(&Path) -> Result<(), SexpError>,
 ) -> Result<(), SexpError> {
-    ensure_closed_or_prepared_for_write(path)?;
+    prepare(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut builder = tempfile::Builder::new();
     builder.prefix(".konnect-");
@@ -696,7 +741,7 @@ fn write_new_atomic_unlocked_with_mode(
     temporary.write_all(content.as_bytes())?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
-    ensure_closed_or_prepared_for_write(path)?;
+    prepare(path)?;
     temporary
         .persist_noclobber(path)
         .map_err(|error| SexpError::Io(error.error))?;
@@ -1862,7 +1907,10 @@ mod atomic_write_tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, SexpError::Conflict { .. }), "{error:?}");
+        assert!(
+            matches!(error, SexpError::ChangedBeforeWrite { .. }),
+            "{error:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "the user's saved work"
@@ -1898,7 +1946,10 @@ mod atomic_write_tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, SexpError::Conflict { .. }), "{error:?}");
+        assert!(
+            matches!(error, SexpError::ChangedBeforeWrite { .. }),
+            "{error:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "changed after planning"
@@ -1921,7 +1972,10 @@ mod atomic_write_tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, SexpError::Conflict { .. }), "{error:?}");
+        assert!(
+            matches!(error, SexpError::ChangedBeforeWrite { .. }),
+            "{error:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "saved during the write"

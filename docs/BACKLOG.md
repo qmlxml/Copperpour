@@ -7,8 +7,11 @@ Each entry names where it was found, what is wrong, and the condition that close
 - **Ten known defects in the Windows-only live editor** (review 2 of step 3; listed in
   `docs/LIVE_EDITOR.md`, "Known defects"). Two can lose design data without any error. The feature is
   off unless `COPPERPOUR_LIVE_EDITOR=1` (owner ruling 2026-10-31). Closing condition: each defect
-  fixed and tested by hand on a Windows build with KiCad 10's Schematic Editor open, and the Windows
-  module compiled in CI.
+  fixed and tested by hand on a Windows build with KiCad 10's Schematic Editor open, on a named
+  machine, with the result recorded in `docs/development/`.
+- **No Windows CI job.** Copperpour's CI has no job that compiles the Windows-only module, so a
+  change that breaks it is not noticed. Closing condition: a CI job that runs
+  `cargo check --target` for a Windows target, or a recorded decision not to add one.
 - **Windows build not checked.** `crates/copperpour/src/live_editor.rs` was adapted at the merge but
   not compiled for Windows: `cargo check --target x86_64-pc-windows-gnu` needs the MinGW C compiler
   for `nng-sys`. Closing condition: the module compiles for a Windows target.

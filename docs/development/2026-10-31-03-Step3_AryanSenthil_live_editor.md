@@ -96,3 +96,40 @@ Done:
 
 Gate after fix pass 2 (`logs/gate-step3-fix2.summary`): 3,168 passed (+1), 1 failed (the known
 baseline failure), 60 ignored.
+Committed as `f81fe5a`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+Review 3 confirmed that users who leave the feature off get the same lock behaviour, error kinds and
+messages as before the step; line endings, BOMs and normalisation cannot cause the new guard to
+refuse (the conditional writers already required byte-equal text); and that no new refusal is
+permanent (a retry re-reads the file). Findings and what was done:
+
+1. **A write refused before anything was written was reported as "may have been written"**
+   (likely defect, reaches every user). `replace_if_unchanged` (crates/copperpour-core/src/tools/mod.rs)
+   relies on `transact_atomic` returning `Conflict` only when the read-back after a write fails, and
+   reports that as `MutationOutcomeUncertain`. The new guard also returned `Conflict`. Fixed: a new
+   error `SexpError::ChangedBeforeWrite` (crates/copperpour-sexp/src/error.rs), always raised before
+   anything is written; `replace_outcome` reports it exactly like a file that changed since the read
+   ("wrote nothing. Reload it and retry"). `Conflict` keeps its meaning for the 29 other places that
+   match it. Its own message says nothing was written, so callers that do not match it get a clear
+   handler error. Test `a_change_before_the_write_is_reported_as_nothing_written`.
+2. **Multi-file transactions compared against a fresh read; recovery could consult the hook.**
+   `apply_entry` (crates/copperpour-sexp/src/transaction.rs) now writes against each entry's before
+   image, and recovery uses new strict writers (`write_atomic_unlocked_strict`,
+   `write_new_atomic_unlocked_strict`) that never consult the hook. Test
+   `an_entry_whose_file_changed_after_verification_is_not_overwritten`.
+3. **A stale hook refusal reason could be shown for a strict refusal.** The recorded reason is now
+   forgotten whenever the write path finds no lock, and the server's lock message
+   (crates/copperpour-core/src/mcp/handler.rs) is chosen from the error itself
+   (`refused_by_live_editor`: `inspection_error` starting "live editor: "), not from whether a hook
+   is installed. Test `only_a_refusal_by_the_live_editor_carries_its_reason`.
+4. **The documentation said only `=1` enables the feature;** the code also accepts `on` and `true`.
+   `docs/LIVE_EDITOR.md` now says so, and its build section says the feature is off without the
+   setting.
+5. **Backlog:** the closing condition "compiled in CI" could not be met, because Copperpour has no
+   Windows CI job. Changed to "tested on a named machine, result recorded", and a separate entry
+   added for the missing CI job.
+
+Gate after fix pass 3 (`logs/gate-step3-fix3.summary`): 3,171 passed (+3), 1 failed (the known
+baseline failure), 60 ignored.

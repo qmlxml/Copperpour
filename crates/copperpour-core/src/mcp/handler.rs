@@ -441,7 +441,11 @@ impl McpHandler {
                                 ToolErrorKind::Conflict {
                                     paths: vec![path.clone()],
                                 },
-                                if copperpour_sexp::writer::editor_lock_hook_installed() {
+                                // Only a refusal the live-editor hook made carries
+                                // its reason; a strict check (rename, recovery)
+                                // or a write the hook was never asked about gets
+                                // the plain lock message.
+                                if refused_by_live_editor(&e) {
                                     format!(
                                         "Schematic '{path}': {}. Copperpour did not modify it.",
                                         copperpour_sexp::writer::schematic_lock_message(locked)
@@ -528,6 +532,20 @@ impl McpHandler {
             sinks.retain(|tx| tx.try_send(json.clone()).is_ok());
         }
     }
+}
+
+/// Whether a lock refusal came from the live-editor hook (its reason is
+/// recorded as `inspection_error: "live editor: ..."`).
+fn refused_by_live_editor(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<copperpour_sexp::SexpError>(),
+            Some(copperpour_sexp::SexpError::KiCadEditorLocked {
+                inspection_error: Some(reason),
+                ..
+            }) if reason.starts_with("live editor: ")
+        )
+    })
 }
 
 fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
@@ -873,6 +891,23 @@ mod required_argument_dispatch_tests {
             Some("invalid_argument"),
             "an empty uuids list is a request to delete nothing, not a mistake"
         );
+    }
+
+    #[test]
+    fn only_a_refusal_by_the_live_editor_carries_its_reason() {
+        let locked = |inspection_error: Option<&str>| {
+            anyhow::Error::from(copperpour_sexp::SexpError::KiCadEditorLocked {
+                path: "/p/a.kicad_sch".into(),
+                lock_path: "/p/~a.kicad_sch.lck".into(),
+                inspection_error: inspection_error.map(str::to_owned),
+            })
+            .context("add_wire")
+        };
+        assert!(refused_by_live_editor(&locked(Some(
+            "live editor: a dialog is open"
+        ))));
+        assert!(!refused_by_live_editor(&locked(None)));
+        assert!(!refused_by_live_editor(&locked(Some("permission denied"))));
     }
 
     #[tokio::test]
