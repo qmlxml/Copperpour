@@ -25,7 +25,12 @@ The parity diagnostic now says that parity is not checked for an SES
 candidate. `library_diagnostic` says when the library table could not be
 applied (its directory contains a double quote, which cannot be written into
 a library URI); footprint-library findings may then differ from the source
-board's. Violation counts can differ from
+board's, `footprint_library` is listed in `missing_categories` and `complete`
+is false. When the project sets the unconnected-items check to "ignore",
+kicad-cli reports none whatever the routing; that category is then reported
+as missing, with `connectivity_diagnostic`, so `routing_clean` is false.
+`rules_source: "project"` means the project's rule files were present and
+given to kicad-cli; kicad-cli does not report a `.kicad_dru` it cannot parse. Violation counts can differ from
 earlier releases for the same board.
 
 `clean` is false for every import, because parity is not checked for the

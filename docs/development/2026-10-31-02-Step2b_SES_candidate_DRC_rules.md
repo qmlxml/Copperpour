@@ -123,3 +123,47 @@ table in `rules_applied` is correct because the table carries no rules.
 
 Gate after fix pass 2 (`logs/gate-step2b-fix2.summary`): 3,152 passed (+4), 1 failed (the known
 baseline failure), 60 ignored.
+Committed as `7c5e5e7`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+Fixed in this pass:
+
+- **Finding 2: `routing_clean` could be true with nothing routed.** With the project's
+  `.kicad_pro` applied, a project severity `unconnected_items: "ignore"` makes kicad-cli report
+  an empty unconnected list (measured by the reviewer: 14 unconnected items with default
+  severities, `[]` with "ignore"). `candidate_drc` now reads that severity from the source
+  `.kicad_pro`; when it is "ignore" the category is reported as missing, with
+  `connectivity_diagnostic`, so `routing_clean` is false. Tests
+  `an_ignored_unconnected_check_is_recognised_in_the_project_file` and
+  `an_ignored_connectivity_check_is_not_evidence_of_routing` (states why not acting is correct
+  and when it would be wrong). The same silent zero exists in plain `run_drc` for a project that
+  ignores unconnected items; that predates this work and is recorded here as deferred.
+- **Finding 5: a library table that was not applied left the evidence complete.**
+  `footprint_library` is now a missing category in that case. Test
+  `a_library_table_not_applied_makes_the_evidence_incomplete`.
+- **Finding 6: `rules_source: "project"` does not prove the rules were parsed** (a `.kicad_dru`
+  with a syntax error gives exit 0 and no message, measured by the reviewer; the source board is
+  affected in the same way). Documented in the migration note.
+
+Not adopted, after measuring:
+
+- **Finding 4: relative library URIs.** The reviewer reported that `(uri "mylib.pretty")`
+  resolves for the board in place and not for the copy. Re-measured here on kicad-cli 10.0.7 in
+  the reviewer's own directories: the board in place also reports `lib_footprint_issues` ("The
+  footprint library 'mylib' is not enabled"). A first fix that made relative URIs absolute was
+  written and then removed, because it made the copy report less than the source. Relative URIs
+  are copied unchanged; the live test `candidate_drc_live_finds_project_local_footprint_libraries`
+  now also checks that the copy and the source report the same findings with a relative URI.
+
+Put to the owner (see the rulings below):
+
+- **Finding 1:** any failure in the DRC setup or run undoes a routing import that was committed
+  and verified, and a failure that repeats (e.g. kicad-cli exceeding its 600 s limit on a large
+  board) makes that board impossible to import.
+- **Finding 3:** findings already on the source board (e.g. 4 `copper_edge_clearance` on the
+  fixture, 17 warnings on KiCad's ecc83-pp demo) are inherited by every candidate, so on such
+  boards `routing_clean` can never be true.
+
+Gate after fix pass 3 (`logs/gate-step2b-fix3.summary`): 3,155 passed (+3), 1 failed (the known
+baseline failure), 60 ignored.

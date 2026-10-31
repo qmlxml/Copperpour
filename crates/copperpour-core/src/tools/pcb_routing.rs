@@ -986,6 +986,23 @@ struct CandidateRules {
     /// Why the project's footprint library table was not applied, if it
     /// exists and could not be.
     library_diagnostic: Option<String>,
+    /// Why the unconnected-items result is not evidence, if the project
+    /// sets that check's severity to "ignore".
+    connectivity_diagnostic: Option<String>,
+}
+
+/// Whether a `.kicad_pro` sets the unconnected-items check to "ignore".
+/// kicad-cli then reports that category as an empty list, which would read as
+/// a fully routed board. A file that cannot be read as JSON gives `false`.
+fn ignores_unconnected_items(project: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(project)
+        .ok()
+        .and_then(|project| {
+            project["board"]["design_settings"]["rule_severities"]["unconnected_items"]
+                .as_str()
+                .map(|severity| severity == "ignore")
+        })
+        .unwrap_or(false)
 }
 
 /// Replace every occurrence of `from` in `haystack`. The braced and
@@ -1077,6 +1094,10 @@ async fn candidate_drc(
             for variable in ["${KIPRJMOD}", "$(KIPRJMOD)", "$KIPRJMOD"] {
                 expanded = replace_bytes(&expanded, variable.as_bytes(), project_dir.as_bytes());
             }
+            // Relative URIs are copied unchanged on purpose. Measured on
+            // kicad-cli 10.0.7: `(uri "mylib.pretty")` is not resolved even
+            // for the board in place ("not enabled"), so the copy reports the
+            // same finding as the source does.
             tokio::fs::write(dir.path().join("fp-lib-table"), expanded)
                 .await
                 .context("write the footprint library table for the candidate's DRC")?;
@@ -1084,6 +1105,18 @@ async fn candidate_drc(
         }
     }
     let mut report = cli::run_drc(cli_path, &copy, false).await?;
+    let mut connectivity_diagnostic = None;
+    let project_file = source.with_extension("kicad_pro");
+    if let Ok(project) = tokio::fs::read(&project_file).await {
+        if ignores_unconnected_items(&project) && report.unconnected_items.is_some() {
+            report.unconnected_items = None;
+            connectivity_diagnostic = Some(format!(
+                "{} sets the unconnected-items check to \"ignore\", so kicad-cli reports none \
+                 whether or not the board is routed; connectivity was not checked",
+                project_file.display()
+            ));
+        }
+    }
     if report.schematic_parity.is_none() {
         report.schematic_parity_diagnostic = Some(
             "schematic parity is not checked for an SES candidate: its DRC runs on a temporary \
@@ -1108,6 +1141,7 @@ async fn candidate_drc(
         CandidateRules {
             applied,
             library_diagnostic,
+            connectivity_diagnostic,
         },
     ))
 }
@@ -1123,7 +1157,10 @@ async fn candidate_drc(
 /// are zero. It is false when the unconnected-items category is missing.
 /// `routing_clean_excludes` names what it does not cover.
 fn specctra_drc_evidence(report: &cli::DrcReport, rules: &CandidateRules) -> serde_json::Value {
-    let missing_categories = report.missing_categories();
+    let mut missing_categories = report.missing_categories();
+    if rules.library_diagnostic.is_some() {
+        missing_categories.push("footprint_library");
+    }
     let rules_applied: Vec<String> = rules
         .applied
         .iter()
@@ -1146,6 +1183,7 @@ fn specctra_drc_evidence(report: &cli::DrcReport, rules: &CandidateRules) -> ser
         },
         "rules_applied": rules_applied,
         "library_diagnostic": rules.library_diagnostic,
+        "connectivity_diagnostic": rules.connectivity_diagnostic,
         "violations": report.violations.len(),
         "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
         "schematic_parity_violations": report.schematic_parity.as_ref().map(Vec::len),
@@ -2981,6 +3019,7 @@ mod specctra_drc_evidence_tests {
         CandidateRules {
             applied: vec![std::path::PathBuf::from("/project/amp.kicad_pro")],
             library_diagnostic: None,
+            connectivity_diagnostic: None,
         }
     }
 
@@ -3001,6 +3040,7 @@ mod specctra_drc_evidence_tests {
             &CandidateRules {
                 applied: Vec::new(),
                 library_diagnostic: None,
+                connectivity_diagnostic: None,
             },
         );
         assert_eq!(evidence["rules_source"], "kicad_defaults");
@@ -3213,6 +3253,83 @@ mod specctra_drc_evidence_tests {
         assert!(rules.library_diagnostic.is_none());
     }
 
+    #[test]
+    fn an_ignored_unconnected_check_is_recognised_in_the_project_file() {
+        let ignore =
+            br#"{"board":{"design_settings":{"rule_severities":{"unconnected_items":"ignore"}}}}"#;
+        let error =
+            br#"{"board":{"design_settings":{"rule_severities":{"unconnected_items":"error"}}}}"#;
+        assert!(ignores_unconnected_items(ignore));
+        assert!(!ignores_unconnected_items(error));
+        assert!(!ignores_unconnected_items(b"{}"));
+        assert!(!ignores_unconnected_items(b"not json"));
+    }
+
+    /// A project that ignores unconnected items gets an empty list from
+    /// kicad-cli whatever the routing. Reporting `routing_clean: false` here
+    /// is correct because connectivity was not checked; it would be wrong
+    /// for a project whose severity is not "ignore", which the routing tests
+    /// above cover.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ignored_connectivity_check_is_not_evidence_of_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let source = project.join("amp.kicad_pcb");
+        std::fs::write(&source, "(kicad_pcb)").unwrap();
+        std::fs::write(
+            source.with_extension("kicad_pro"),
+            r#"{"board":{"design_settings":{"rule_severities":{"unconnected_items":"ignore"}}}}"#,
+        )
+        .unwrap();
+        let candidate = tmp.path().join("amp.routed.kicad_pcb");
+        std::fs::write(&candidate, "(kicad_pcb)").unwrap();
+        let report = tmp.path().join("report.json");
+        std::fs::write(
+            &report,
+            r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
+        )
+        .unwrap();
+        let script = format!(
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    \
+             shift\n    cp \"{}\" \"$1\"\n  fi\n  shift\ndone\nexit 0\n",
+            report.display()
+        );
+        let cli = crate::tools::cli::test_support::write_script(
+            tmp.path(),
+            "fake-kicad-cli",
+            &script,
+            "@echo off\r\nexit /b 1\r\n",
+        );
+        let (drc, rules) = candidate_drc(cli.to_str().unwrap(), &candidate, &source)
+            .await
+            .unwrap();
+        assert!(drc.unconnected_items.is_none());
+        let evidence = specctra_drc_evidence(&drc, &rules);
+        assert_eq!(evidence["routing_clean"], false);
+        assert!(evidence["missing_categories"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconnected_items")));
+        assert!(evidence["connectivity_diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("ignore"));
+    }
+
+    #[test]
+    fn a_library_table_not_applied_makes_the_evidence_incomplete() {
+        let rules = CandidateRules {
+            applied: Vec::new(),
+            library_diagnostic: Some("not applied".into()),
+            connectivity_diagnostic: None,
+        };
+        let evidence = specctra_drc_evidence(&checked_zero(), &rules);
+        assert_eq!(evidence["complete"], false);
+        assert_eq!(evidence["missing_categories"], json!(["footprint_library"]));
+    }
+
     /// Live check of the footprint library table: a project-local library
     /// (`${KIPRJMOD}/mylib.pretty`) must still be found when the candidate is
     /// checked as a temporary copy. Control: the copy checked without the
@@ -3259,6 +3376,19 @@ mod specctra_drc_evidence_tests {
                 .any(|v| v.rule == "lib_footprint_issues"),
             "control: a copy without the library table cannot find mylib"
         );
+        let (drc, _) = candidate_drc(&cli, &candidate, &source).await.unwrap();
+        assert_eq!(rules_of(&drc), rules_of(&in_place));
+
+        // The same library named by a relative URI. kicad-cli 10.0.7 does not
+        // resolve it even in place; the copy must report what the source
+        // reports, not more and not less.
+        let table = std::fs::read_to_string(project.join("fp-lib-table")).unwrap();
+        std::fs::write(
+            project.join("fp-lib-table"),
+            table.replace("${KIPRJMOD}/mylib.pretty", "mylib.pretty"),
+        )
+        .unwrap();
+        let in_place = cli::run_drc(&cli, &source, false).await.unwrap();
         let (drc, _) = candidate_drc(&cli, &candidate, &source).await.unwrap();
         assert_eq!(rules_of(&drc), rules_of(&in_place));
     }
