@@ -542,11 +542,18 @@ fn reject_non_file_lock_path(path: &Path) -> Result<(), SexpError> {
 }
 
 fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
-    // KONNECT_STATE_DIR is the name before the rename to Copperpour.
+    document_lock_path_in(&state_root()?, path)
+}
+
+/// Where Copperpour keeps its own files: `COPPERPOUR_STATE_DIR` (or its name
+/// before the rename, `KONNECT_STATE_DIR`), or the platform's local data folder.
+/// Public so the simulation worker can place its files under the same root
+/// (contributed by yuvaltal912-sys; merged with Copperpour's variable names).
+pub fn state_root() -> Result<PathBuf, SexpError> {
     let configured = ["COPPERPOUR_STATE_DIR", "KONNECT_STATE_DIR"]
         .into_iter()
         .find_map(|key| std::env::var_os(key).filter(|value| !value.is_empty()));
-    let state_root = match configured {
+    match configured {
         Some(value) => {
             let root = PathBuf::from(value);
             if !root.is_absolute() {
@@ -554,7 +561,7 @@ fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
                     "COPPERPOUR_STATE_DIR must be an absolute path".to_owned(),
                 ));
             }
-            root
+            Ok(root)
         }
         // Still named `konnect`, so a Konnect build editing the same file
         // takes the same lock as this one. Never relative to the working
@@ -567,9 +574,8 @@ fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
                     "no platform local-data directory is available (on Unix: HOME is relative, or unset with no account entry); set COPPERPOUR_STATE_DIR to an absolute path"
                         .to_owned(),
                 )
-            })?,
-    };
-    document_lock_path_in(&state_root, path)
+            }),
+    }
 }
 
 fn document_lock_path_in(state_root: &Path, path: &Path) -> Result<PathBuf, SexpError> {

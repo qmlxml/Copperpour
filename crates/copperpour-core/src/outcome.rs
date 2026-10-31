@@ -20,6 +20,7 @@ pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
     "batch_place_components",
     "delete_zone",
     "run_design_review",
+    "run_simulation",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

@@ -5,7 +5,8 @@
     "annotate_schematic",
     "batch_place_components",
     "delete_zone",
-    "run_design_review"
+    "run_design_review",
+    "run_simulation"
   ],
   "legacy_entry_ceiling": 3,
   "legacy_entries": [
