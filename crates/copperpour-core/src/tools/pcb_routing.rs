@@ -146,14 +146,14 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves post-commit IPC read-back counts, and reports KiCad DRC findings and missing categories. A clean verdict requires complete evidence; import success alone is not design acceptance. Schematic parity is checked only if <candidate stem>.kicad_sch exists beside the candidate, so it is normally reported as missing: for complete evidence, save the board in KiCad and run run_drc on the source board.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
                     "ses_path": { "type": "string", "description": "Freerouting .ses result" },
                     "manifest_path": { "type": "string", "description": "Copperpour reverse manifest written with the DSN" },
-                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." }
+                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced. KiCad checks schematic parity only against <candidate stem>.kicad_sch beside it." }
                 },
                 "required": ["board", "ses_path", "manifest_path", "candidate_output_path"]
             }),
@@ -2845,16 +2845,17 @@ mod specctra_drc_evidence_tests {
     }
 
     #[test]
-    fn unavailable_parity_preserves_the_kicad_diagnostic() {
+    fn unavailable_parity_passes_its_diagnostic_through() {
         let mut report = checked_zero();
         report.schematic_parity = None;
         report.schematic_parity_diagnostic =
-            Some("KiCad could not read the candidate root schematic".into());
+            Some("the expected root schematic is unavailable".into());
         let evidence = specctra_drc_evidence(&report);
         assert_eq!(evidence["clean"], false);
+        assert_eq!(evidence["complete"], false);
         assert_eq!(
             evidence["schematic_parity_diagnostic"],
-            "KiCad could not read the candidate root schematic"
+            "the expected root schematic is unavailable"
         );
     }
 

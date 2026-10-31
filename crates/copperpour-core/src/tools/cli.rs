@@ -1064,9 +1064,12 @@ fn drc_args<'a>(out_path: &'a str, refill_zones: bool, pcb: &'a str) -> Vec<&'a 
     args
 }
 
-/// KiCad's own statement that the parity test compared nothing. Written to
-/// stderr, with exit 0 and an empty `schematic_parity` array, whenever the
-/// board's project has no root schematic to read.
+/// KiCad's own statement that the parity test compared nothing, written to
+/// stderr with exit 0 and an empty `schematic_parity` array when the board's
+/// project has no root schematic to read. Not every KiCad release prints it:
+/// measured on kicad-cli 10.0.7 (scripts/measure_parity_stderr.sh), a board
+/// with no root schematic beside it gives exit 0, an empty array and no
+/// message. [`apply_parity_evidence`] therefore also checks for the file.
 const PARITY_NOT_RUN: &str = "Failed to fetch schematic netlist for parity tests";
 
 /// The schematic kicad-cli's parity test reads: the root of the board's own
@@ -1086,8 +1089,8 @@ fn parity_root_schematic(pcb: &Path) -> std::path::PathBuf {
 ///
 /// With `--schematic-parity` and no root schematic for the board's project,
 /// kicad-cli exits 0, prints [`PARITY_NOT_RUN`] to stderr, and writes
-/// `"schematic_parity": []` — the same silent zero #245 removed from Konnect's
-/// side, now produced by KiCad. KiCad's own statement is the signal, not a
+/// `"schematic_parity": []` — the same silent zero #245 removed from Copperpour's
+/// side (then Konnect), now produced by KiCad. KiCad's own statement is the signal, not a
 /// filesystem guess when KiCad reports failure; an absent exact root is also
 /// sufficient to withhold an empty result when KiCad stays silent.
 ///
@@ -2388,7 +2391,7 @@ mod drc_parse_tests {
 
     /// Silence only permits a checked zero when the exact root is present.
     #[test]
-    fn a_silent_empty_parity_array_is_a_checked_zero() {
+    fn a_silent_empty_parity_array_with_its_root_present_is_a_checked_zero() {
         let mut report = parse_drc_report(&real_report()).unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2416,11 +2419,22 @@ mod drc_parse_tests {
     }
 
     /// Bounded live CLI acceptance. Does not exercise SES import/undo or IPC.
+    ///
+    /// The fixture boards are not in this repository: they were made by the
+    /// contributor (halthinks, 2026-10-20) and kept outside it. To run, set
+    /// `KONNECT_NATIVE_FIXTURES` to a directory holding the subdirectories
+    /// named below, each with a `fixture.kicad_pcb`, and `KONNECT_NATIVE_CLI`
+    /// to kicad-cli 10.0.7. The `KONNECT_` prefix matches the other live-test
+    /// variables (`KONNECT_LIVE_*`).
     #[tokio::test]
     #[ignore = "requires KiCad 10.0.7 and retained independent native fixtures"]
     async fn native_independent_drc_controls() {
-        let root = PathBuf::from(std::env::var("KONNECT_NATIVE_FIXTURES").unwrap());
-        let cli = std::env::var("KONNECT_NATIVE_CLI").unwrap();
+        let root = PathBuf::from(
+            std::env::var("KONNECT_NATIVE_FIXTURES")
+                .expect("set KONNECT_NATIVE_FIXTURES to the native fixture directory"),
+        );
+        let cli = std::env::var("KONNECT_NATIVE_CLI")
+            .expect("set KONNECT_NATIVE_CLI to a kicad-cli 10.0.7 executable");
         for case in ["mechanical-positive", "routed-probes"] {
             let report = run_drc(&cli, &root.join(case).join("fixture.kicad_pcb"), false)
                 .await
@@ -2536,10 +2550,14 @@ mod drc_parse_tests {
             .expect("kicad-cli pcb drc on the lone board");
         assert!(report.schematic_parity.is_none());
         assert!(report.missing_categories().contains(&"schematic_parity"));
+        // KiCad 10.0.7 gives no message for a lone board (exit 0, empty
+        // array); earlier releases print PARITY_NOT_RUN. Either way the
+        // parity result must be withheld with a diagnostic.
         assert!(report
             .schematic_parity_diagnostic
             .as_deref()
-            .is_some_and(|reason| reason.contains(PARITY_NOT_RUN)));
+            .is_some_and(|reason| reason.contains(PARITY_NOT_RUN)
+                || reason.contains("root schematic is unavailable")));
 
         // A project of another name beside the board is not consulted.
         let renamed = tmp.path().join("renamed");
