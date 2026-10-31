@@ -27,9 +27,39 @@ summary="logs/gate-$label.summary"
 : > "$summary"
 export PROTOC="${PROTOC:-$(command -v protoc)}"
 
+# Build directory and disk space.
+# On 2026-10-31 a full debug build filled /home to 100% on this machine (target/ was about
+# 16 GB by du). The owner then freed space on /home (42 GB free), so the build stays in the
+# project's target/ directory. To build elsewhere, set CARGO_TARGET_DIR; a directory on the
+# root partition must not be under /var/tmp, where systemd-tmpfiles deletes files unused for
+# 30 days.
+# Line-table-only debug information roughly halves the build size and does not change test
+# results. The gate refuses to start, and stops between checks, when the build partition has
+# less than MIN_FREE_GB free: /home also holds the owner's other work.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}"
+export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-line-tables-only}"
+MIN_FREE_GB="${MIN_FREE_GB:-10}"
+mkdir -p "$CARGO_TARGET_DIR"
+if [ ! -d "$CARGO_TARGET_DIR" ] || [ ! -w "$CARGO_TARGET_DIR" ]; then
+    echo "gate: build directory $CARGO_TARGET_DIR is missing or not writable" | tee -a "$summary"
+    exit 2
+fi
+free_gb() { df --output=avail -BG "$CARGO_TARGET_DIR" | tail -1 | tr -dc '0-9'; }
+check_space() {
+    local free
+    free=$(free_gb)
+    if [ "$free" -lt "$MIN_FREE_GB" ]; then
+        echo "ABORT disk: ${free} GB free on the build partition, below ${MIN_FREE_GB} GB" | tee -a "$summary"
+        exit 3
+    fi
+}
+check_space
+
 status=0
 run() {
     local name="$1"; shift
+    check_space
     echo "===== $name: $*" >> "$log"
     if "$@" >> "$log" 2>&1; then
         echo "PASS $name" >> "$summary"
