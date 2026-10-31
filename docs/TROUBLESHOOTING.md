@@ -474,6 +474,17 @@ back to project-local sidecars, and so is a relative default (a relative
 `HOME`, say): edits then refuse until `HOME`, `XDG_DATA_HOME` or
 `COPPERPOUR_STATE_DIR` is an absolute path.
 
+## `run_simulation` times out, or the client stops waiting
+
+`timeout_seconds` is a budget for the whole call, export included. At the budget the
+run halts softly and keeps its data, which reads as `partial` with
+`stopped.reason: timeout`. With no data it fails with reason `timed_out`.
+
+Many MCP clients stop waiting at 60 seconds, and Konnect sends no progress during a
+run, so the default budget is 40. Raise it only as far as the client allows. If the
+client gave up first, the run still finished and its files are under Konnect's
+state folder, in `simulation/`.
+
 ## Tools don't appear after `load_toolset`
 
 After a successful `load_toolset` call the server sends a
