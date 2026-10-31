@@ -1017,7 +1017,9 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
     let _ = tokio::fs::remove_file(&out_path).await;
 
     let mut report = parse_drc_report(&raw)?;
-    apply_parity_evidence(&mut report, &output.stderr, pcb);
+    // KiCad's reporter may write the not-run message to either stream.
+    let kicad_output = format!("{}\n{}", output.stderr, output.stdout);
+    apply_parity_evidence(&mut report, &kicad_output, pcb);
 
     // Ownership comes from the exact board this DRC ran on, and it is attached
     // here — the one path `run_drc` and `get_drc_violations` share — so the two
@@ -1096,18 +1098,36 @@ fn parity_root_schematic(pcb: &Path) -> std::path::PathBuf {
 ///
 /// A **non-empty** array is KiCad's evidence and is kept whatever stderr or
 /// the filesystem say: findings cannot be un-found by a lookup failing.
-fn apply_parity_evidence(report: &mut DrcReport, stderr: &str, pcb: &Path) {
+///
+/// `kicad_output` is kicad-cli's stderr and stdout together.
+///
+/// Measured on kicad-cli 10.0.7 (scripts/measure_parity_stderr.sh): a board
+/// with no root schematic beside it gives exit 0, an empty array and no
+/// message, so the file check below is what catches it. A root that exists
+/// but cannot be used (empty, unparsable, truncated, unreadable, or a
+/// directory) makes kicad-cli exit 255 with no report at all, so that state
+/// never reaches this function on 10.0.7.
+///
+/// Only `<board stem>.kicad_sch` counts as the root. A project whose root is
+/// a legacy `.sch` file is reported as not checked even if KiCad compared it:
+/// the result is withheld, never invented.
+///
+/// The file is checked once. A root created after kicad-cli finished but
+/// before this check would turn KiCad's silent "not compared" into a checked
+/// zero; that cannot be closed without KiCad stating what it compared.
+fn apply_parity_evidence(report: &mut DrcReport, kicad_output: &str, pcb: &Path) {
     let Some(parity) = report.schematic_parity.as_ref() else {
         return;
     };
     let expected = parity_root_schematic(pcb);
-    let native_not_run = stderr.contains(PARITY_NOT_RUN);
-    // KiCad 10.0.7 can also silently emit [] when the root is absent.
-    // A missing root cannot be positive parity evidence, even without stderr.
-    if !parity.is_empty() || (!native_not_run && expected.is_file()) {
+    let root_present = expected.is_file();
+    let native_not_run = kicad_output.contains(PARITY_NOT_RUN);
+    // A missing root cannot be positive parity evidence, even when KiCad
+    // prints nothing.
+    if !parity.is_empty() || (!native_not_run && root_present) {
         return;
     }
-    let root_state = if expected.is_file() {
+    let root_state = if root_present {
         "which exists but could not be read for parity"
     } else {
         "which does not exist"
@@ -2401,6 +2421,37 @@ mod drc_parse_tests {
 
         assert_eq!(report.schematic_parity.as_ref().map(Vec::len), Some(0));
         assert!(report.schematic_parity_diagnostic.is_none());
+    }
+
+    /// KiCad's reporter may write the not-run message to stdout instead of
+    /// stderr. `run_drc` must recognise it there too, even with a root
+    /// schematic beside the board (where the file check alone would accept
+    /// the empty array as a checked zero).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_not_run_message_on_stdout_also_withholds_parity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pcb = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&pcb, "(kicad_pcb)").unwrap();
+        std::fs::write(pcb.with_extension("kicad_sch"), "(kicad_sch)").unwrap();
+        let prepared = tmp.path().join("prepared.json");
+        std::fs::write(&prepared, real_report().to_string()).unwrap();
+        let cli = test_support::write_script(
+            tmp.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    \
+                 shift\n    cp \"{}\" \"$1\"\n  fi\n  shift\ndone\nprintf '%s\\n' \"{PARITY_NOT_RUN}\"\nexit 0\n",
+                prepared.display()
+            ),
+            "@echo off\r\nexit /b 1\r\n",
+        );
+
+        let report = run_drc(cli.to_str().unwrap(), &pcb, false).await.unwrap();
+
+        assert!(report.schematic_parity.is_none(), "{report:?}");
+        let reason = report.schematic_parity_diagnostic.as_deref().unwrap();
+        assert!(reason.contains(PARITY_NOT_RUN), "{reason}");
     }
 
     /// Native 10.0.7 also emits [] without a diagnostic for a missing root.

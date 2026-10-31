@@ -66,3 +66,46 @@ Review 1 found no defect in the logic. Its findings and what was done:
 7. **Wording.** "Konnect's side" now names Copperpour; the test
    `a_silent_empty_parity_array_is_a_checked_zero` renamed
    `a_silent_empty_parity_array_with_its_root_present_is_a_checked_zero`.
+
+Gate after fix pass 1 (`logs/gate-step2-fix1.summary`): same as after the merge — 3,140 passed,
+1 failed (the known baseline failure), 58 ignored. Committed as `414422f`.
+
+## Review 2 (robustness) and fix pass 2
+
+The reviewer could not run kicad-cli in its sandbox (exit 3 for every case), so KiCad's
+behaviour was measured afterwards on this machine with an extended
+`scripts/measure_parity_stderr.sh`, using `board_outline_kicad10.kicad_pcb`:
+
+| Case | kicad-cli 10.0.7 result |
+|---|---|
+| board alone | exit 0, parity `[]`, no message on either stream |
+| root `.kicad_sch` empty, unparsable, truncated, unreadable (mode 000), or a directory | exit 255, no report written |
+
+Findings and what was done:
+
+1. **A root schematic that exists but cannot be used would be accepted as a checked zero unless
+   KiCad prints its English message** (likely defect, by reading). Measured: on 10.0.7 every such
+   root makes kicad-cli exit 255 without a report, so `run_drc` fails instead of returning a zero.
+   The state cannot occur on 10.0.7. No logic change; the measurement is recorded in the comment
+   on `apply_parity_evidence`. A translated message could not be tested (no other locale is
+   installed) and does not matter on 10.0.7, which prints no message for this check.
+2. **Only stderr was searched for the message.** `run_drc` now passes stderr and stdout together.
+   New test `the_not_run_message_on_stdout_also_withholds_parity` (Unix; a fake kicad-cli prints
+   the message on stdout with a root schematic present). Control: with the old stderr-only line
+   restored, the test fails; with the fix it passes.
+3. **`is_file()` was evaluated twice**, so a file appearing in between gave a diagnostic that
+   contradicted itself. Now evaluated once. The remaining case, a root created after kicad-cli
+   finished, is recorded in the comment as not closable without KiCad stating what it compared.
+4. **Legacy `.sch` roots are not recognised.** Kept: the result is withheld (reported as not
+   checked), never invented. Recorded in the comment.
+5. **The SES evidence dropped `ownership_diagnostic`.** Now passed through; migration note
+   updated; test `an_ownership_diagnostic_is_passed_through` added.
+
+Checked by the reviewer and found consistent: paths with several dots, no extension or an
+uppercase extension; relative paths (kicad-cli and the file check resolve against the same
+working directory); symlinks; no caller of `run_drc` treats the new `null` as a number. A
+non-UTF-8 board path still panics at `pcb.to_str().unwrap()` in `run_drc`; that predates this
+change and is not part of this step.
+
+Gate after fix pass 2 (`logs/gate-step2-fix2.summary`): 3,142 passed (the two new tests),
+1 failed (the known baseline failure), 58 ignored.

@@ -12,8 +12,9 @@
 #
 # Usage: scripts/measure_parity_stderr.sh [board.kicad_pcb]
 #   Default board: crates/copperpour-core/tests/fixtures/test.kicad_pcb (has test.kicad_sch).
-#   Runs three cases in temporary directories: board with its schematic and project, board with
-#   its schematic only, and the board alone. Prints, per case, the exit status, whether the
+#   Runs these cases in temporary directories: board with its schematic and project, board with
+#   its schematic only, the board alone, and the board beside a root schematic that exists but
+#   cannot be used (empty file, unparsable text, unreadable permissions, a directory). Prints, per case, the exit status, whether the
 #   message appeared on stderr, and the number of entries in "schematic_parity".
 # Requires: kicad-cli on PATH (or KICAD_CLI), python3.
 
@@ -39,11 +40,13 @@ run_case() {
         [ -f "$src_dir/$stem.$extra" ] && cp "$src_dir/$stem.$extra" "$dir/"
     done
     local report="$dir/report.json"
+    [ -n "${SETUP:-}" ] && (cd "$dir" && eval "$SETUP")
     "$cli" pcb drc --schematic-parity --format json --output "$report" "$dir/$stem.kicad_pcb" \
         > "$dir/stdout" 2> "$dir/stderr"
     local rc=$?
     local said="no"
-    grep -qF "$msg" "$dir/stderr" "$dir/stdout" && said="yes"
+    grep -qF "$msg" "$dir/stderr" && said="stderr"
+    grep -qF "$msg" "$dir/stdout" && said="${said/no/}stdout"
     local count
     count=$(python3 -I -c 'import json,sys
 d=json.load(open(sys.argv[1])); p=d.get("schematic_parity")
@@ -54,3 +57,8 @@ print("absent" if p is None else len(p))' "$report" 2>/dev/null || echo "no-repo
 run_case with-sch-and-pro kicad_sch kicad_pro
 run_case with-sch-only kicad_sch
 run_case lone-board
+SETUP=": > $stem.kicad_sch" run_case empty-root
+SETUP="echo 'not a schematic' > $stem.kicad_sch" run_case garbage-root
+SETUP="echo '(kicad_sch (version 20250114) (generator x)' > $stem.kicad_sch" run_case truncated-root
+SETUP="echo '(kicad_sch)' > $stem.kicad_sch; chmod 000 $stem.kicad_sch" run_case unreadable-root
+SETUP="mkdir $stem.kicad_sch" run_case directory-root

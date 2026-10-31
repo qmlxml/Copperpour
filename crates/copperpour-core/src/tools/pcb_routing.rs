@@ -977,7 +977,8 @@ fn specctra_drc_evidence(report: &cli::DrcReport) -> serde_json::Value {
         "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
         "schematic_parity_violations": report.schematic_parity.as_ref().map(Vec::len),
         "missing_categories": missing_categories,
-        "schematic_parity_diagnostic": report.schematic_parity_diagnostic
+        "schematic_parity_diagnostic": report.schematic_parity_diagnostic,
+        "ownership_diagnostic": report.ownership_diagnostic
     })
 }
 
@@ -2823,6 +2824,18 @@ mod specctra_drc_evidence_tests {
         assert_eq!(evidence["unconnected_items"], 0);
         assert_eq!(evidence["schematic_parity_violations"], 0);
         assert_eq!(evidence["missing_categories"], json!([]));
+        assert!(evidence["ownership_diagnostic"].is_null());
+    }
+
+    #[test]
+    fn an_ownership_diagnostic_is_passed_through() {
+        let mut report = checked_zero();
+        report.ownership_diagnostic = Some("footprint ownership could not be read".into());
+        let evidence = specctra_drc_evidence(&report);
+        assert_eq!(
+            evidence["ownership_diagnostic"],
+            "footprint ownership could not be read"
+        );
     }
 
     #[test]

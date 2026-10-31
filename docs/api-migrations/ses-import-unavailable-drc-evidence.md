@@ -7,7 +7,8 @@ category counts are now `null`; checked counts remain integers. The new
 `missing_categories` names those that were unavailable. The
 `schematic_parity_diagnostic` field says why parity could not run: KiCad's
 own message when it printed one, otherwise Copperpour's statement that the
-expected root schematic is missing.
+expected root schematic is missing. `ownership_diagnostic` says when
+Copperpour could not name what owns each violation item.
 
 `drc.clean` requires complete evidence and zero findings in every category.
 Top-level `success` still describes completion of the import, not design
