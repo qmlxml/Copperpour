@@ -125,7 +125,7 @@ pub fn isolate() {
     // Copperpour reads KiCad's global tables from (`kicad_config_base`), and
     // the two read one configuration, as in a real home.
     #[cfg(target_os = "windows")]
-    let kicad_config = "appdata/roaming/kicad";
+    let kicad_config = "home/AppData/Roaming/kicad";
     #[cfg(target_os = "macos")]
     let kicad_config = "home/Library/Preferences/kicad";
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -137,8 +137,11 @@ pub fn isolate() {
         ("XDG_DATA_HOME", "home/.local/share"),
         ("XDG_STATE_HOME", "home/.local/state"),
         ("XDG_CACHE_HOME", "home/.cache"),
-        ("APPDATA", "appdata/roaming"),
-        ("LOCALAPPDATA", "appdata/local"),
+        // Under the home, where Windows puts them: the known-folder API that
+        // `dirs` uses expands `%USERPROFILE%\AppData\…`, and returns nothing
+        // when the folder is missing.
+        ("APPDATA", "home/AppData/Roaming"),
+        ("LOCALAPPDATA", "home/AppData/Local"),
         ("KICAD_CONFIG_HOME", kicad_config),
         // On Windows kicad-cli would otherwise use the real Documents folder.
         ("KICAD_DOCUMENTS_HOME", "home/Documents/KiCad"),

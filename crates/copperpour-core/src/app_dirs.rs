@@ -199,7 +199,17 @@ mod tests {
             user_state_dir(),
             user_data_dir(),
         ] {
-            assert!(path.as_deref().is_some_and(Path::is_absolute), "{path:?}");
+            assert!(
+                path.as_deref().is_some_and(Path::is_absolute),
+                "{path:?} among app_data {:?}, local_data {:?}, user_state {:?}, \
+                 user_data {:?}; USERPROFILE {:?}, LOCALAPPDATA {:?}",
+                app_data_dir(),
+                local_data_dir(),
+                user_state_dir(),
+                user_data_dir(),
+                std::env::var_os("USERPROFILE"),
+                std::env::var_os("LOCALAPPDATA"),
+            );
         }
         #[cfg(not(target_os = "windows"))]
         assert_eq!(

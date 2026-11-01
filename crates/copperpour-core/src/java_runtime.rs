@@ -126,16 +126,20 @@ mod tests {
     fn java_home_comes_first_then_the_path() {
         let path = std::env::join_paths(["/usr/local/bin", "/usr/bin"]).unwrap();
         let found = candidates(Some("/jdk".into()), Some(path), false);
+        let java = if cfg!(windows) { "java.exe" } else { "java" };
         assert_eq!(
             found,
             [
-                PathBuf::from("/jdk/bin/java"),
-                PathBuf::from("/usr/local/bin/java"),
-                PathBuf::from("/usr/bin/java"),
+                Path::new("/jdk").join("bin").join(java),
+                Path::new("/usr/local/bin").join(java),
+                Path::new("/usr/bin").join(java),
             ]
         );
     }
 
+    /// Not on Windows: there the candidate is `/usr/bin\\java.exe`, which can
+    /// never equal the macOS stub's path, so the order under test cannot arise.
+    #[cfg(not(windows))]
     #[test]
     fn macos_tries_homebrew_before_the_system_stub() {
         let path = std::env::join_paths(["/usr/bin", "/opt/tools/bin"]).unwrap();

@@ -38,6 +38,11 @@ pub(crate) fn take_snapshot(root: &Path, into: &Path) -> Result<Snapshot> {
         .context("schematic has no parent folder")?
         .to_path_buf();
     let root_name = root.file_name().context("schematic has no file name")?;
+    // The resolved folder is compared with the resolved sheets below; the
+    // copy's model paths use its ordinary spelling, `C:\…` rather than the
+    // `\\?\C:\…` that `canonicalize` returns on Windows, so kicad-cli and the
+    // deck check read the path a user would write.
+    let written_dir = PathBuf::from(copperpour_sexp::paths::display_path(&project_dir));
 
     let mut locks_present = Vec::new();
     for sheet in hierarchy_files(&project_dir.join(root_name))? {
@@ -54,7 +59,7 @@ pub(crate) fn take_snapshot(root: &Path, into: &Path) -> Result<Snapshot> {
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&destination, absolute_sim_libraries(&source, &project_dir))
+        std::fs::write(&destination, absolute_sim_libraries(&source, &written_dir))
             .with_context(|| format!("cannot copy sheet {}", sheet.display()))?;
         if let Some(lock) = copperpour_sexp::writer::kicad_editor_lock_path(&sheet) {
             if lock.exists() {
@@ -193,6 +198,12 @@ mod tests {
 
     const PROJECT: &str = "/live/project";
 
+    /// `PROJECT/relative` as the rewrite writes it: joined with the platform's
+    /// separator (`\` on Windows) and escaped for the S-expression.
+    fn live(relative: &str) -> String {
+        escape(&Path::new(PROJECT).join(relative).to_string_lossy())
+    }
+
     fn rewrite(value: &str) -> String {
         let source = format!("(property \"Sim.Library\" \"{value}\" (at 0 0 0))");
         absolute_sim_libraries(&source, Path::new(PROJECT))
@@ -217,13 +228,15 @@ mod tests {
 
     #[test]
     fn a_bare_library_name_becomes_a_live_path() {
-        assert!(rewrite("diode.mod").contains("/live/project/diode.mod\" (at"));
+        assert!(rewrite("diode.mod").contains(&format!("{}\" (at", live("diode.mod"))));
     }
 
     #[test]
     fn a_project_variable_becomes_a_live_path() {
-        assert!(rewrite("${KIPRJMOD}/models/a.lib").contains("/live/project/models/a.lib\""));
-        assert!(rewrite("$(KIPRJMOD)/a.lib").contains("/live/project/a.lib\""));
+        assert!(
+            rewrite("${KIPRJMOD}/models/a.lib").contains(&format!("{}\"", live("models/a.lib")))
+        );
+        assert!(rewrite("$(KIPRJMOD)/a.lib").contains(&format!("{}\"", live("a.lib"))));
     }
 
     #[test]
@@ -245,8 +258,8 @@ mod tests {
         let source = "(a) (property \"Sim.Library\" \"x.lib\") (b) \
                       (property \"Sim.Library\" \"y.lib\") (property \"Sim.Name\" \"z.lib\")";
         let out = absolute_sim_libraries(source, Path::new(PROJECT));
-        assert!(out.contains("/live/project/x.lib"));
-        assert!(out.contains("/live/project/y.lib"));
+        assert!(out.contains(&live("x.lib")));
+        assert!(out.contains(&live("y.lib")));
         assert!(out.contains("(property \"Sim.Name\" \"z.lib\")"));
         assert!(out.starts_with("(a) "));
     }
@@ -257,7 +270,8 @@ mod tests {
             "(property \"Sim.Library\" \"a\\\"b.lib\")",
             Path::new("/p\"q"),
         );
-        assert!(out.contains("/p\\\"q/a\\\"b.lib"), "{out}");
+        let expected = escape(&Path::new("/p\"q").join("a\"b.lib").to_string_lossy());
+        assert!(out.contains(&expected), "{out}");
     }
 
     #[test]

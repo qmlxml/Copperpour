@@ -821,7 +821,7 @@ impl Flattener<'_> {
                 "Include paths may not use variables or ~.",
             ));
         }
-        if target.starts_with("//") || target.starts_with(r"\\") {
+        if names_network_location(target) {
             return Err(Self::refuse(
                 RefusalCode::UnsafeDeckContent,
                 origin,
@@ -1162,6 +1162,24 @@ pub(crate) fn verify_deck(deck: &str) -> Result<(), Refusal> {
         })
         .collect();
     verify_lines(&lines)
+}
+
+/// Whether an include target names a network location: `//host/…`,
+/// `\\host\…`, or a Windows device or verbatim path other than a drive one.
+///
+/// A verbatim drive path, `\\?\C:\…`, is local. Windows returns that form from
+/// `canonicalize`, and before this was accepted the Windows tests that
+/// include a resolved model path were all refused. `\\?\UNC\…` and `\\.\…`
+/// stay refused.
+fn names_network_location(target: &str) -> bool {
+    if !(target.starts_with("//") || target.starts_with(r"\\")) {
+        return false;
+    }
+    let Some(rest) = target.strip_prefix(r"\\?\") else {
+        return true;
+    };
+    let bytes = rest.as_bytes();
+    !(bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == br":\")
 }
 
 #[cfg(test)]
@@ -1960,8 +1978,31 @@ mod tests {
     }
 
     #[test]
+    fn a_verbatim_drive_path_is_local() {
+        for target in [r"\\?\C:\m.lib", r"\\?\z:\dir\m.lib", "/abs/m.lib", "m.lib"] {
+            assert!(!names_network_location(target), "{target}");
+        }
+        for target in [
+            r"\\?\UNC\host\m.lib",
+            r"\\.\C:\m.lib",
+            r"\\?\1:\m.lib",
+            r"\\?\C:",
+            r"\\host\m.lib",
+        ] {
+            assert!(names_network_location(target), "{target}");
+        }
+    }
+
+    #[test]
     fn a_network_path_is_refused_before_it_is_touched() {
-        for target in [r"\\\\host\\share\\m.lib", "//host/share/m.lib"] {
+        for target in [
+            r"\\\\host\\share\\m.lib",
+            r"\\host\share\m.lib",
+            "//host/share/m.lib",
+            r"\\?\UNC\host\share\m.lib",
+            r"\\.\pipe\m.lib",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\m.lib",
+        ] {
             let refused = deck(&format!(".include \"{target}\"\n")).unwrap_err();
             assert!(refused.detail.contains("network"), "{target}");
         }

@@ -814,7 +814,11 @@ mod tests {
             dir.path(),
             "hung-worker",
             "exec /bin/sleep 30\n",
-            "ping -n 30 127.0.0.1 >NUL\r\n",
+            // A loop inside cmd itself: the worker starts with its
+            // environment cleared and PATH set to the library's folder, so an
+            // external program such as `ping` is not found and the script
+            // would exit at once (seen in Windows CI as `nonzero_exit`).
+            ":wait\r\ngoto wait\r\n",
         );
         let status = probe_library(
             &runtime(worker),
@@ -823,7 +827,7 @@ mod tests {
             Duration::from_millis(200),
         )
         .await;
-        assert_eq!(status.probe_status, "timed_out");
+        assert_eq!(status.probe_status, "timed_out", "{status:?}");
         assert!(!status.available);
     }
 
