@@ -93,3 +93,8 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
   run and after apply, as a warning naming `refill_zones`; tracks, arcs and vias of the old net
   reaching the pad, and an unreadable zone, still refuse. To be implemented as plan step 7b with the
   full cycle.
+- **J3Techs native router: assess first, merge nothing (option D).** Build the fork at its own base,
+  run its tests, route two or three KiCad demo boards with `route_native`, check each with KiCad's DRC
+  and compare completion and violations with Freerouting on the same boards, read the design, and
+  report to the owner, who then decides between not taking it and a router-only branch. Second
+  opinion (second reviewer) agreed on D first; it would go to the router-only branch directly if D passes.
