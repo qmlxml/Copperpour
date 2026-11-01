@@ -1,4 +1,4 @@
-### `route_specctra_dsn` and `check_freerouting`: Freerouting settings, honest completion, progress (minor release)
+### `route_specctra_dsn` and `check_freerouting`: Freerouting settings, verified completion, progress (minor release)
 
 `route_specctra_dsn` accepts new arguments: `optimize_seconds` (bounds the optimiser and keeps its
 best board; `final_state` `OPTIMIZATION_STOPPED`), `optimizer_max_passes`,

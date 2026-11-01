@@ -20,7 +20,7 @@ listed here with where it is recorded, so it can be confirmed or changed. Nothin
 
 Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
 
-## Step 5 (daGrumpf-bxp, Freerouting), review 1
+## Step 5 (daGrumpf-bxp, Freerouting): review 1 (items 5–7), review 2 (item 8), review 3 (items 9–10)
 
 5. **HTTP clients get no progress notifications.** The contribution broadcast them to every open
    event stream, which leaked one client's progress to another; removed rather than rebuilt per
@@ -28,7 +28,7 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
 6. ~~`route_specctra_dsn` keeps `success: true` when Freerouting's log could not be read.~~
    **Reversed by step 5 review 3**: that broke the owner's rule that a check which did not run is
    never reported as a pass. `success` is now false whenever the unrouted or violation count is
-   unknown, a project rule was not applied, the settings were not verified, or no project was found.
+   unknown (an unknown violation count was added by the documentation review), a project rule was not applied, the settings were not verified, or no project was found.
    This makes every routing on macOS and Windows report `success: false` until Freerouting's log is
    found there (`docs/BACKLOG.md`).
 7. **The CPL policy id changed to `konnect-jlcpcb-cpl-v2`** because the rule set changed. Reverse:

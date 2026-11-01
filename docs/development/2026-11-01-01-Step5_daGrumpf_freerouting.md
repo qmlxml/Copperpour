@@ -8,8 +8,8 @@ What the contribution adds (author Pierre Grasswill): `route_specctra_dsn` repor
 `optimize_seconds` bounds the optimiser and keeps its best board; job settings sent in the keys
 Freerouting reads, with optimiser passes and threshold; `plane_nets` / `plane_as_obstacle`;
 `router_settings` passes any Freerouting setting and reports what did not take; a routing that
-leaves connections unrouted is `success: false`; non-JSON-RPC output lines skipped; unanswered
-polls survived; the log read incrementally; JVM crash reports kept out of the project directory;
+leaves connections unrouted is `success: false`; non-JSON-RPC output lines skipped; a routing no
+longer fails on a status poll that gets no answer; the log read incrementally; JVM crash reports kept out of the project directory;
 the project's edge and hole rules sent with the job. Also JLCPCB CPL rotation rules backed by
 preview observations (`docs/JLCPCB_CPL_CORRECTIONS.md`).
 
@@ -36,7 +36,7 @@ Conflicts:
   no line the contributor added to those files is missing.
 
 Adaptation: none needed for names or paths (git's rename detection placed every file; the new files
-`java_runtime.rs` and `progress.rs` landed under `copperpour-core`). Two comments that said
+`java_runtime.rs` and `progress.rs` were placed under `copperpour-core`). Two comments that said
 "Konnect" now say Copperpour; references to upstream issue #518 keep its name. The workspace
 builds; `Cargo.lock` unchanged.
 
@@ -55,7 +55,7 @@ command built). Findings and what was done:
    contribution meant to prevent. Now uses `app_dirs::home_dir()` and ignores a relative
    `XDG_STATE_HOME`.
 2. **On macOS and Windows unrouted connections are never counted**, and the result read as a
-   complete routing. `success` keeps its meaning (the job finished), but the response now has
+   complete routing. (Reversed in fix pass 3.) `success` keeps its meaning (the job finished), but the response now has
    `unrouted_connections_checked`, and `message` says completeness is unknown when it is false.
    The missing log locations are recorded in `docs/BACKLOG.md`.
 3. **No migration notes**: added `docs/api-migrations/freerouting-route-specctra-dsn.md` and
@@ -157,4 +157,12 @@ lines are filtered by the job's tag). Findings and what was done; decisions are 
 11. HTTP: nothing taken away (progress was new in this step).
 
 Gate (`logs/gate-step5-fix3.summary`): 3,691 passed (+2), 1 failed (the known baseline failure),
-109 ignored.
+109 ignored. Committed as `6675dff`.
+
+## Documentation review (sub-step 16)
+
+Found: an unknown violation count still gave `success: true` (code fixed: it is now a reason for
+`false`, like an unknown unrouted count); the tool-directory row still described fix pass 1; a
+backlog entry claimed but absent; the CPL migration note said all 29 rules are backed by
+observations (24 are, 5 are unverified); the overnight decisions heading; a missing commit hash;
+four unclear phrases. All corrected.

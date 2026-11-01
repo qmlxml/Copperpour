@@ -1,7 +1,7 @@
 ### JLCPCB CPL rotation rules: policy `konnect-jlcpcb-cpl-v2` (minor release)
 
-The built-in CPL rotation corrections changed from 2 rules to 29, each backed by observed JLCPCB
-placement previews (`docs/JLCPCB_CPL_CORRECTIONS.md`, "Built-in rules"). Footprints that now get a
+The built-in CPL rotation corrections changed from 2 rules to 29: 24 backed by observed JLCPCB
+placement previews, and 5 unverified (warned about, KiCad's rotation kept) (`docs/JLCPCB_CPL_CORRECTIONS.md`, "Built-in rules"). Footprints that now get a
 correction where none applied before include every `SOIC-*`, `SSOP-*`, `MSOP-*`, `TQFN-*` and
 `VQFN-*` (+270) and `SOT-23` / `SOT-23-5` (+180); the HRO USB-C rule (+180) was withdrawn and that
 connector now keeps KiCad's rotation with a warning. A board exported again can therefore get a

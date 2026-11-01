@@ -3302,10 +3302,17 @@ async fn handle_route_specctra_dsn(
                 .to_string(),
         ),
     }
-    if let Some(violations) = evidence.violations.filter(|count| *count > 0) {
-        problems.push(format!(
+    match evidence.violations {
+        Some(0) => {}
+        Some(violations) => problems.push(format!(
             "{violations} clearance violation(s) in Freerouting's own check"
-        ));
+        )),
+        // An unknown count is not a pass (documentation review, plan step 5).
+        None if evidence.unrouted.is_some() => problems.push(
+            "Freerouting's log gave no clearance-violation count for the end of the job"
+                .to_string(),
+        ),
+        None => {}
     }
     if !evidence.project_rules_not_applied.is_empty() {
         problems.push(format!(
