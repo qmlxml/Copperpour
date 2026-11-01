@@ -228,6 +228,43 @@ fn file_names(dir: &Path) -> Vec<String> {
     names
 }
 
+/// KiCad 10 still honours the older per-symbol field `Sim.Enable` "0": the
+/// part leaves the SPICE netlist although `exclude_from_sim` says no. It is
+/// excluded by the schematic and must be reported so (step 4b review 2,
+/// measured on the rectifier demo's R2).
+#[test]
+#[ignore = "needs KiCad 10 and KICAD_DEMOS"]
+fn a_part_disabled_by_the_older_sim_enable_field_is_reported_as_excluded() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let schematic = project.path().join("rectifier.kicad_sch");
+    let text = std::fs::read_to_string(&schematic).unwrap();
+    let flag = "(exclude_from_sim no)";
+    let at = text
+        .match_indices(flag)
+        .nth(12)
+        .expect("13 exclude_from_sim flags")
+        .0
+        + flag.len();
+    let edited = format!(
+        "{}\n\t\t(property \"Sim.Enable\" \"0\" (at 0 0 0) (effects (hide yes))){}",
+        &text[..at],
+        &text[at..]
+    );
+    std::fs::write(&schematic, edited).unwrap();
+
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({ "schematic": schematic }),
+    );
+    assert_eq!(
+        report["excluded_in_schematic"]["items"],
+        json!(["R2"]),
+        "{report}"
+    );
+    assert!(report.get("not_in_spice_netlist").is_none(), "{report}");
+}
+
 /// A sheet instance marked "exclude from simulation" drops every part of that
 /// instance from KiCad's SPICE export, while the same sheet's other instance
 /// keeps them. Those parts are excluded by the schematic and must be reported

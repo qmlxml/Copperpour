@@ -145,6 +145,10 @@ Each entry names where it was found, what is wrong, and the condition that close
   `activity-hook`, the custom IPC messages, the dispatch-path and live-editor changes, `d2961f4`.
   Revisit the rest if the owner adopts the modified KiCad build. Waiting for: a live KiCad session.
 
+- **Sheet files sharing symbol UUIDs** (step 4b): the flags of every sheet file go into one set, so
+  if one sheet file is a copy of another under a different name, a flag in one excludes the matching
+  part of the other. Closing condition: each part matched only against the file its sheet path
+  resolves to, or shared UUIDs reported.
 - **Design variants and `exclude_from_sim`** (step 4b): kicad-cli 10.0.7 exports the default variant;
   whether a variant can change a part's `exclude_from_sim` per instance, and so make the flag read
   from the sheet files disagree with the export, is not measured (no demo has variants). Closing

@@ -1715,7 +1715,7 @@ fn sim_exclusions(dir: &Path) -> SimExclusions {
             // library symbols sit under `lib_symbols` and are not visited.
             for (tag, into) in [("symbol", &mut found.symbols), ("sheet", &mut found.sheets)] {
                 for node in tree.find_all(tag) {
-                    if node.find_str("exclude_from_sim") == Some("yes") {
+                    if excluded_by_flag(node) {
                         if let Some(uuid) = node.find_str("uuid") {
                             into.insert(uuid.to_owned());
                         }
@@ -1727,6 +1727,28 @@ fn sim_exclusions(dir: &Path) -> SimExclusions {
     found
 }
 
+/// Whether a placed symbol or sheet is excluded from simulation by the
+/// schematic: `(exclude_from_sim yes)`, or one of the older per-symbol fields
+/// KiCad 10 still honours, `Sim.Enable` "0" and `Spice_Netlist_Enabled` "N"
+/// (step 4b review 2, measured on the rectifier demo with kicad-cli 10.0.7:
+/// either drops the part from the SPICE netlist with `exclude_from_sim no`).
+fn excluded_by_flag(node: &copperpour_sexp::SexpNode) -> bool {
+    if node.find_str("exclude_from_sim") == Some("yes") {
+        return true;
+    }
+    node.find_all("property").into_iter().any(|property| {
+        let field = |index| {
+            property
+                .get(index)
+                .and_then(copperpour_sexp::SexpNode::as_str)
+        };
+        matches!(
+            (field(1), field(2)),
+            (Some("Sim.Enable"), Some("0")) | (Some("Spice_Netlist_Enabled"), Some("N" | "n"))
+        )
+    })
+}
+
 /// Split the parts KiCad's SPICE netlist has no line for: those the
 /// schematic excludes (symbol or sheet flag) and the rest. Pure, so it is
 /// tested without kicad-cli.
@@ -1735,11 +1757,21 @@ fn split_missing_parts(
     elements: &[crate::simulation::kicad_netlist::ElementEntry],
     exclusions: &SimExclusions,
 ) -> (Vec<String>, Vec<String>) {
-    let flagged: std::collections::HashSet<&str> = kicad
-        .components
-        .iter()
-        .filter(|component| exclusions.excludes(component))
-        .map(|component| component.reference.as_str())
+    // Keyed by reference, so a reference two parts share (duplicate or
+    // missing annotation) counts as excluded only if every part carrying it
+    // is: one part's flag must not explain the other (step 4b review 2).
+    let mut by_reference: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+    for component in &kicad.components {
+        let excluded = exclusions.excludes(component);
+        by_reference
+            .entry(component.reference.as_str())
+            .and_modify(|all| *all &= excluded)
+            .or_insert(excluded);
+    }
+    let flagged: std::collections::HashSet<&str> = by_reference
+        .into_iter()
+        .filter(|(_, excluded)| *excluded)
+        .map(|(reference, _)| reference)
         .collect();
     elements
         .iter()
@@ -1766,6 +1798,10 @@ async fn inspect_design(
         .unwrap_or_default();
     let compatibility = Compatibility::from_project_file(&schematic.with_extension("kicad_pro"));
     let sources_hash = hash_sources(&source)?;
+    // Read before taking the export lock: the flags come from the snapshot's
+    // own sheet files, so other sessions need not wait for this parse (step
+    // 4b review 2). The lock covers the export and the read of its includes.
+    let exclusions = sim_exclusions(&source);
     let _export_guard = EXPORT_LOCK.lock().await;
     let netlists = cli::export_simulation_netlists(
         kicad_cli,
@@ -1812,7 +1848,7 @@ async fn inspect_design(
     // excludes them: KiCad's netlist does not carry the flag, so it is read
     // from the snapshot's sheet files and matched by symbol and sheet UUID.
     let (excluded_in_schematic, not_in_spice_netlist) =
-        split_missing_parts(&kicad, &elements, &sim_exclusions(&source));
+        split_missing_parts(&kicad, &elements, &exclusions);
     let inlined = deck.as_ref().map_or(&[][..], |deck| &deck.inlined_files);
     let inputs_hash = inputs_hash(sources_hash, inlined)?;
     Ok(Design {
@@ -2066,6 +2102,10 @@ mod tests {
             "(kicad_sch (lib_symbols (symbol \"Device:R\" (exclude_from_sim yes))) \
              (symbol (lib_id \"Device:R\") (exclude_from_sim yes) (uuid \"u-flagged\")) \
              (symbol (lib_id \"Device:R\") (exclude_from_sim no) (uuid \"u-kept\")) \
+             (symbol (exclude_from_sim no) (property \"Sim.Enable\" \"0\") (uuid \"u-sim-off\")) \
+             (symbol (exclude_from_sim no) (property \"Sim.Enable\" \"1\") (uuid \"u-sim-on\")) \
+             (symbol (exclude_from_sim no) (property \"Spice_Netlist_Enabled\" \"N\") (uuid \"u-legacy\")) \
+             (symbol (exclude_from_sim no) (property \"Spice_Netlist_Enabled\" \"Y\") (uuid \"u-legacy-on\")) \
              (sheet (exclude_from_sim yes) (uuid \"s-off\")) \
              (sheet (exclude_from_sim no) (uuid \"s-on\")))",
         )
@@ -2079,7 +2119,11 @@ mod tests {
         std::fs::write(dir.path().join("broken.kicad_sch"), "(kicad_sch (").unwrap();
         let found = sim_exclusions(dir.path());
         let set = |items: &[&str]| items.iter().map(|item| item.to_string()).collect();
-        assert_eq!(found.symbols, set(&["u-flagged", "u-child"]));
+        // The older fields KiCad 10 still honours (step 4b review 2).
+        assert_eq!(
+            found.symbols,
+            set(&["u-flagged", "u-child", "u-sim-off", "u-legacy"])
+        );
         assert_eq!(found.sheets, set(&["s-off"]));
     }
 
@@ -2107,6 +2151,10 @@ mod tests {
                 part("R401", &["u-r"], &["s-v"]),
                 part("R1", &["u-plain"], &[]),
                 part("R2", &["u-ran"], &[]),
+                // Two parts share a reference; only one is flagged, so the
+                // reference is not explained by the flag (step 4b review 2).
+                part("R5", &["u-shared"], &[]),
+                part("R5", &["u-other"], &[]),
             ],
             nets: Vec::new(),
             library_parts: Vec::new(),
@@ -2117,7 +2165,7 @@ mod tests {
             modelled: false,
             excluded: false,
         };
-        let mut elements: Vec<ElementEntry> = ["C201", "C301", "U201", "R401", "R1"]
+        let mut elements: Vec<ElementEntry> = ["C201", "C301", "U201", "R401", "R1", "R5"]
             .into_iter()
             .map(missing)
             .collect();
@@ -2134,7 +2182,7 @@ mod tests {
         };
         let (excluded, unexplained) = split_missing_parts(&kicad, &elements, &exclusions);
         assert_eq!(excluded, ["C201", "C301", "U201", "R401"]);
-        assert_eq!(unexplained, ["R1"]);
+        assert_eq!(unexplained, ["R1", "R5"]);
     }
 
     #[test]

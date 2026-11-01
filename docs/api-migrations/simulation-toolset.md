@@ -8,7 +8,8 @@ isolated `copperpour sim-worker` process with ngspice and returns compact result
 configuration keys: `ngspice_library`, `ngspice_code_models_dir`, `ngspice_allow_digital_models`
 and `ngspice_model_dirs`. A stopped run's `stopped` object may carry `node` (ngspice 44) or
 `instance` (ngspice 47) naming where the analysis failed. Results list parts the schematic marks
-"exclude from simulation" (on the symbol, or on a sheet instance that holds it) in
+"exclude from simulation" (on the symbol, by the older symbol fields `Sim.Enable` "0" or
+`Spice_Netlist_Enabled` "N" that KiCad 10 still honours, or on a sheet instance that holds it) in
 `circuit.excluded_in_schematic`, and any other part with no line in KiCad's SPICE netlist, for a
 reason the schematic does not show, in `circuit.not_in_spice_netlist`; either makes the circuit
 read `modified`. The readiness report lists both. Results may carry the warnings

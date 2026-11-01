@@ -57,3 +57,25 @@ the whole part; a library symbol's flag and `dnp` have no effect. Fixed:
 
 Gate (`logs/gate-step4b-fix1.summary`): 3,737 passed (+1), 1 failed (the known baseline failure),
 111 ignored (+1, the new live test).
+Committed as `55b1aef8`.
+
+## Review 2 (robustness) and fix pass 2
+
+Confirmed (measured): the walk sees only the snapshot's sheets and project file (the netlists are
+written outside it, and there are no symlinks); KiCad refuses `exclude_from_sim` values other than
+`yes`/`no`; an empty `tstamps` falls to `not_in_spice_netlist`, the cautious side. Fixed:
+
+1. **KiCad 10 still honours the older symbol fields** `Sim.Enable` "0" and `Spice_Netlist_Enabled`
+   "N" (measured: either drops the part with `exclude_from_sim no`; KiCad's own demos still carry
+   `Spice_Netlist_Enabled`). Such a part was reported as unexplained. `excluded_by_flag` now reads
+   them. Live test `a_part_disabled_by_the_older_sim_enable_field_is_reported_as_excluded`
+   (rectifier, R2); control: with the field check disabled it fails.
+2. **A reference two parts share** counted as excluded when one part was flagged: it now counts only
+   if every part carrying it is. Unit test extended.
+3. Sheet files sharing symbol UUIDs: `docs/BACKLOG.md`.
+4. **The flags were read while holding the export lock**, delaying other sessions: they are now read
+   before the lock is taken (the lock covers the export and the read of its includes, so it is not
+   released earlier).
+
+Gate (`logs/gate-step4b-fix2.summary`): 3,737 passed, 1 failed (the known baseline failure), 112
+ignored (+1, the new live test).
