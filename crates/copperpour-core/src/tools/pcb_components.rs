@@ -950,6 +950,57 @@ struct LibraryFootprintData {
     attributes: copperpour_ipc::gen::kiapi::board::types::FootprintAttributes,
     description_and_keywords: copperpour_ipc::gen::kiapi::board::types::FootprintAttributes,
     models: Vec<copperpour_ipc::gen::kiapi::board::types::Footprint3DModel>,
+    /// Net-tie pad groups and the footprint-level zone connection (from the
+    /// `marju212` fork): a solder jumper placed without its ties is a short.
+    net_ties: Vec<copperpour_ipc::gen::kiapi::board::types::NetTieDefinition>,
+    zone_connection: Option<copperpour_ipc::gen::kiapi::board::types::ZoneConnectionStyle>,
+}
+
+impl LibraryFootprintData {
+    fn read(root: &copperpour_sexp::SexpNode) -> anyhow::Result<Self> {
+        Ok(Self {
+            attributes: super::library_footprint::attributes(root)?,
+            description_and_keywords: super::library_footprint::description_and_keywords(root),
+            models: super::library_footprint::models(root)?,
+            net_ties: super::library_footprint::net_ties(root)?,
+            zone_connection: super::library_footprint::zone_connection(root)?,
+        })
+    }
+
+    /// Put this library data on a `FootprintInstance` item built from pads,
+    /// drawings and fields. `with_models` is false for a footprint built
+    /// directly on B.Cu (not flipped by KiCad), where the position KiCad gives a
+    /// front-side model has not been checked; such a part keeps the models
+    /// it had before, none.
+    fn apply_to_item(
+        &self,
+        item: prost_types::Any,
+        with_models: bool,
+    ) -> anyhow::Result<prost_types::Any> {
+        let mut footprint = copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+            item.value.as_slice(),
+        )?;
+        footprint.attributes = Some(self.attributes.clone());
+        super::library_footprint::apply_net_ties_and_zone_connection(
+            &mut footprint,
+            &self.net_ties,
+            self.zone_connection,
+        )?;
+        let definition = footprint
+            .definition
+            .as_mut()
+            .context("built footprint has no definition")?;
+        definition.attributes = Some(self.description_and_keywords.clone());
+        if with_models {
+            definition.items.extend(self.models.iter().map(|model| {
+                copperpour_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
+            }));
+        }
+        Ok(copperpour_ipc::builders::pack_any(
+            &footprint,
+            "kiapi.board.types.FootprintInstance",
+        ))
+    }
 }
 
 impl PreparedFootprintPlacement {
@@ -997,11 +1048,7 @@ impl PreparedFootprintPlacement {
         let graphics = extract_graphic_definitions(&prepared)?;
         let fields = extract_field_placement(&prepared);
         let root = copperpour_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
-        let library = LibraryFootprintData {
-            attributes: super::library_footprint::attributes(&root)?,
-            description_and_keywords: super::library_footprint::description_and_keywords(&root),
-            models: super::library_footprint::models(&root)?,
-        };
+        let library = LibraryFootprintData::read(&root)?;
         let library_path =
             resolve_footprint_path(lib_id, project_dir).map_err(anyhow::Error::msg)?;
         let board_sexp = board_footprint_sexp(
@@ -1077,22 +1124,7 @@ impl PreparedFootprintPlacement {
         let Some(library) = &self.library else {
             return Ok(item);
         };
-        let mut footprint = copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
-            item.value.as_slice(),
-        )?;
-        footprint.attributes = Some(library.attributes.clone());
-        let definition = footprint
-            .definition
-            .as_mut()
-            .context("built footprint has no definition")?;
-        definition.attributes = Some(library.description_and_keywords.clone());
-        definition.items.extend(library.models.iter().map(|model| {
-            copperpour_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
-        }));
-        Ok(copperpour_ipc::builders::pack_any(
-            &footprint,
-            "kiapi.board.types.FootprintInstance",
-        ))
+        library.apply_to_item(item, true)
     }
 
     /// The block the closed-board path inserts: the prepared F.Cu block, or
@@ -4192,6 +4224,16 @@ async fn handle_place_array(
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
     let fields = extract_field_placement(&source);
+    // The library data place_component gives a part; without it every array
+    // instance had no mounting style, 3D model or net ties (merge of the
+    // `marju212` fork, plan step 7).
+    let library = match copperpour_sexp::parse_sexp(&source)
+        .context("invalid footprint S-expression")
+        .and_then(|root| LibraryFootprintData::read(&root))
+    {
+        Ok(library) => library,
+        Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
+    };
 
     let value = footprint
         .split_once(':')
@@ -4252,6 +4294,7 @@ async fn handle_place_array(
                     0.0,
                     "F.Cu",
                 )
+                .and_then(|item| library.apply_to_item(item, true))
                 .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -4407,9 +4450,17 @@ async fn handle_duplicate_component(
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
     let fields = extract_field_placement(&prepared);
-    let dup_board = board.clone();
-    let fp = ipc!(ctx, args, |c| c.place_footprint(
-        &dup_board,
+    // The copy gets the library data place_component gives a part (merge of
+    // the `marju212` fork, plan step 7). On B.Cu the item is built on that
+    // layer rather than flipped, so its 3D models are left off, as before.
+    let library = match copperpour_sexp::parse_sexp(&source)
+        .context("invalid footprint S-expression")
+        .and_then(|root| LibraryFootprintData::read(&root))
+    {
+        Ok(library) => library,
+        Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
+    };
+    let item = match KiCadIpcClient::build_footprint_item(
         &fp_id,
         &ipc_reference,
         &fp_value,
@@ -4419,7 +4470,18 @@ async fn handle_duplicate_component(
         x,
         y,
         fp_rotation,
-        &fp_layer
+        &fp_layer,
+    )
+    .and_then(|item| library.apply_to_item(item, fp_layer == "F.Cu"))
+    {
+        Ok(item) => item,
+        Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
+    };
+    let dup_board = board.clone();
+    let fp = ipc!(ctx, args, |c| c.place_footprint_item(
+        &dup_board,
+        &ipc_reference,
+        item.clone()
     ));
     Ok(CallToolResult::json(&json!({
         "duplicated_from": reference,
@@ -7762,6 +7824,84 @@ mod tests {
             "\t\t(rotate\n\t\t\t(xyz 0 0 270)",
             1,
         )
+    }
+
+    /// A footprint placed from a library with net-tie pad groups and a
+    /// footprint-level zone connection carries both (merge of the `marju212`
+    /// fork): a solder jumper placed without its ties reaches the board as a
+    /// short. `apply_to_item` is what `place_component`, `place_array` and
+    /// `duplicate_component` all use; on B.Cu it leaves the 3D models off.
+    #[test]
+    fn placed_items_carry_net_ties_and_the_zone_connection() {
+        use copperpour_ipc::gen::kiapi::board::types as board;
+        let source = C_0603.replacen(
+            "\t(layer \"F.Cu\")",
+            "\t(layer \"F.Cu\")\n\t(zone_connect 1)\n\t(net_tie_pad_groups \"1, 2\")",
+            1,
+        );
+        assert_ne!(source, C_0603, "the fixture must gain both clauses");
+        let tmp = tempfile::tempdir().unwrap();
+        capacitor_fixture(tmp.path(), &source);
+        let prepared = PreparedFootprintPlacement::from_library(
+            &source,
+            "Capacitor_SMD:C_0603_1608Metric",
+            "C1",
+            None,
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+            Some(tmp.path()),
+        )
+        .unwrap();
+        let item = prepared
+            .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", 10.0, 20.0)
+            .unwrap();
+        let footprint = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        assert_eq!(
+            footprint.overrides.unwrap().zone_connection,
+            board::ZoneConnectionStyle::ZcsThermal as i32
+        );
+        assert_eq!(
+            footprint.definition.as_ref().unwrap().net_ties[0].pad_number,
+            vec!["1".to_string(), "2".to_string()]
+        );
+
+        let library =
+            LibraryFootprintData::read(&copperpour_sexp::parse_sexp(&source).unwrap()).unwrap();
+        let bare = || {
+            KiCadIpcClient::build_footprint_item(
+                "Capacitor_SMD:C_0603_1608Metric",
+                "C2",
+                "C",
+                &extract_pad_definitions(&source).unwrap(),
+                &[],
+                &extract_field_placement(&source),
+                0.0,
+                0.0,
+                0.0,
+                "F.Cu",
+            )
+            .unwrap()
+        };
+        let model_count = |item: &prost_types::Any| {
+            board::FootprintInstance::decode(item.value.as_slice())
+                .unwrap()
+                .definition
+                .unwrap()
+                .items
+                .iter()
+                .filter(|item| {
+                    copperpour_ipc::builders::any_is(item, "kiapi.board.types.Footprint3DModel")
+                })
+                .count()
+        };
+        let front = library.apply_to_item(bare(), true).unwrap();
+        let back = library.apply_to_item(bare(), false).unwrap();
+        assert_eq!(model_count(&front), 1);
+        assert_eq!(model_count(&back), 0);
+        let back = board::FootprintInstance::decode(back.value.as_slice()).unwrap();
+        assert_eq!(back.definition.unwrap().net_ties.len(), 1);
     }
 
     /// A project registering `Capacitor_SMD` with `footprint` as its

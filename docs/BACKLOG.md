@@ -127,6 +127,21 @@ Each entry names where it was found, what is wrong, and the condition that close
 - **`f517fd8` and `d2961f4` from wilfredo-a14/agent-hub were not merged** (activity reporting to,
   and editor control of, a modified KiCad build). Closing condition: an owner decision.
 
+## PCB sync and library data (plan step 7)
+
+- **`duplicate_component` on B.Cu leaves the library's 3D models off**, as before the merge: that path
+  builds the footprint directly on B.Cu instead of flipping it, and where KiCad then puts a front-side
+  model has not been checked. Closing condition: measured on a live board, or the copy flipped as
+  `place_component` does.
+- **A library that drops its `zone_connect` clause leaves the board footprint's earlier override in
+  place** (KiCad's refresh would reset it to inherited). Closing condition: decided against KiCad's
+  behaviour on a live board.
+- **The sync's readback does not check that net ties were kept**, as it does for models and
+  attributes. Closing condition: `net_ties` compared in the readback.
+- **The IPC paths of this step were not run against KiCad here** (no KiCad GUI session): the footprint
+  text tools, net ties on placement, and the refresh's no-op with net ties rely on unit tests and on
+  the fork's live checks. Closing condition: one live run on a board with a solder jumper.
+
 ## Custom-shape pads (plan step 1, not merged)
 
 - **Footprints with custom-shape pads cannot be placed** (about 3.9% of KiCad's library). KiCad's

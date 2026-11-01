@@ -23,3 +23,32 @@ KiCad 10 board.
 
 Gate (`logs/gate-step7-merge.summary`): 3,715 passed (+11, the fork's footprint-text tests), 1
 failed (the known baseline failure), 110 ignored.
+Committed as `b388cc1` (author kept: Marcus Junström).
+
+## `a7886a9`: net ties and footprint zone connection (re-implemented)
+
+Not cherry-picked: its delete_symbol, exclude-from-BOM, field copying and `(unlocked …)` changes are
+already in Copperpour, and its `LibraryExtras` duplicated Copperpour's `LibraryFootprintData`. Taken:
+
+- `library_footprint::net_ties` and `zone_connection`, and their test
+  `net_ties_and_zone_connection_read_from_a_solder_jumper`, as the fork wrote them. The file values
+  0–3 map by name to the API's `ZcsNone`…`ZcsPthThermal` (the API enum numbers differ: 0 is
+  `ZcsUnknown`), and `find` reads only the footprint's own clause, not a pad's. New
+  `apply_net_ties_and_zone_connection` puts both on a built footprint.
+- Sync: `PreparedFootprint` carries both, applied in `apply_library_data`. Test
+  `an_added_solder_jumper_carries_its_net_ties_and_zone_connection`.
+- Placement: `LibraryFootprintData` gains both, with `read` and `apply_to_item`, used by
+  `place_component`, and now also by `place_array` and `duplicate_component`, which before sent the
+  bare built footprint with none of the library data. `duplicate_component` on B.Cu builds on that
+  layer instead of flipping, so the models are left off there (backlog). Test
+  `placed_items_carry_net_ties_and_the_zone_connection`.
+- Library refresh: both clauses accepted; both copied onto the rebuilt footprint; new changed domains
+  `net_ties` and `zone_connection`. Without them a refresh that differed only in net ties planned a
+  no-op and never sent them. Test `net_ties_and_zone_connection_are_sent_once_then_unchanged` also
+  checks that a second refresh is a no-op (`109f890`); control: with the net-tie comparison disabled
+  it fails.
+
+Migration note `docs/api-migrations/footprint-net-ties-and-zone-connection.md`.
+
+Gate (`logs/gate-step7-a7886a9.summary`): 3,719 passed (+4), 1 failed (the known baseline
+failure), 110 ignored.

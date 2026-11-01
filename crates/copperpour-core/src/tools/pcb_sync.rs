@@ -315,6 +315,11 @@ struct PreparedFootprint {
     /// footprint definition.
     description_and_keywords: copperpour_ipc::gen::kiapi::board::types::FootprintAttributes,
     models: Vec<copperpour_ipc::gen::kiapi::board::types::Footprint3DModel>,
+    /// The library's net-tie pad groups and footprint-level zone connection
+    /// (from the `marju212` fork): without the ties a solder jumper's bridge
+    /// reaches the board as a short.
+    net_ties: Vec<copperpour_ipc::gen::kiapi::board::types::NetTieDefinition>,
+    zone_connection: Option<copperpour_ipc::gen::kiapi::board::types::ZoneConnectionStyle>,
     /// The library's properties as typed fields, or why they could not be
     /// read. Unreadable properties never refuse the part (#789).
     library_fields: std::result::Result<super::library_footprint::LibraryProperties, String>,
@@ -2360,6 +2365,8 @@ fn prepare_footprint_source(
     let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
     let description_and_keywords = super::library_footprint::description_and_keywords(&root);
     let models = super::library_footprint::models(&root).map_err(unsupported)?;
+    let net_ties = super::library_footprint::net_ties(&root).map_err(unsupported)?;
+    let zone_connection = super::library_footprint::zone_connection(&root).map_err(unsupported)?;
     let library_fields =
         super::library_footprint::properties(&root).map_err(|error| format!("{error:#}"));
     // Properties travel as typed fields when they can be read. Drawing visible
@@ -2379,6 +2386,8 @@ fn prepare_footprint_source(
         attributes,
         description_and_keywords,
         models,
+        net_ties,
+        zone_connection,
         library_fields,
         width,
         height,
@@ -2406,6 +2415,11 @@ fn apply_library_data(
     definition.items.extend(part.models.iter().map(|model| {
         copperpour_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
     }));
+    super::library_footprint::apply_net_ties_and_zone_connection(
+        footprint,
+        &part.net_ties,
+        part.zone_connection,
+    )?;
     if let Ok(fields) = &part.library_fields {
         apply_library_fields(footprint, fields)?;
     }
@@ -7349,6 +7363,44 @@ mod tests {
     /// as KiCad's own Update PCB from Schematic does. The library data is
     /// applied first and the schematic's fields second, so the order is what
     /// this pins: both directions, on the KiCad-written 0603.
+    /// A part the sync adds from a library with net-tie pad groups and a
+    /// footprint-level zone connection carries both (merge of the `marju212`
+    /// fork); a solder jumper added without its ties is a short in DRC.
+    #[test]
+    fn an_added_solder_jumper_carries_its_net_ties_and_zone_connection() {
+        use copperpour_ipc::gen::kiapi;
+
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod")
+            .replacen(
+                "\t(layer \"F.Cu\")",
+                "\t(layer \"F.Cu\")\n\t(zone_connect 2)\n\t(net_tie_pad_groups \"1, 2\")",
+                1,
+            );
+        let part = prepare_footprint_source(&source).unwrap();
+        let addition = PlannedChange::Add {
+            reference: "JP1".into(),
+            value: "Jumper".into(),
+            footprint_id: STOCK_0603.into(),
+            symbol_path: "/jp1-uuid".into(),
+            dnp: false,
+            exclude_from_bom: false,
+            pad_nets: BTreeMap::new(),
+            position: Point { x: 10.0, y: 10.0 },
+            fields: Vec::new(),
+        };
+        let item = build_added_footprint(&addition, &part, &BTreeMap::new()).unwrap();
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        assert_eq!(
+            footprint.overrides.unwrap().zone_connection,
+            kiapi::board::types::ZoneConnectionStyle::ZcsFull as i32
+        );
+        assert_eq!(
+            footprint.definition.unwrap().net_ties[0].pad_number,
+            vec!["1".to_string(), "2".to_string()]
+        );
+    }
+
     #[test]
     fn the_schematic_decides_dnp_over_the_library() {
         use copperpour_ipc::gen::kiapi;

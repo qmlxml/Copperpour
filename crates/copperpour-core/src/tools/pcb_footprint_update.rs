@@ -28,6 +28,10 @@ struct LibraryFootprint {
     pads: Vec<copperpour_ipc::IpcPadDefinition>,
     graphics: Vec<copperpour_ipc::IpcGraphicDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
+    /// `(net_tie_pad_groups …)`: pads copper may join without a short.
+    net_ties: Vec<kiapi::board::types::NetTieDefinition>,
+    /// The footprint-level `(zone_connect …)`, `None` when inherited.
+    zone_connection: Option<kiapi::board::types::ZoneConnectionStyle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -39,6 +43,10 @@ enum ChangedDomain {
     Metadata,
     Models,
     TextEffects,
+    /// The definition's net-tie pad groups (merge of the `marju212` fork).
+    NetTies,
+    /// The footprint-level zone connection override.
+    ZoneConnection,
 }
 
 #[derive(Debug)]
@@ -902,6 +910,8 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
     let models = super::library_footprint::models(&root)?;
     let attributes = super::library_footprint::attributes(&root)?;
+    let net_ties = super::library_footprint::net_ties(&root)?;
+    let zone_connection = super::library_footprint::zone_connection(&root)?;
     let definition = kiapi::board::types::Footprint {
         id: Some(kiapi::common::types::LibraryIdentifier {
             library_nickname: library_nickname.to_string(),
@@ -923,6 +933,8 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         pads,
         graphics,
         models,
+        net_ties,
+        zone_connection,
     })
 }
 
@@ -935,6 +947,10 @@ fn validate_supported_children(root: &copperpour_sexp::SexpNode) -> Result<()> {
             "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
             | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
             | "fp_poly" | "pad" | "model" => {}
+            // Read into typed messages by `library_footprint`: a solder
+            // jumper's net-tie pad groups and the footprint-level zone
+            // connection a jumper or test pad sets (merge of `marju212`).
+            "net_tie_pad_groups" | "zone_connect" => {}
             // KiCad 10 writes these two flags into every footprint it saves
             // (all 15,428 official library files carry them, every one at its
             // default). At the default the typed rebuild loses nothing;
@@ -1411,6 +1427,14 @@ fn build_updated_instance(
         attributes.do_not_populate = current_attributes.do_not_populate;
     }
     updated.attributes = Some(attributes);
+    // A library zone-connection override replaces the instance's, as KiCad's
+    // own refresh copies it; a library without one leaves the instance's
+    // overrides alone. `preserved.instance_overrides` reports the change.
+    super::library_footprint::apply_net_ties_and_zone_connection(
+        &mut updated,
+        &library.net_ties,
+        library.zone_connection,
+    )?;
 
     let mut text_effects = Vec::new();
     if text_reset.any() {
@@ -1890,6 +1914,20 @@ fn changed_domains(
         || current.value_field != updated.value_field
     {
         changed.insert(ChangedDomain::TextEffects);
+    }
+    // Without these two, a refresh whose only difference is a solder jumper's
+    // net ties planned a no-op and never sent them.
+    if current_definition.net_ties != updated_definition.net_ties {
+        changed.insert(ChangedDomain::NetTies);
+    }
+    let zone_connection = |footprint: &kiapi::board::types::FootprintInstance| {
+        footprint
+            .overrides
+            .as_ref()
+            .map(|overrides| overrides.zone_connection)
+    };
+    if zone_connection(current) != zone_connection(updated) {
+        changed.insert(ChangedDomain::ZoneConnection);
     }
     Ok(changed)
 }
@@ -3495,6 +3533,74 @@ mod tests {
         assert_eq!(
             prepared.changed_domains,
             BTreeSet::from([ChangedDomain::Metadata])
+        );
+    }
+
+    /// A library that gains a solder jumper's net ties and a footprint-level
+    /// zone connection is a change the refresh must send: before the merge of
+    /// the `marju212` fork both clauses were refused, and comparing neither
+    /// would have planned a no-op that never sent them. Applying the result
+    /// and refreshing again must then be a no-op (`109f890`), or every
+    /// refresh of a jumper would rewrite it.
+    #[test]
+    fn net_ties_and_zone_connection_are_sent_once_then_unchanged() {
+        let base = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let routed = BTreeSet::new();
+        let build = |current: &kiapi::board::types::FootprintInstance,
+                     library: &LibraryFootprint| {
+            build_updated_instance(
+                current,
+                library,
+                two_layers(),
+                &net_codes,
+                &routed,
+                TextReset::default(),
+            )
+            .unwrap()
+        };
+        let decode = |prepared: &PreparedUpdate| {
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap()
+        };
+        let applied = decode(&build(&current, &base));
+
+        let pads: Vec<String> = base.pads.iter().map(|pad| pad.number.clone()).collect();
+        assert!(pads.len() >= 2, "{pads:?}");
+        let jumper_source = LIBRARY_FOOTPRINT.replacen(
+            "(version 20240108)",
+            &format!(
+                "(version 20240108)\n  (zone_connect 2)\n  (net_tie_pad_groups \"{}, {}\")",
+                pads[0], pads[1]
+            ),
+            1,
+        );
+        let jumper = parse_library_footprint("Test:Socket", &jumper_source).unwrap();
+
+        let first = build(&applied, &jumper);
+        assert_eq!(
+            first.changed_domains,
+            BTreeSet::from([ChangedDomain::NetTies, ChangedDomain::ZoneConnection])
+        );
+        let sent = decode(&first);
+        assert_eq!(
+            sent.definition.as_ref().unwrap().net_ties[0].pad_number,
+            vec![pads[0].clone(), pads[1].clone()]
+        );
+        assert_eq!(
+            sent.overrides.as_ref().unwrap().zone_connection,
+            kiapi::board::types::ZoneConnectionStyle::ZcsFull as i32
+        );
+        assert!(
+            !first.preserved.instance_overrides,
+            "replacing the instance's zone connection is reported"
+        );
+
+        let again = build(&sent, &jumper);
+        assert!(
+            again.changed_domains.is_empty(),
+            "{:?}",
+            again.changed_domains
         );
     }
 
