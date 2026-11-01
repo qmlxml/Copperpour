@@ -135,6 +135,15 @@ Each entry names where it was found, what is wrong, and the condition that close
 - **A library that drops its `zone_connect` clause leaves the board footprint's earlier override in
   place** (KiCad's refresh would reset it to inherited). Closing condition: decided against KiCad's
   behaviour on a live board.
+- **Footprint-local coordinates on a back-side footprint are not supported** by the footprint text
+  tools (`local` is null, local moves refused) and are converted by rotation alone, without the
+  mirror, by Copperpour's footprint graphics tools (`list_footprint_graphics`,
+  `set_footprint_graphic_points`; this predates step 7). Closing condition: KiCad's back-side
+  transform measured on a live board and applied in both.
+- **A net-tie pad name containing white space** is one name to KiCad's DRC but two to KiCad's IPC
+  writer (`footprint.cpp` 10.0.7, lines 369 and 3862), so a library refresh of such a footprint would
+  never be a no-op. Copperpour follows the DRC reading. Closing condition: measured on a live board, or
+  such names refused.
 - **The sync's readback does not check that net ties were kept**, as it does for models and
   attributes. Closing condition: `net_ties` compared in the readback.
 - **The IPC paths of this step were not run against KiCad here** (no KiCad GUI session): the footprint

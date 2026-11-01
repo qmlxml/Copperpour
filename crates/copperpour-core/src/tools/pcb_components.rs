@@ -2843,13 +2843,59 @@ fn parse_text_moves(
         let Some(reference) = obj.get("reference").and_then(|v| v.as_str()) else {
             return Err(invalid(format!("entry {i} has no 'reference' string")));
         };
-        let num = |key: &str| -> Result<Option<f64>, CallToolResult> {
+        // A misspelt key (`dX`, `rotation`) would otherwise be ignored and the
+        // entry reported as moved (review 2 of plan step 7).
+        const KEYS: [&str; 12] = [
+            "reference",
+            "field",
+            "uuid",
+            "x",
+            "y",
+            "dx",
+            "dy",
+            "local_x",
+            "local_y",
+            "angle",
+            "layer",
+            "visible",
+        ];
+        if let Some(unknown) = obj.keys().find(|key| !KEYS.contains(&key.as_str())) {
+            return Err(invalid(format!(
+                "entry {i}: unknown key '{unknown}'; the keys are {}",
+                KEYS.join(", ")
+            )));
+        }
+        // Present but not a string is refused, not read as absent: a numeric
+        // `field` fell back to Reference and moved the wrong text.
+        let text = |key: &str| -> Result<Option<&str>, CallToolResult> {
             match obj.get(key) {
                 None | Some(serde_json::Value::Null) => Ok(None),
                 Some(v) => v
-                    .as_f64()
+                    .as_str()
                     .map(Some)
-                    .ok_or_else(|| invalid(format!("entry {i}: '{key}' is not a number"))),
+                    .ok_or_else(|| invalid(format!("entry {i}: '{key}' is not a string"))),
+            }
+        };
+        let limit_mm = copperpour_ipc::footprint_text::COORDINATE_LIMIT_NM as f64 / 1e6;
+        let num = |key: &str| -> Result<Option<f64>, CallToolResult> {
+            match obj.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(v) => {
+                    let value = v
+                        .as_f64()
+                        .ok_or_else(|| invalid(format!("entry {i}: '{key}' is not a number")))?;
+                    // Beyond KiCad's coordinate range the nanometre value
+                    // saturates or overflows; an angle that large is a
+                    // mistake as well.
+                    if key != "angle" && value.abs() > limit_mm
+                        || key == "angle" && value.abs() > 36_000.0
+                    {
+                        return Err(invalid(format!(
+                            "entry {i}: '{key}' = {value} is out of range"
+                        )));
+                    }
+                    Ok(Some(value))
+                }
             }
         };
         let pair = |a: &str, b: &str| -> Result<Option<(f64, f64)>, CallToolResult> {
@@ -2859,10 +2905,7 @@ fn parse_text_moves(
                 _ => Err(invalid(format!("entry {i}: give both '{a}' and '{b}'"))),
             }
         };
-        let target = match (
-            obj.get("field").and_then(|v| v.as_str()),
-            obj.get("uuid").and_then(|v| v.as_str()),
-        ) {
+        let target = match (text("field")?, text("uuid")?) {
             (Some(_), Some(_)) => {
                 return Err(invalid(format!(
                     "entry {i}: give 'field' or 'uuid', not both"
@@ -2886,12 +2929,20 @@ fn parse_text_moves(
             offset: pair("dx", "dy")?,
             local: pair("local_x", "local_y")?,
             angle: num("angle")?,
-            layer: obj
-                .get("layer")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
+            layer: text("layer")?.map(str::to_string),
             visible,
         };
+        if edit.position.is_none()
+            && edit.offset.is_none()
+            && edit.local.is_none()
+            && edit.angle.is_none()
+            && edit.layer.is_none()
+            && edit.visible.is_none()
+        {
+            return Err(invalid(format!(
+                "entry {i}: nothing to change; give a position, angle, layer or visible"
+            )));
+        }
         let modes = [edit.position, edit.offset, edit.local]
             .iter()
             .filter(|m| m.is_some())
@@ -8440,6 +8491,17 @@ mod board_footprint_graphics_tests {
             json!([{ "reference": "R1", "field": "Value", "uuid": "u" }]),
             json!([{ "reference": "R1", "angle": "ninety" }]),
             json!([{ "reference": "R1", "visible": "no" }]),
+            // Review 2 of plan step 7: a numeric field fell back to Reference,
+            // a misspelt key was ignored, an empty entry was reported moved,
+            // and a huge coordinate overflowed the nanometre value.
+            json!([{ "reference": "R1", "field": 5, "x": 1, "y": 2 }]),
+            json!([{ "reference": "R1", "uuid": true, "x": 1, "y": 2 }]),
+            json!([{ "reference": "R1", "layer": 3, "x": 1, "y": 2 }]),
+            json!([{ "reference": "R1", "dX": 1, "dy": 1 }]),
+            json!([{ "reference": "R1" }]),
+            json!([{ "reference": "R1", "x": 1e300, "y": 0 }]),
+            json!([{ "reference": "R1", "dx": 3000, "dy": 0 }]),
+            json!([{ "reference": "R1", "angle": 1e9 }]),
         ] {
             let err = parse_text_moves(&bad).expect_err(&format!("{bad} should be refused"));
             assert!(err.is_error, "{bad}");
@@ -8590,5 +8652,164 @@ mod required_count_tests {
         .await
         .expect("no anyhow");
         assert!(result.is_error, "an explicit zero must still be rejected");
+    }
+}
+
+/// `move_footprint_texts` through a mock KiCad that keeps what it is sent
+/// (review 2 of plan step 7): the batch is sent in one commit, a refused
+/// edit sends nothing, and the response is the board read back.
+#[cfg(test)]
+mod footprint_text_served_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{
+        ctx_talking_to, spawn_kicad_holding_items, ItemStore,
+    };
+    use copperpour_ipc::builders::{pack_any, vec2};
+    use copperpour_ipc::gen::kiapi;
+    use std::sync::{Arc, Mutex};
+
+    fn reference_at(x: f64, y: f64) -> kiapi::board::types::Field {
+        kiapi::board::types::Field {
+            name: "Reference".to_string(),
+            text: Some(kiapi::board::types::BoardText {
+                text: Some(kiapi::common::types::Text {
+                    text: "R1".to_string(),
+                    position: Some(vec2(x, y)),
+                    ..Default::default()
+                }),
+                layer: kiapi::board::types::BoardLayer::BlFSilkS as i32,
+                ..Default::default()
+            }),
+            visible: true,
+            ..Default::default()
+        }
+    }
+
+    fn held_r1() -> prost_types::Any {
+        pack_any(
+            &kiapi::board::types::FootprintInstance {
+                id: Some(kiapi::common::types::Kiid {
+                    value: "fp-1".to_string(),
+                }),
+                position: Some(vec2(10.0, 20.0)),
+                layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                reference_field: Some(reference_at(10.0, 18.5)),
+                definition: Some(kiapi::board::types::Footprint::default()),
+                ..Default::default()
+            },
+            "kiapi.board.types.FootprintInstance",
+        )
+    }
+
+    fn held_reference_position(store: &ItemStore) -> (i64, i64) {
+        let fp = kiapi::board::types::FootprintInstance::decode(store.items[0].value.as_slice())
+            .unwrap();
+        let at = fp
+            .reference_field
+            .unwrap()
+            .text
+            .unwrap()
+            .text
+            .unwrap()
+            .position
+            .unwrap();
+        (at.x_nm, at.y_nm)
+    }
+
+    fn board_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        board
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap_or(serde_json::Value::String(text.clone()))
+    }
+
+    #[tokio::test]
+    async fn a_move_is_sent_once_and_reported_as_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![held_r1()],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, |_, _| None);
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        // Two moves of one text: the last is what the board holds, and the
+        // text is counted once.
+        let result = handle_move_footprint_texts(
+            &json!({ "board": board, "moves": [
+                { "reference": "R1", "x": 12.0, "y": 17.0 },
+                { "reference": "R1", "dx": 1.0, "dy": 0.0 }
+            ]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let reply = body(&result);
+        assert_eq!(reply["moved"], 1, "{reply}");
+        assert_eq!(reply["texts"][0]["position"]["x"], 13.0, "{reply}");
+        let held = store.lock().unwrap();
+        assert_eq!(held.updates, 1, "one UpdateItems for the batch");
+        assert_eq!(held_reference_position(&held), (13_000_000, 17_000_000));
+    }
+
+    #[tokio::test]
+    async fn a_refused_edit_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![held_r1()],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, |_, _| None);
+        let result = handle_move_footprint_texts(
+            &json!({ "board": board, "moves": [
+                { "reference": "R1", "x": 12.0, "y": 17.0 },
+                { "reference": "R9", "x": 1.0, "y": 1.0 }
+            ]}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{:?}", result.content);
+        let held = store.lock().unwrap();
+        assert_eq!(held.updates, 0);
+        assert_eq!(held_reference_position(&held), (10_000_000, 18_500_000));
+    }
+
+    /// A board that keeps something other than what was sent (standing in
+    /// for KiCad changing an item on commit) is reported, not described as
+    /// moved.
+    #[tokio::test]
+    async fn a_board_that_kept_something_else_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![held_r1()],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            |item| *item = held_r1(),
+            |_, _| None,
+        );
+        let result = handle_move_footprint_texts(
+            &json!({ "board": board, "moves": [{ "reference": "R1", "x": 12.0, "y": 17.0 }]}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{:?}", result.content);
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("the edit was sent"), "{text}");
     }
 }

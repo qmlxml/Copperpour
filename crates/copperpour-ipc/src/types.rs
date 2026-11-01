@@ -641,7 +641,10 @@ pub struct IpcFootprintText {
     pub text: String,
     pub layer: String,
     pub position: IpcVector2,
-    pub local: IpcVector2,
+    /// Footprint-local position, as the `.kicad_mod` shows it. `None` on a
+    /// back-side footprint: the mirror KiCad applies there has not been
+    /// measured, so a local position could be on the wrong side.
+    pub local: Option<IpcVector2>,
     pub angle: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<IpcVector2>,

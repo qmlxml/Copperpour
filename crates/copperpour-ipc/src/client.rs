@@ -15,7 +15,7 @@ use copperpour_sexp::paths::display_path;
 use copperpour_sexp::title_block::TitleBlock;
 // NNG SetOpt trait is brought in scope automatically by the nng crate's prelude
 use prost::Message;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -3403,49 +3403,125 @@ impl KiCadIpcClient {
         &self,
         edits: &[IpcFootprintTextEdit],
     ) -> Result<Vec<IpcFootprintText>> {
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
-        let mut footprints: Vec<kiapi::board::types::FootprintInstance> = Vec::new();
-        let mut touched = BTreeSet::new();
-        let mut results = Vec::with_capacity(edits.len());
-        for (i, edit) in edits.iter().enumerate() {
-            let index = match footprints
-                .iter()
-                .position(|fp| crate::footprint_text::reference_of(fp) == edit.reference)
-            {
-                Some(index) => index,
-                None => {
-                    let mut matches = items.iter().filter_map(|item| {
-                        kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-                            .ok()
-                            .filter(|fp| crate::footprint_text::reference_of(fp) == edit.reference)
-                    });
-                    let fp = matches.next().ok_or_else(|| {
-                        anyhow::anyhow!("edit {i}: footprint '{}' not found", edit.reference)
-                    })?;
-                    if matches.next().is_some() {
-                        anyhow::bail!(
+        // Read, check and send inside one commit (review 2 of plan step 7): a
+        // refused edit or a failed send drops the commit, so nothing of the
+        // batch stays on the board, and the window in which an edit made in
+        // the GUI is overwritten by the stale copy is as short as it can be.
+        let results = self.run_commit("Move footprint texts", |c| {
+            let items = c.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+            // Decoded once, by reference; a reference on two footprints is
+            // refused when an edit names it.
+            let mut by_reference: BTreeMap<String, Vec<kiapi::board::types::FootprintInstance>> =
+                BTreeMap::new();
+            for item in &items {
+                if let Ok(fp) =
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                {
+                    by_reference
+                        .entry(crate::footprint_text::reference_of(&fp).to_string())
+                        .or_default()
+                        .push(fp);
+                }
+            }
+            let mut touched: BTreeMap<String, kiapi::board::types::FootprintInstance> =
+                BTreeMap::new();
+            let mut results = Vec::with_capacity(edits.len());
+            for (i, edit) in edits.iter().enumerate() {
+                if !touched.contains_key(&edit.reference) {
+                    let fp = match by_reference.get(&edit.reference).map(Vec::as_slice) {
+                        Some([fp]) => fp.clone(),
+                        Some([]) | None => {
+                            anyhow::bail!("edit {i}: footprint '{}' not found", edit.reference)
+                        }
+                        Some(_) => anyhow::bail!(
                             "edit {i}: more than one footprint is called '{}'",
                             edit.reference
-                        );
-                    }
-                    footprints.push(fp);
-                    footprints.len() - 1
+                        ),
+                    };
+                    touched.insert(edit.reference.clone(), fp);
                 }
-            };
-            let result = crate::footprint_text::apply_edit(&mut footprints[index], edit)
-                .with_context(|| format!("edit {i} ({})", edit.reference))?;
-            touched.insert(index);
-            results.push(result);
-        }
-        if touched.is_empty() {
-            return Ok(results);
-        }
-        let packed = touched
+                let fp = touched.get_mut(&edit.reference).expect("inserted above");
+                let result = crate::footprint_text::apply_edit(fp, edit)
+                    .with_context(|| format!("edit {i} ({})", edit.reference))?;
+                results.push(result);
+            }
+            if !touched.is_empty() {
+                c.update_items(
+                    touched
+                        .values()
+                        .map(|fp| pack_any(fp, "kiapi.board.types.FootprintInstance"))
+                        .collect(),
+                )?;
+            }
+            Ok(results)
+        })?;
+
+        // Report what the board holds, not what was computed: each edited
+        // text read back, by footprint and field name or UUID. The last edit
+        // of a text is what the board should show.
+        let references: Vec<String> = edits
+            .iter()
+            .map(|edit| edit.reference.clone())
+            .collect::<BTreeSet<_>>()
             .into_iter()
-            .map(|i| pack_any(&footprints[i], "kiapi.board.types.FootprintInstance"))
             .collect();
-        self.update_items(packed)?;
-        Ok(results)
+        let board = self.list_footprint_texts(&references)?;
+        let same_text = |a: &IpcFootprintText, b: &IpcFootprintText| {
+            a.reference == b.reference && a.field == b.field && a.uuid == b.uuid
+        };
+        let mut read_back: Vec<IpcFootprintText> = Vec::new();
+        for expected in results.iter().rev() {
+            if read_back.iter().any(|seen| same_text(seen, expected)) {
+                continue;
+            }
+            let actual = board
+                .iter()
+                .find(|text| same_text(text, expected))
+                .with_context(|| {
+                    format!(
+                        "the edit was sent, but {} {} is not on the board when read back",
+                        expected.reference,
+                        expected
+                            .field
+                            .as_deref()
+                            .or(expected.uuid.as_deref())
+                            .unwrap_or("text")
+                    )
+                })?;
+            let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+            if !close(actual.position.x, expected.position.x)
+                || !close(actual.position.y, expected.position.y)
+                || actual.layer != expected.layer
+                // KiCad may hold an angle normalised (-90 as 270).
+                || !close(
+                    (actual.angle - expected.angle).rem_euclid(360.0).min(
+                        (expected.angle - actual.angle).rem_euclid(360.0),
+                    ),
+                    0.0,
+                )
+                || actual.visible != expected.visible
+            {
+                anyhow::bail!(
+                    "the edit was sent, but KiCad holds {} {} at ({}, {}) on {} rather than \
+                     ({}, {}) on {}",
+                    actual.reference,
+                    actual
+                        .field
+                        .as_deref()
+                        .or(actual.uuid.as_deref())
+                        .unwrap_or("text"),
+                    actual.position.x,
+                    actual.position.y,
+                    actual.layer,
+                    expected.position.x,
+                    expected.position.y,
+                    expected.layer
+                );
+            }
+            read_back.push(actual.clone());
+        }
+        read_back.reverse();
+        Ok(read_back)
     }
 
     /// The placed footprint carrying `reference`, and its index among items.

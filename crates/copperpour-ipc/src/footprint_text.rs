@@ -39,6 +39,21 @@ fn frame(fp: &FootprintInstance) -> ((i64, i64), f64) {
     ((pos.x_nm, pos.y_nm), angle)
 }
 
+/// Whether `fp` sits on the back of the board.
+fn on_back(fp: &FootprintInstance) -> bool {
+    fp.layer == kiapi::board::types::BoardLayer::BlBCu as i32
+}
+
+/// KiCad's board reader clamps a coordinate beyond this (`INT_LIMIT` in
+/// `pcb_io_kicad_sexpr_parser.cpp`); a text placed further out would be
+/// stored somewhere other than reported.
+pub const COORDINATE_LIMIT_NM: i64 = i32::MAX as i64 - 10;
+
+/// Whether a layer name is on the back of the board (`B.SilkS`, `B.Fab`, …).
+fn back_layer(name: &str) -> bool {
+    name.starts_with("B.")
+}
+
 fn layer_name(layer: i32) -> String {
     kiapi::board::types::BoardLayer::try_from(layer)
         .ok()
@@ -79,10 +94,10 @@ fn describe(
             x: nm_to_mm(pos.x_nm),
             y: nm_to_mm(pos.y_nm),
         },
-        local: IpcVector2 {
+        local: (!on_back(fp)).then(|| IpcVector2 {
             x: nm_to_mm(lx - anchor.0),
             y: nm_to_mm(ly - anchor.1),
-        },
+        }),
         angle: attrs
             .and_then(|a| a.angle.as_ref())
             .map(|a| a.value_degrees)
@@ -160,11 +175,32 @@ fn apply_to_text(
     edit: &IpcFootprintTextEdit,
     anchor: (i64, i64),
     fp_angle: f64,
+    fp_on_back: bool,
 ) -> Result<()> {
     let layer = match edit.layer.as_deref() {
-        Some(name) => Some(crate::builders::try_layer_from_name(name)? as i32),
+        Some(name) => {
+            let layer = crate::builders::try_layer_from_name(name)? as i32;
+            // A text moved between the front and the back would need its
+            // mirroring changed as well, which this tool does not do: it
+            // would sit on the back reading as front-side text (review 2 of
+            // plan step 7).
+            if back_layer(name) != back_layer(&layer_name(bt.layer)) {
+                anyhow::bail!(
+                    "moving a text from {} to {name} changes the board side, which needs the \
+                     text mirrored; flip the footprint, or change it in KiCad",
+                    layer_name(bt.layer)
+                );
+            }
+            Some(layer)
+        }
         None => None,
     };
+    if edit.local.is_some() && fp_on_back {
+        anyhow::bail!(
+            "local_x/local_y are not accepted on a back-side footprint, whose local frame is \
+             mirrored; give x/y or dx/dy in board millimetres"
+        );
+    }
     if edit.visible.is_some() && visible.is_none() {
         anyhow::bail!("a plain footprint text has no visibility flag; only fields can be hidden");
     }
@@ -173,7 +209,14 @@ fn apply_to_text(
     let old = text.position.unwrap_or_default();
     let new = match (edit.position, edit.offset, edit.local) {
         (Some((x, y)), None, None) => (mm_to_nm(x), mm_to_nm(y)),
-        (None, Some((dx, dy)), None) => (old.x_nm + mm_to_nm(dx), old.y_nm + mm_to_nm(dy)),
+        (None, Some((dx, dy)), None) => (
+            old.x_nm
+                .checked_add(mm_to_nm(dx))
+                .context("dx moves the text off the board's coordinate range")?,
+            old.y_nm
+                .checked_add(mm_to_nm(dy))
+                .context("dy moves the text off the board's coordinate range")?,
+        ),
         (None, None, Some((lx, ly))) => {
             let to_board = Xform::Rotate {
                 cx_nm: 0,
@@ -181,13 +224,30 @@ fn apply_to_text(
                 delta_deg: fp_angle,
             };
             let (bx, by) = to_board.point(mm_to_nm(lx), mm_to_nm(ly));
-            (anchor.0 + bx, anchor.1 + by)
+            (
+                anchor
+                    .0
+                    .checked_add(bx)
+                    .context("local_x moves the text off the board's coordinate range")?,
+                anchor
+                    .1
+                    .checked_add(by)
+                    .context("local_y moves the text off the board's coordinate range")?,
+            )
         }
         (None, None, None) => (old.x_nm, old.y_nm),
         _ => anyhow::bail!(
             "give at most one of position (x, y), offset (dx, dy) or local (local_x, local_y)"
         ),
     };
+    if new.0.abs() > COORDINATE_LIMIT_NM || new.1.abs() > COORDINATE_LIMIT_NM {
+        anyhow::bail!(
+            "the text would land at ({}, {}) mm, outside the ±{} mm KiCad can hold",
+            nm_to_mm(new.0),
+            nm_to_mm(new.1),
+            nm_to_mm(COORDINATE_LIMIT_NM)
+        );
+    }
     text.position = Some(kiapi::common::types::Vector2 {
         x_nm: new.0,
         y_nm: new.1,
@@ -214,6 +274,7 @@ pub fn apply_edit(
     edit: &IpcFootprintTextEdit,
 ) -> Result<IpcFootprintText> {
     let (anchor, fp_angle) = frame(fp);
+    let fp_on_back = on_back(fp);
     let reference = reference_of(fp).to_string();
 
     match &edit.target {
@@ -232,7 +293,7 @@ pub fn apply_edit(
                 let mut probe = field.clone();
                 let Field { text, visible, .. } = &mut probe;
                 let bt = text.get_or_insert_with(Default::default);
-                apply_to_text(bt, Some(visible), edit, anchor, fp_angle)?;
+                apply_to_text(bt, Some(visible), edit, anchor, fp_angle, fp_on_back)?;
                 *field = probe.clone();
                 return describe_field(fp, &probe).context("the edited field lost its text");
             }
@@ -254,7 +315,7 @@ pub fn apply_edit(
                 }
                 let Field { text, visible, .. } = &mut field;
                 let bt = text.get_or_insert_with(Default::default);
-                apply_to_text(bt, Some(visible), edit, anchor, fp_angle)?;
+                apply_to_text(bt, Some(visible), edit, anchor, fp_angle, fp_on_back)?;
                 *any = pack_any(&field, "kiapi.board.types.Field");
                 return describe_field(fp, &field).context("the edited field lost its text");
             }
@@ -279,7 +340,7 @@ pub fn apply_edit(
                 if bt.id.as_ref().map(|k| k.value.as_str()) != Some(uuid.as_str()) {
                     continue;
                 }
-                apply_to_text(&mut bt, None, edit, anchor, fp_angle)?;
+                apply_to_text(&mut bt, None, edit, anchor, fp_angle, fp_on_back)?;
                 *any = pack_any(&bt, "kiapi.board.types.BoardText");
                 return Ok(describe(fp, None, true, &bt));
             }
@@ -385,7 +446,7 @@ mod tests {
         );
         assert_eq!(texts[0].text, "R1");
         assert_eq!(texts[0].layer, "F.SilkS");
-        assert!(close(texts[0].local.y, -1.5));
+        assert!(close(texts[0].local.as_ref().unwrap().y, -1.5));
         assert_eq!(texts[3].uuid.as_deref(), Some("u-1"));
     }
 
@@ -405,8 +466,8 @@ mod tests {
             .unwrap()
             .position = Some(vec2(8.5, 20.0));
         let r = &list_texts(&fp)[0];
-        assert!(close(r.local.x, 0.0), "{:?}", r.local);
-        assert!(close(r.local.y, -1.5), "{:?}", r.local);
+        assert!(close(r.local.as_ref().unwrap().x, 0.0), "{:?}", r.local);
+        assert!(close(r.local.as_ref().unwrap().y, -1.5), "{:?}", r.local);
     }
 
     #[test]
@@ -442,7 +503,7 @@ mod tests {
         let after = apply_edit(&mut fp, &e).unwrap();
         assert!(close(after.position.x, 8.0), "{:?}", after.position);
         assert!(close(after.position.y, 20.0), "{:?}", after.position);
-        assert!(close(after.local.y, -2.0));
+        assert!(close(after.local.as_ref().unwrap().y, -2.0));
     }
 
     #[test]
@@ -470,6 +531,26 @@ mod tests {
         assert!(close(after.position.x, 11.0));
     }
 
+    /// On a back-side footprint the local frame is mirrored, which this
+    /// module does not model: `local` is reported as absent and a local move
+    /// refused, while board-coordinate moves still work (review 2 of plan
+    /// step 7).
+    #[test]
+    fn a_back_side_footprint_has_no_local_position_and_refuses_local_moves() {
+        let mut fp = footprint(10.0, 20.0, 0.0);
+        fp.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+        assert!(list_texts(&fp).iter().all(|text| text.local.is_none()));
+        let original = fp.clone();
+        let mut local = edit(IpcTextTarget::Field("Reference".to_string()));
+        local.local = Some((0.0, -2.0));
+        assert!(apply_edit(&mut fp, &local).is_err());
+        assert_eq!(fp, original);
+        let mut board = edit(IpcTextTarget::Field("Reference".to_string()));
+        board.position = Some((11.0, 21.0));
+        let moved = apply_edit(&mut fp, &board).unwrap();
+        assert!(close(moved.position.x, 11.0) && moved.local.is_none());
+    }
+
     #[test]
     fn refusals_leave_the_footprint_untouched() {
         let original = footprint(10.0, 20.0, 0.0);
@@ -483,7 +564,21 @@ mod tests {
             hide_plain.visible = Some(false);
             let missing = edit(IpcTextTarget::Field("MPN".to_string()));
             let missing_uuid = edit(IpcTextTarget::Uuid("nope".to_string()));
-            vec![two_modes, bad_layer, hide_plain, missing, missing_uuid]
+            // Review 2 of plan step 7: a change of board side would leave the
+            // text unmirrored; an offset may not leave KiCad's range.
+            let mut other_side = edit(IpcTextTarget::Field("Reference".to_string()));
+            other_side.layer = Some("B.SilkS".to_string());
+            let mut too_far = edit(IpcTextTarget::Field("Reference".to_string()));
+            too_far.offset = Some((2_147.0, 0.0));
+            vec![
+                two_modes,
+                bad_layer,
+                hide_plain,
+                missing,
+                missing_uuid,
+                other_side,
+                too_far,
+            ]
         };
         for e in cases {
             let mut fp = original.clone();

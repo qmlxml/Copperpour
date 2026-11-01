@@ -126,3 +126,41 @@ arc; the tests fail if the behaviour regresses. Fixed:
 
 Gate (`logs/gate-step7-fix1.summary`): 3,726 passed (+2), 1 failed (the known baseline failure),
 110 ignored.
+Committed as `325b083`.
+
+## Review 2 (robustness) and fix pass 2
+
+Confirmed: the planner's cost is bounded (once per changed pad, that footprint's pads times the old
+net's copper); zero-length tracks; arcs over 180 degrees; no NaN path from IPC; the plan revision is
+re-taken at apply. Fixed:
+
+1. **`move_footprint_texts` read a present value of the wrong type as absent** (`"field": 5` moved
+   the Reference text and reported success) and ignored misspelt keys. Present values of the wrong
+   type, unknown keys, and an entry that changes nothing are refused.
+2. **Coordinates had no range check**: `dx` of 1e300 overflowed the nanometre sum (a panic in a debug
+   build, a wrapped value in release). Inputs are checked against KiCad's ±2,147 mm, and the result
+   with overflow-checked addition.
+3. **On a back-side footprint the local frame is mirrored**, which the text tools did not model:
+   `local` is now null there and local moves are refused (board-coordinate moves work). Copperpour's
+   own footprint graphics tools have the same gap; recorded in `docs/BACKLOG.md`.
+4. **The read, check and send were not one commit, and the response was the computed result**: now
+   inside `run_commit` (a refused edit or failed send drops the commit), footprints decoded once into
+   a map by reference (finding 8), and the response is the texts read back from the board, compared
+   with what was sent (angles modulo 360). Served tests in `footprint_text_served_tests` with the
+   item-store mock: one `UpdateItems` per batch and the read-back position; a refused edit sends
+   nothing; a board that keeps something else is reported. Control: with the read-back refusal
+   replaced by success, the last test fails. (A first control disabled only the x comparison and
+   the test still passed, because y differed too; it was redone.)
+5. **A layer change from front to back left the text unmirrored**: refused.
+6. **Review 1's fix 8 was wrong.** KiCad 10.0.7's DRC (`FOOTPRINT::MapPadNumbersToNetTieGroups`)
+   splits a net-tie group on unescaped commas only and trims each name; only its IPC writer splits
+   on white space too. Splitting on white space would tie pads `1` and `2` for a library whose pad is
+   named `1 2`, which could hide a real short. `net_tie_pads` now reads groups as the DRC does
+   (commas, `\` escapes, trimming); the difference from the IPC writer is in `docs/BACKLOG.md`.
+7. Repeated `net_tie_pad_groups` or `zone_connect` clauses are refused instead of reading the first.
+8. `moved` counts distinct texts (two moves of one text: 1).
+9. A negative track width counts as unread geometry; a pad with no position or a zero size counts as
+   reached.
+
+Gate (`logs/gate-step7-fix2.summary`): 3,730 passed (+4), 1 failed (the known baseline failure),
+110 ignored.

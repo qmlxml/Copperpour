@@ -52,28 +52,55 @@ pub(crate) fn attributes(root: &SexpNode) -> Result<kiapi::board::types::Footpri
 /// bridge as `shorting_items` and the jumper's pads as a clearance error.
 /// (From the `marju212/Konnect` fork, commit `a7886a9`.)
 pub(crate) fn net_ties(root: &SexpNode) -> Result<Vec<kiapi::board::types::NetTieDefinition>> {
-    let Some(groups) = root.find("net_tie_pad_groups") else {
+    let groups = root.find_all("net_tie_pad_groups");
+    let Some(groups) = groups.first() else {
         return Ok(Vec::new());
     };
+    // KiCad's parser appends the groups of a repeated clause; one clause is
+    // what KiCad writes, so a second is refused rather than guessed.
+    if root.find_all("net_tie_pad_groups").len() > 1 {
+        bail!("footprint has more than one net_tie_pad_groups clause");
+    }
     let mut ties = Vec::new();
     for group in groups.children().unwrap_or_default().iter().skip(1) {
         let group = group
             .as_str()
             .context("footprint net_tie_pad_groups contains a non-atom")?;
-        // KiCad splits a group on commas and white space alike (review 1 of
-        // plan step 7: a hand-written `"1 2"` read as one pad named "1 2"
-        // would never match KiCad's own reading).
-        let pad_number = group
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|pad| !pad.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        let pad_number = net_tie_pads(group);
         if pad_number.is_empty() {
             bail!("footprint net_tie_pad_groups contains an empty group");
         }
         ties.push(kiapi::board::types::NetTieDefinition { pad_number });
     }
     Ok(ties)
+}
+
+/// The pads of one net-tie group, read as KiCad's DRC reads them
+/// (`FOOTPRINT::MapPadNumbersToNetTieGroups`, KiCad 10.0.7): split on commas
+/// not escaped by a backslash, each name trimmed, empty names dropped. White
+/// space inside a name is part of it. (Review 2 of plan step 7: splitting on
+/// white space as well, as KiCad's IPC writer does, would tie pads `1` and
+/// `2` for a library that names one pad `1 2`.)
+fn net_tie_pads(group: &str) -> Vec<String> {
+    let mut pads = Vec::new();
+    let mut pad = String::new();
+    let mut escaped = false;
+    for ch in group.chars() {
+        match ch {
+            _ if escaped => {
+                escaped = false;
+                pad.push(ch);
+            }
+            '\\' => escaped = true,
+            ',' => pads.push(std::mem::take(&mut pad)),
+            _ => pad.push(ch),
+        }
+    }
+    pads.push(pad);
+    pads.into_iter()
+        .map(|pad| pad.trim().to_string())
+        .filter(|pad| !pad.is_empty())
+        .collect()
 }
 
 /// The footprint-level `(zone_connect N)` override, when the library sets one.
@@ -86,7 +113,11 @@ pub(crate) fn zone_connection(
 ) -> Result<Option<kiapi::board::types::ZoneConnectionStyle>> {
     use kiapi::board::types::ZoneConnectionStyle;
 
-    let Some(clause) = root.find("zone_connect") else {
+    let clauses = root.find_all("zone_connect");
+    if clauses.len() > 1 {
+        bail!("footprint has more than one zone_connect clause");
+    }
+    let Some(clause) = clauses.first() else {
         return Ok(None);
     };
     let value = clause
@@ -863,8 +894,18 @@ mod tests {
         assert!(zone_connection(&bad).is_err());
         let empty = root("(footprint \"X\" (net_tie_pad_groups \" , \"))");
         assert!(net_ties(&empty).is_err());
-        let spaced = root("(footprint \"X\" (net_tie_pad_groups \"1 2,3\"))");
-        assert_eq!(net_ties(&spaced).unwrap()[0].pad_number, ["1", "2", "3"]);
+        // As KiCad's DRC reads a group: commas only, trimmed, `\,` escaped.
+        let spaced = root("(footprint \"X\" (net_tie_pad_groups \" 1 2 ,3, a\\\\,b\"))");
+        assert_eq!(
+            net_ties(&spaced).unwrap()[0].pad_number,
+            ["1 2", "3", "a,b"]
+        );
+        let twice =
+            root("(footprint \"X\" (net_tie_pad_groups \"1, 2\") (net_tie_pad_groups \"3, 4\"))");
+        assert!(net_ties(&twice).is_err());
+        assert!(
+            zone_connection(&root("(footprint \"X\" (zone_connect 1) (zone_connect 2))")).is_err()
+        );
     }
 
     #[test]

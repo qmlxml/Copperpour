@@ -2186,8 +2186,11 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
         net.map(|net| net.name.clone())
             .filter(|name| !name.is_empty())
     };
+    // A negative width would shrink the touch distance: read as unknown.
     let half = |width: Option<&kiapi::common::types::Distance>| {
-        width.map(|w| copperpour_ipc::builders::nm_to_mm(w.value_nm) / 2.0)
+        width
+            .filter(|w| w.value_nm >= 0)
+            .map(|w| copperpour_ipc::builders::nm_to_mm(w.value_nm) / 2.0)
     };
     // The geometry is read only from items of their declared type: whether
     // a trace query also lists arcs and vias has not been measured here, and
@@ -2372,8 +2375,10 @@ fn board_footprint_from_instance(
         };
         pad_numbers.insert(pad.number.clone());
         // Pads come back in board coordinates (`client.rs`,
-        // `get_footprint_pads_in`), so no footprint transform is applied.
-        if let Some(at) = pad.position.as_ref() {
+        // `get_footprint_pads_in`), so no footprint transform is applied. A
+        // pad with no position, no size, a zero size or a custom shape gets
+        // no bounded reach and counts as touched (review 2 of plan step 7).
+        {
             use kiapi::board::types::PadStackShape;
             let layers = pad
                 .pad_stack
@@ -2393,14 +2398,16 @@ fn board_footprint_from_instance(
                 })
                 .fold(None, |max: Option<f64>, r| {
                     Some(max.map_or(r, |m| m.max(r)))
-                });
+                })
+                .filter(|radius| *radius > 0.0 && !custom);
+            let at = pad.position.as_ref().map(|at| Point {
+                x: copperpour_ipc::builders::nm_to_mm(at.x_nm),
+                y: copperpour_ipc::builders::nm_to_mm(at.y_nm),
+            });
             pad_reach.push(PadReach {
                 number: pad.number.clone(),
-                at: Point {
-                    x: copperpour_ipc::builders::nm_to_mm(at.x_nm),
-                    y: copperpour_ipc::builders::nm_to_mm(at.y_nm),
-                },
-                radius: radius.filter(|_| !custom),
+                at: at.unwrap_or(Point { x: 0.0, y: 0.0 }),
+                radius: radius.filter(|_| at.is_some()),
             });
         }
         if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
