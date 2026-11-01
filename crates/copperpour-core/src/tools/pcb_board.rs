@@ -1284,7 +1284,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "set_active_layer",
-            "Make a layer the PCB editor's active layer, as clicking it in the Appearance panel does, on a board open in KiCad. Reads the active layer back and reports it with the previous one. Editor state only: it never writes the board file and never writes an (active_layer ...) token, which KiCad 10 board files do not support. Returns unsupported_capability when the board is not open in KiCad, or when KiCad does not handle the command.",
+            "Make a layer the PCB editor's active layer, as clicking it in the Appearance panel does, on a board open in KiCad. Reads the active layer back and reports it with the previous one. No Copperpour tool uses the active layer: pass `layer` explicitly to tools that draw or route. Its only effect is where the person's next item drawn by hand in KiCad goes, so tell the user you changed it (and restore `previous` when done). Editor state only: it never writes the board file and never writes an (active_layer ...) token, which KiCad 10 board files do not support. Returns editor_unavailable when the board is not open in KiCad, and unsupported_capability when KiCad does not handle the command.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2425,8 +2425,24 @@ async fn handle_set_active_layer(
             ),
         )
     };
+    // Board-state refusals are `editor_unavailable`, as for the other
+    // live-only tools: opening the board fixes them. `unsupported_capability`
+    // is kept for a KiCad that does not handle the command (review 3).
+    let unavailable = |reason: String| {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::EditorUnavailable {
+                editor: "pcb".to_string(),
+                reason: reason.clone(),
+            },
+            format!(
+                "Cannot set active layer '{name}' for '{}': {reason}. The board file is never \
+                 written by this tool.",
+                board_path.display()
+            ),
+        )
+    };
     let not_open = |answer: String| {
-        unsupported(format!(
+        unavailable(format!(
             "the active layer is PCB editor state, and KiCad does not hold this board open \
              ({answer}); open it in KiCad first"
         ))
@@ -2512,12 +2528,13 @@ async fn handle_set_active_layer(
         )),
         LiveBoard::Answered(ActiveLayerChange::Busy(status)) => CallToolResult::error(format!(
             "KiCad is busy with another operation ({status}) and changed nothing. Calling \
-             set_active_layer again when it finishes is safe. The board file is never written by \
-             this tool."
+             set_active_layer again once is safe. If KiCad stays busy, a dialog in KiCad is \
+             usually waiting for a person: report that to the user instead of repeating. The \
+             board file is never written by this tool."
         )),
         // Each refusal says only what KiCad's answer established (review 2).
         LiveBoard::NotOpen { message, .. } => not_open(message),
-        LiveBoard::Unserved { absence, .. } => unsupported(format!(
+        LiveBoard::Unserved { absence, .. } => unavailable(format!(
             "the active layer is PCB editor state, and KiCad is running but {}{}",
             absence.observed(),
             match absence {
@@ -2525,11 +2542,11 @@ async fn handle_set_active_layer(
                 crate::tools::BoardEditorAbsence::OpenDocumentsUnimplemented => "",
             }
         )),
-        LiveBoard::NeverReached(message) => unsupported(format!(
+        LiveBoard::NeverReached(message) => unavailable(format!(
             "KiCad could not be reached over IPC ({message}); start KiCad with the API enabled \
              and open the board"
         )),
-        LiveBoard::LostAfterObservation { situation, .. } => unsupported(format!(
+        LiveBoard::LostAfterObservation { situation, .. } => unavailable(format!(
             "{situation} ({}); reopen the board in KiCad and call again",
             super::live_board::PREVIOUSLY_OBSERVED_LIVE
         )),
@@ -2609,8 +2626,7 @@ mod active_layer_refusal_tests {
 
         assert!(result.is_error);
         let body = body(&result);
-        assert_eq!(body["error"]["kind"], "unsupported_capability");
-        assert_eq!(body["error"]["capability"], "set_active_layer");
+        assert_eq!(body["error"]["kind"], "editor_unavailable");
         assert!(body["message"]
             .as_str()
             .unwrap()
@@ -2931,6 +2947,8 @@ mod active_layer_refusal_tests {
         assert_eq!(tool.board_access, BoardAccess::LiveOnly);
         assert!(tool.description.contains("unsupported_capability"));
         assert!(tool.description.contains("never writes"));
+        // No other tool reads the active layer; the caller is told (review 3).
+        assert!(tool.description.contains("pass `layer` explicitly"));
         assert!(!tool.description.contains("recorded in the board file"));
     }
 }

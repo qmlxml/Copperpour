@@ -5,9 +5,13 @@
 - Measured on stock KiCad 10.0.7 (2026-11-01): `GetActiveLayer` and `SetActiveLayer` are handled and
   a change reads back. Now, on a board open in KiCad, the tool sets the layer, reads it back, and
   returns `{active_layer, previous, changed, source: "ipc_readback"}`.
-- Still `unsupported_capability`: a board not open in KiCad, or KiCad not reachable (the active layer
-  is editor state and is never written to the file), and a KiCad that answers the command as
-  unhandled. A layer the board does not enable (KiCad answers `AS_BAD_REQUEST`) is
+- A board not open in KiCad, no PCB editor, or KiCad not reachable is now `editor_unavailable`
+  (`editor: "pcb"`), as for the other live-only tools: opening the board fixes it. Callers that
+  treated the old `unsupported_capability` as "never works" should open the board and call again.
+  `unsupported_capability` remains only for a KiCad that answers the command as unhandled.
+- No Copperpour tool uses the active layer: tools that draw or route take `layer` (default F.Cu or
+  F.SilkS). Setting it only changes where the person's next item drawn by hand goes; the tool
+  description tells the caller to say so to the user and to restore `previous`. A layer the board does not enable (KiCad answers `AS_BAD_REQUEST`) is
   `invalid_argument` on `layer`. A timeout, or a read-back that fails after KiCad accepted the
   change, is `ipc_outcome_unknown` with `retry_safe: true`: repeating the call is safe. `previous`
   and `changed` are `null` when the layer read first is not a known layer.

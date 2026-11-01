@@ -151,13 +151,17 @@ Each entry names where it was found, what is wrong, and the condition that close
   wrong; `RunAction` `common.Control.zoomFitScreen` is handled (`RAS_OK`). **`GetVisibleLayers`
   fails an internal KiCad assertion** (`ToProtoEnum<PCB_LAYER_ID>`, a visible layer with no protocol
   value), opens one modal dialog per such layer and blocks every later command until a person closes
-  them. So per the plan: `set_active_layer` (done 2026-11-01, `docs/development/2026-11-01-07-Set_active_layer.md`)
-  is implemented. **`run_editor_action` is not** (decided 2026-11-01, 2 models agree): `RunAction`
-  returns only a status, so view actions (the only ones measured safe from dialogs) give an LLM
-  caller nothing it can see, while the tool name would be permanent public API promising more than a
-  fixed list can provide. Revisit if a tool needs KiCad to show a result to a person; `set_layer_visibility` is not, on KiCad 10.0.7, because reading the visible layers can
-  leave KiCad waiting for a person (Rule B). Closing condition for the rest: that implementation, with
-  the full review cycle.
+  them. Outcome per tool:
+  - `set_active_layer`: implemented 2026-11-01
+    (`docs/development/2026-11-01-07-Set_active_layer.md`). Closed.
+  - `set_layer_visibility`: not implemented on KiCad 10.0.7, because reading the visible layers can
+    leave KiCad waiting for a person (Rule B); a fix is proposed to KiCad in `docs/upstream/`.
+    Closing condition: a KiCad release in which `GetVisibleLayers` no longer asserts.
+  - `run_editor_action`: not implemented (decided 2026-11-01, 2 models agree): `RunAction` returns
+    only a status, so view actions, the only ones measured safe from dialogs, give an LLM caller
+    nothing it can see; the tool name would be permanent public API promising more than a fixed list
+    provides; and `editor_navigation.rs` already excludes raw `RunAction` strings by design (#395).
+    Closing condition: a tool that needs KiCad to show a result to a person.
 
 - **Sheet files sharing symbol UUIDs** (step 4b): the flags of every sheet file go into one set, so
   if one sheet file is a copy of another under a different name, a flag in one excludes the matching

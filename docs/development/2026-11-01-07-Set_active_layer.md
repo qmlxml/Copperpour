@@ -81,3 +81,28 @@ change with a failed read-back reported as accepted). Fixed:
 
 Gate (`logs/gate-set-active-layer-fix2.summary`): 3,744 passed (+1), 1 failed (the known baseline
 failure), 113 ignored.
+Committed as `ef263151`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+Confirmed: no skill file mentions the tool or the active layer; no other tool uses `RunAction`; no
+new state needs a person to leave it. Fixed:
+
+1. **No Copperpour tool reads the active layer** (tools that draw or route default to F.Cu or
+   F.SilkS), so an LLM that sets B.Cu and then routes without `layer` gets F.Cu with no warning, and
+   the only real effect is on where the person's next hand-drawn item goes. The description now says
+   so: pass `layer` explicitly, tell the user, restore `previous`. The catalogue test pins it.
+2. **Board-state refusals used `unsupported_capability`**, which other live tools reserve for "the
+   KiCad cannot do this"; a caller that had learned the old permanent refusal would never open the
+   board. They are now `editor_unavailable` (`editor: "pcb"`); `unsupported_capability` remains for
+   an unhandled command. Migration note updated.
+3. **A persistent busy state could make an LLM repeat the call indefinitely** (KiCad stays busy while
+   a dialog waits for a person): the message now says to repeat once, then report to the user.
+4. The backlog entry for `f517fd8` lists each of the three tools with its own outcome and closing
+   condition.
+5. The decision not to implement `run_editor_action` is in the overnight-decisions record, with both
+   opinions and the #395 reference.
+6. The probe's comment is in the past tense.
+
+Gate (`logs/gate-set-active-layer-fix3.summary`): 3,744 passed, 1 failed (the known baseline
+failure), 113 ignored.

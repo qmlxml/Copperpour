@@ -8251,9 +8251,9 @@ mod stackup_tests {
 /// Measures whether a stock KiCad answers the editor commands the wilfredo-a14
 /// fork's `f517fd8` relies on (owner ruling 2026-11-01: measure before any
 /// narrow implementation of `set_active_layer`, `set_layer_visibility` and
-/// `run_editor_action`). Copperpour's `set_active_layer` refuses on the claim
-/// that the stable protocol has no supported active-layer mutation; the proto
-/// declares `GetActiveLayer`/`SetActiveLayer`, so one of the two is wrong.
+/// `run_editor_action`). Copperpour's `set_active_layer` then refused on the
+/// claim that the stable protocol had no supported active-layer mutation; this
+/// probe showed the claim wrong, and the tool now uses the commands.
 ///
 /// Changes nothing in the design: each "set" sends back the value just read,
 /// and the action only zooms the view. Prints one line per command. The

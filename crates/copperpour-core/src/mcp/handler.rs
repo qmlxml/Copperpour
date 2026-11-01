@@ -1383,8 +1383,8 @@ mod active_layer_dispatch_tests {
             .expect("tool returns JSON text");
         let body: Value = serde_json::from_str(text).expect("tool body is JSON");
 
-        assert_eq!(body["error"]["kind"], "unsupported_capability");
-        assert_eq!(body["error"]["capability"], "set_active_layer");
+        assert_eq!(body["error"]["kind"], "editor_unavailable");
+        assert_eq!(body["error"]["editor"], "pcb");
         assert_eq!(std::fs::read(&board).unwrap(), original);
     }
 }
