@@ -2,8 +2,10 @@
 
 Owner review of overnight decision 1 (2026-11-01; the second reviewer second opinion; 2 models agree): MODIFY.
 Since step 4's review 3, a part in KiCad's netlist with no line in its SPICE netlist was listed as
-`excluded_in_schematic`, with a warning saying the schematic marks it excluded. That was inferred: a
-connector or test point with no model was told the same, which was false.
+`excluded_in_schematic`, with a warning saying the schematic marks it excluded. That was inferred,
+not read. (The premise that a part with no model has no line was wrong: review 1 measured that
+KiCad 10.0.7 gives such a part a `REF __REF` line; parts with no line were, in four demos, all
+excluded by a symbol or sheet flag.)
 
 ## Implementation
 
@@ -27,3 +29,31 @@ connector or test point with no model was told the same, which was false.
 The first gate run failed the documentation test on the skill's `not_in_spice_netlist`; it was added
 to `NOT_TOOLS` beside `excluded_in_schematic`. Gate (`logs/gate-step4b.summary`): 3,736 passed (+2),
 1 failed (the known baseline failure), 110 ignored.
+
+Committed as `bbbe1252`.
+
+## Review 1 (implementation) and fix pass 1
+
+Measured by the reviewer with kicad-cli 10.0.7 on complex_hierarchy, pic_programmer, ecc83 and q17:
+a netlist part's own `tstamps` is the placed symbol's `uuid`; a sheet used twice shares symbol
+UUIDs between its instances; a multi-unit part has one string per unit, and flagging one unit drops
+the whole part; a library symbol's flag and `dnp` have no effect. Fixed:
+
+1. **A sheet instance flagged `exclude_from_sim` was not read**: KiCad dropped its 29 parts and they
+   were reported as unexplained. `sim_exclusions` now also reads `(sheet …)` flags, `Component`
+   keeps its `sheetpath` UUIDs, and a part counts as excluded when its symbol or a sheet on its path
+   is flagged. Live test `the_parts_of_a_sheet_excluded_from_simulation_are_reported_as_excluded`
+   (complex_hierarchy, `ampli_ht_vertical` flagged, the horizontal instance not); control: with the
+   sheet match disabled it fails.
+2. **The `not_in_spice_netlist` reason was wrong** ("usually no model"): now "for a reason the
+   schematic does not show"; the migration note, skill and this log corrected.
+3. The UUID test uses KiCad's real form, one string per unit.
+4. The split is a pure function, `split_missing_parts`, with a unit test
+   (`missing_parts_are_split_by_symbol_and_sheet_flags`) on the measured shapes; the rectifier live
+   test also asserts that `not_in_spice_netlist` is empty.
+5. The `#` reference filter is removed: KiCad's netlist holds no power symbols, and it could only hide
+   a part.
+6. Design variants are recorded in `docs/BACKLOG.md`.
+
+Gate (`logs/gate-step4b-fix1.summary`): 3,737 passed (+1), 1 failed (the known baseline failure),
+111 ignored (+1, the new live test).

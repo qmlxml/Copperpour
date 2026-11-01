@@ -1647,6 +1647,7 @@ mod tests {
             has_sim_fields: false,
             sim_params: None,
             symbol_uuids: Vec::new(),
+            sheet_path_uuids: Vec::new(),
         };
         let kicad = KiCadNetlist {
             components: vec![
@@ -1768,6 +1769,7 @@ mod tests {
             has_sim_fields: false,
             sim_params: None,
             symbol_uuids: Vec::new(),
+            sheet_path_uuids: Vec::new(),
         }
     }
 
@@ -2734,6 +2736,7 @@ mod tests {
             has_sim_fields,
             sim_params: None,
             symbol_uuids: Vec::new(),
+            sheet_path_uuids: Vec::new(),
         };
         let kicad = KiCadNetlist {
             components: vec![
@@ -2766,6 +2769,7 @@ mod tests {
             has_sim_fields: true,
             sim_params,
             symbol_uuids: Vec::new(),
+            sheet_path_uuids: Vec::new(),
         };
         let kicad = KiCadNetlist {
             components: vec![

@@ -228,6 +228,43 @@ fn file_names(dir: &Path) -> Vec<String> {
     names
 }
 
+/// A sheet instance marked "exclude from simulation" drops every part of that
+/// instance from KiCad's SPICE export, while the same sheet's other instance
+/// keeps them. Those parts are excluded by the schematic and must be reported
+/// as such, not as unexplained (step 4b review 1, measured: the
+/// complex_hierarchy demo's `ampli_ht_vertical` instance holds 29 parts).
+#[test]
+#[ignore = "needs KiCad 10 and KICAD_DEMOS"]
+fn the_parts_of_a_sheet_excluded_from_simulation_are_reported_as_excluded() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("complex_hierarchy"), project.path());
+    let schematic = project.path().join("complex_hierarchy.kicad_sch");
+    let text = std::fs::read_to_string(&schematic).unwrap();
+    let name = text
+        .find("(property \"Sheetname\" \"ampli_ht_vertical\"")
+        .expect("the ampli_ht_vertical sheet");
+    let flag = "(exclude_from_sim no)";
+    let at = text[..name].rfind(flag).expect("the sheet's own flag");
+    let sheet = text[..name].rfind("(sheet").unwrap();
+    assert!(at > sheet, "the flag belongs to that sheet node");
+    let edited = format!(
+        "{}(exclude_from_sim yes){}",
+        &text[..at],
+        &text[at + flag.len()..]
+    );
+    std::fs::write(&schematic, edited).unwrap();
+
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({ "schematic": schematic }),
+    );
+    let excluded = report["excluded_in_schematic"]["total"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(excluded >= 29, "{report}");
+    assert!(report.get("not_in_spice_netlist").is_none(), "{report}");
+}
+
 /// A part the schematic marks "exclude from simulation" vanishes from KiCad's
 /// SPICE export. It must be named, and the circuit must not read `as_drawn`
 /// (found by review 3 of plan step 4; measured on the rectifier demo, where
@@ -262,8 +299,16 @@ fn a_part_excluded_in_the_schematic_is_named_and_the_circuit_is_modified() {
         "{report}"
     );
 
+    // A part flagged on its symbol is not reported as unexplained (step 4b).
+    assert!(report.get("not_in_spice_netlist").is_none(), "{report}");
+
     let result = run_operating_point(project.path(), "rectifier.kicad_sch");
     assert_eq!(result["simulated_circuit"], "modified", "{result}");
+    assert_eq!(
+        result["circuit"]["not_in_spice_netlist"],
+        json!([]),
+        "{result}"
+    );
     assert_eq!(
         result["circuit"]["excluded_in_schematic"],
         json!(["R2"]),

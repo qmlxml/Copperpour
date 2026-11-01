@@ -1336,8 +1336,9 @@ impl RunEnd<'_> {
         if !self.design.not_in_spice_netlist.is_empty() {
             warnings.push(json!({
                 "code": "not_in_spice_netlist",
-                "detail": "These parts have no line in KiCad's SPICE netlist, usually because they \
-                           have no simulation model, so they were not simulated. The result is not \
+                "detail": "These parts have no line in KiCad's SPICE netlist for a reason the \
+                           schematic does not show (neither their symbol nor their sheet is marked \
+                           exclude from simulation), so they were not simulated. The result is not \
                            evidence about them.",
                 "items": self.design.not_in_spice_netlist,
             }));
@@ -1662,12 +1663,34 @@ fn allowed_roots(project_dir: &Path, model_dirs: &[PathBuf]) -> (Vec<PathBuf>, V
     (roots, ignored)
 }
 
-/// UUIDs of placed symbols flagged `(exclude_from_sim yes)` in the sheet
-/// files under `dir` (the snapshot's copy). A file that cannot be read or
-/// parsed contributes nothing; its parts are then reported as
-/// `not_in_spice_netlist`, which still marks the result `modified`.
-fn sim_excluded_symbols(dir: &Path) -> std::collections::HashSet<String> {
-    let mut flagged = std::collections::HashSet::new();
+/// What the sheet files under `dir` (the snapshot's copy) flag
+/// `(exclude_from_sim yes)`: placed symbols and sheet instances, by UUID. A
+/// file that cannot be read or parsed contributes nothing; its parts are then
+/// reported as `not_in_spice_netlist`, which still marks the result
+/// `modified`.
+#[derive(Debug, Default, PartialEq)]
+struct SimExclusions {
+    symbols: std::collections::HashSet<String>,
+    sheets: std::collections::HashSet<String>,
+}
+
+impl SimExclusions {
+    /// Whether the schematic itself excludes `component`: its symbol is
+    /// flagged, or a sheet instance on its path is.
+    fn excludes(&self, component: &crate::simulation::kicad_netlist::Component) -> bool {
+        component
+            .symbol_uuids
+            .iter()
+            .any(|uuid| self.symbols.contains(uuid))
+            || component
+                .sheet_path_uuids
+                .iter()
+                .any(|uuid| self.sheets.contains(uuid))
+    }
+}
+
+fn sim_exclusions(dir: &Path) -> SimExclusions {
+    let mut found = SimExclusions::default();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1688,18 +1711,41 @@ fn sim_excluded_symbols(dir: &Path) -> std::collections::HashSet<String> {
             else {
                 continue;
             };
-            // Placed symbols are direct children of the sheet; library
-            // symbols sit under `lib_symbols` and are not visited.
-            for symbol in tree.find_all("symbol") {
-                if symbol.find_str("exclude_from_sim") == Some("yes") {
-                    if let Some(uuid) = symbol.find_str("uuid") {
-                        flagged.insert(uuid.to_owned());
+            // Placed symbols and sheets are direct children of the sheet;
+            // library symbols sit under `lib_symbols` and are not visited.
+            for (tag, into) in [("symbol", &mut found.symbols), ("sheet", &mut found.sheets)] {
+                for node in tree.find_all(tag) {
+                    if node.find_str("exclude_from_sim") == Some("yes") {
+                        if let Some(uuid) = node.find_str("uuid") {
+                            into.insert(uuid.to_owned());
+                        }
                     }
                 }
             }
         }
     }
-    flagged
+    found
+}
+
+/// Split the parts KiCad's SPICE netlist has no line for: those the
+/// schematic excludes (symbol or sheet flag) and the rest. Pure, so it is
+/// tested without kicad-cli.
+fn split_missing_parts(
+    kicad: &crate::simulation::kicad_netlist::KiCadNetlist,
+    elements: &[crate::simulation::kicad_netlist::ElementEntry],
+    exclusions: &SimExclusions,
+) -> (Vec<String>, Vec<String>) {
+    let flagged: std::collections::HashSet<&str> = kicad
+        .components
+        .iter()
+        .filter(|component| exclusions.excludes(component))
+        .map(|component| component.reference.as_str())
+        .collect();
+    elements
+        .iter()
+        .filter(|element| element.element_name.is_none())
+        .map(|element| element.reference.clone())
+        .partition(|reference| flagged.contains(reference.as_str()))
 }
 
 async fn inspect_design(
@@ -1762,26 +1808,11 @@ async fn inspect_design(
             has_testbench_lines: !inputs.testbench.spice_lines.is_empty(),
         })
     });
-    // Parts missing from what ran, split by whether the schematic itself flags
-    // them: KiCad's netlist does not carry the flag, so it is read from the
-    // snapshot's sheet files and matched by symbol UUID.
-    let flagged = sim_excluded_symbols(&source);
-    let flagged_references: std::collections::HashSet<&str> = kicad
-        .components
-        .iter()
-        .filter(|component| {
-            component
-                .symbol_uuids
-                .iter()
-                .any(|uuid| flagged.contains(uuid))
-        })
-        .map(|component| component.reference.as_str())
-        .collect();
-    let (excluded_in_schematic, not_in_spice_netlist): (Vec<String>, Vec<String>) = elements
-        .iter()
-        .filter(|element| element.element_name.is_none() && !element.reference.starts_with('#'))
-        .map(|element| element.reference.clone())
-        .partition(|reference| flagged_references.contains(reference.as_str()));
+    // Parts missing from what ran, split by whether the schematic itself
+    // excludes them: KiCad's netlist does not carry the flag, so it is read
+    // from the snapshot's sheet files and matched by symbol and sheet UUID.
+    let (excluded_in_schematic, not_in_spice_netlist) =
+        split_missing_parts(&kicad, &elements, &sim_exclusions(&source));
     let inlined = deck.as_ref().map_or(&[][..], |deck| &deck.inlined_files);
     let inputs_hash = inputs_hash(sources_hash, inlined)?;
     Ok(Design {
@@ -2023,18 +2054,20 @@ mod tests {
         }
     }
 
-    /// The flag is read from the sheet files: only placed symbols marked
-    /// `(exclude_from_sim yes)` count, in any sheet of the snapshot, and a
-    /// library symbol's own flag does not (owner review of overnight
-    /// decision 1).
+    /// The flags are read from the sheet files: placed symbols and sheet
+    /// instances marked `(exclude_from_sim yes)`, in any sheet of the
+    /// snapshot; a library symbol's own flag does not count (owner review of
+    /// overnight decision 1; step 4b review 1 for the sheet flag).
     #[test]
-    fn sim_excluded_symbols_reads_placed_symbols_in_every_sheet() {
+    fn sim_exclusions_reads_symbols_and_sheets_in_every_sheet_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("top.kicad_sch"),
             "(kicad_sch (lib_symbols (symbol \"Device:R\" (exclude_from_sim yes))) \
              (symbol (lib_id \"Device:R\") (exclude_from_sim yes) (uuid \"u-flagged\")) \
-             (symbol (lib_id \"Device:R\") (exclude_from_sim no) (uuid \"u-kept\")))",
+             (symbol (lib_id \"Device:R\") (exclude_from_sim no) (uuid \"u-kept\")) \
+             (sheet (exclude_from_sim yes) (uuid \"s-off\")) \
+             (sheet (exclude_from_sim no) (uuid \"s-on\")))",
         )
         .unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
@@ -2044,14 +2077,64 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("broken.kicad_sch"), "(kicad_sch (").unwrap();
-        let flagged = sim_excluded_symbols(dir.path());
-        assert_eq!(
-            flagged,
-            ["u-flagged", "u-child"]
+        let found = sim_exclusions(dir.path());
+        let set = |items: &[&str]| items.iter().map(|item| item.to_string()).collect();
+        assert_eq!(found.symbols, set(&["u-flagged", "u-child"]));
+        assert_eq!(found.sheets, set(&["s-off"]));
+    }
+
+    /// The split, without kicad-cli (step 4b review 1), on the shapes
+    /// measured in KiCad 10.0.7's complex_hierarchy demo: a symbol shared by
+    /// two instances of one sheet, a multi-unit part with one unit flagged,
+    /// and one instance of a sheet used twice flagged as a whole.
+    #[test]
+    fn missing_parts_are_split_by_symbol_and_sheet_flags() {
+        use crate::simulation::kicad_netlist::{Component, ElementEntry, KiCadNetlist};
+        let part = |reference: &str, symbols: &[&str], path: &[&str]| Component {
+            reference: reference.to_string(),
+            value: String::new(),
+            lib_id: None,
+            has_sim_fields: false,
+            sim_params: None,
+            symbol_uuids: symbols.iter().map(|uuid| uuid.to_string()).collect(),
+            sheet_path_uuids: path.iter().map(|uuid| uuid.to_string()).collect(),
+        };
+        let kicad = KiCadNetlist {
+            components: vec![
+                part("C201", &["u-shared"], &["s-h"]),
+                part("C301", &["u-shared"], &["s-v"]),
+                part("U201", &["u-a", "u-b"], &["s-h"]),
+                part("R401", &["u-r"], &["s-v"]),
+                part("R1", &["u-plain"], &[]),
+                part("R2", &["u-ran"], &[]),
+            ],
+            nets: Vec::new(),
+            library_parts: Vec::new(),
+        };
+        let missing = |reference: &str| ElementEntry {
+            reference: reference.to_string(),
+            element_name: None,
+            modelled: false,
+            excluded: false,
+        };
+        let mut elements: Vec<ElementEntry> = ["C201", "C301", "U201", "R401", "R1"]
+            .into_iter()
+            .map(missing)
+            .collect();
+        elements.push(ElementEntry {
+            element_name: Some("R2".to_string()),
+            ..missing("R2")
+        });
+        let exclusions = SimExclusions {
+            symbols: ["u-shared", "u-b"]
                 .into_iter()
                 .map(str::to_string)
-                .collect()
-        );
+                .collect(),
+            sheets: ["s-v"].into_iter().map(str::to_string).collect(),
+        };
+        let (excluded, unexplained) = split_missing_parts(&kicad, &elements, &exclusions);
+        assert_eq!(excluded, ["C201", "C301", "U201", "R401"]);
+        assert_eq!(unexplained, ["R1"]);
     }
 
     #[test]

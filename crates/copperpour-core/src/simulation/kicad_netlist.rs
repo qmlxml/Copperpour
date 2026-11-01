@@ -23,6 +23,11 @@ pub(crate) struct Component {
     /// does not carry `exclude_from_sim`, so the flag is matched by these
     /// against the schematic files (owner review of overnight decision 1).
     pub symbol_uuids: Vec<String>,
+    /// The UUIDs of the sheet instances on the part's path (`sheetpath`
+    /// `tstamps`, "/a/b/"), so a sheet flagged `exclude_from_sim` excludes
+    /// the parts of that one instance (step 4b review 1, measured: KiCad drops
+    /// every part of a flagged sheet instance).
+    pub sheet_path_uuids: Vec<String>,
 }
 
 /// What a library symbol carries, which a placed symbol may not have copied.
@@ -138,6 +143,14 @@ fn component(node: &SexpNode) -> Result<Component> {
         .flat_map(str::split_whitespace)
         .map(str::to_owned)
         .collect();
+    let sheet_path_uuids = node
+        .find("sheetpath")
+        .and_then(|path| path.find_str("tstamps"))
+        .unwrap_or_default()
+        .split('/')
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_owned)
+        .collect();
     Ok(Component {
         reference: required(node, "ref")?,
         value: node.find_str("value").unwrap_or_default().to_owned(),
@@ -145,6 +158,7 @@ fn component(node: &SexpNode) -> Result<Component> {
         has_sim_fields,
         sim_params,
         symbol_uuids,
+        sheet_path_uuids,
     })
 }
 
@@ -309,10 +323,14 @@ mod tests {
     #[test]
     fn a_component_keeps_its_symbol_uuids() {
         let node = copperpour_sexp::parse_sexp(
-            "(comp (ref \"R2\") (value \"100k\") (tstamps \"u-1 u-2\"))",
+            "(comp (ref \"U201\") (value \"x\") \
+             (sheetpath (names \"/a/\") (tstamps \"/s-1/s-2/\")) (tstamps \"u-1\" \"u-2\"))",
         )
         .unwrap();
-        assert_eq!(component(&node).unwrap().symbol_uuids, ["u-1", "u-2"]);
+        // KiCad writes one string per unit (measured on complex_hierarchy).
+        let part = component(&node).unwrap();
+        assert_eq!(part.symbol_uuids, ["u-1", "u-2"]);
+        assert_eq!(part.sheet_path_uuids, ["s-1", "s-2"]);
     }
 
     #[test]
@@ -423,6 +441,7 @@ mod tests {
             has_sim_fields: false,
             sim_params: None,
             symbol_uuids: Vec::new(),
+            sheet_path_uuids: Vec::new(),
         };
         let kicad = KiCadNetlist {
             components: vec![component("R7"), component("VR7"), component("BT1")],
@@ -446,6 +465,7 @@ mod tests {
                 has_sim_fields: false,
                 sim_params: None,
                 symbol_uuids: Vec::new(),
+                sheet_path_uuids: Vec::new(),
             }],
             nets: Vec::new(),
             library_parts: Vec::new(),

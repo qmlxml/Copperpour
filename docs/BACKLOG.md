@@ -145,6 +145,11 @@ Each entry names where it was found, what is wrong, and the condition that close
   `activity-hook`, the custom IPC messages, the dispatch-path and live-editor changes, `d2961f4`.
   Revisit the rest if the owner adopts the modified KiCad build. Waiting for: a live KiCad session.
 
+- **Design variants and `exclude_from_sim`** (step 4b): kicad-cli 10.0.7 exports the default variant;
+  whether a variant can change a part's `exclude_from_sim` per instance, and so make the flag read
+  from the sheet files disagree with the export, is not measured (no demo has variants). Closing
+  condition: measured on a schematic with variants.
+
 ## PCB sync and library data (plan step 7)
 
 - **A pad's reach ignores a pad-stack offset**: KiCad's IPC `PadStack` and `PadStackLayer` messages
