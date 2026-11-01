@@ -12,7 +12,9 @@ Each entry names where it was found, what is wrong, and the condition that close
 - **~~No Windows CI job.~~ Corrected 2026-11-01:** Copperpour's CI `check` job runs
   `cargo check --workspace` and the unit and integration tests on `windows-latest` as well as Linux
   and macOS (`.github/workflows/ci.yml`, job `check`, matrix `os`), which compiles the Windows-only
-  module. It runs only when the branch is pushed to GitHub with Actions enabled.
+  module. It runs only on a push to `main` or a pull request into `main`
+  (`ci.yml` lines 3-7), and only once Actions is enabled on the fork; pushing `integration` alone runs
+  nothing.
 - **Windows build not checked.** `crates/copperpour/src/live_editor.rs` was adapted at the merge but
   not compiled for Windows: `cargo check --target x86_64-pc-windows-gnu` needs the MinGW C compiler
   for `nng-sys`. Closing condition: the module compiles for a Windows target.
