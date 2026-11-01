@@ -171,7 +171,7 @@ fn cli_candidates() -> Vec<PathBuf> {
             PathBuf::from("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
             PathBuf::from("/usr/local/bin/kicad-cli"),
         ];
-        if let Some(home) = crate::app_dirs::home_dir() {
+        for home in install_homes() {
             paths.push(home.join("Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"));
         }
         paths
@@ -226,7 +226,7 @@ pub fn share_roots() -> Vec<PathBuf> {
         );
         push_existing_unique(&mut roots, PathBuf::from("/usr/local/share/kicad"));
         push_existing_unique(&mut roots, PathBuf::from("/opt/homebrew/share/kicad"));
-        if let Some(home) = crate::app_dirs::home_dir() {
+        for home in install_homes() {
             push_existing_unique(
                 &mut roots,
                 home.join("Applications/KiCad/KiCad.app/Contents/SharedSupport"),
@@ -245,7 +245,7 @@ pub fn share_roots() -> Vec<PathBuf> {
         ] {
             push_existing_unique(&mut roots, root);
         }
-        if let Some(home) = crate::app_dirs::home_dir() {
+        for home in install_homes() {
             push_existing_unique(
                 &mut roots,
                 home.join(
@@ -465,6 +465,24 @@ fn windows_registry_install_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Homes searched for a per-user KiCad installation: the user's home, and,
+/// in Copperpour's own test processes, the developer's real home
+/// (`COPPERPOUR_TEST_REAL_HOME`, set by `copperpour-test-home`), so a KiCad
+/// installed for one user is still found while tests run with a temporary
+/// `HOME` (review 1 of the test-isolation change). The variable only adds a
+/// place to look; it is never written to.
+#[allow(dead_code)]
+fn install_homes() -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> = crate::app_dirs::home_dir().into_iter().collect();
+    if let Some(real) = std::env::var_os("COPPERPOUR_TEST_REAL_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && !homes.contains(path))
+    {
+        homes.push(real);
+    }
+    homes
+}
+
 #[cfg(test)]
 mod ngspice_tests {
     use super::*;
@@ -550,6 +568,18 @@ mod ngspice_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In a test process `HOME` is temporary (copperpour-test-home), and a
+    /// KiCad installed for one user is still looked for under the real home.
+    #[test]
+    fn a_per_user_installation_is_searched_in_the_real_home_too() {
+        let real = std::env::var_os("COPPERPOUR_TEST_REAL_HOME").map(PathBuf::from);
+        let homes = install_homes();
+        assert_eq!(homes.first().cloned(), crate::app_dirs::home_dir());
+        if let Some(real) = real.filter(|real| Some(real) != crate::app_dirs::home_dir().as_ref()) {
+            assert!(homes.contains(&real), "{homes:?}");
+        }
+    }
 
     /// With a relative `HOME`, no per-user KiCad root, `kicad-cli` or native
     /// bridge directory is found below the working directory, even one

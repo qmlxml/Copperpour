@@ -14,9 +14,10 @@
 //! empty directory and fails if anything appears in it, which catches a test
 //! binary that does not call this, and doctests, which cannot.
 //!
-//! Remaining gap, stated rather than hidden: on Windows `dirs` reads the
+//! Remaining gaps, stated rather than hidden: on Windows `dirs` reads the
 //! known-folder API, not these variables, for `data_local_dir`, which only
-//! `native_specctra_bridge.rs` uses for state.
+//! `native_specctra_bridge.rs` uses for state; and kicad-cli on Windows may
+//! still use the real profile's cache folder.
 
 use std::path::{Path, PathBuf};
 
@@ -24,20 +25,41 @@ use std::path::{Path, PathBuf};
 /// itself; [`isolate`] then leaves them alone.
 pub const UNCHANGED: &str = "COPPERPOUR_TEST_HOME_UNCHANGED";
 
-/// The directory every test process shares: `<temp>/copperpour-test-home`.
-/// Shared rather than per process, so repeated runs reuse it instead of
-/// leaving one directory per process; document locks in it keep working
-/// across processes as they do in a real home.
+/// The developer's own home, as it was before [`isolate`] changed `HOME`.
+/// For tests that must find a per-user KiCad installation or KiCad's real
+/// model cache (review 1 of this change): only those read it.
+pub const REAL_HOME: &str = "COPPERPOUR_TEST_REAL_HOME";
+
+/// The directory every test process of this checkout shares:
+/// `<target>/copperpour-test-home`, found from the test binary's own path
+/// (`<target>/<profile>/deps/<binary>`). Under the build directory rather than
+/// the system temporary directory, so it belongs to this user and checkout:
+/// a fixed name in a shared `/tmp` could be created first by another user,
+/// even as a link into this user's home (review 1). `cargo clean` removes it,
+/// and the gate empties it before each run so runs do not depend on earlier
+/// ones. Falls back to the temporary directory with the user's name when the
+/// binary's path has no such shape.
 pub fn root() -> PathBuf {
-    std::env::temp_dir().join("copperpour-test-home")
+    let from_exe = std::env::current_exe().ok().and_then(|exe| {
+        let deps = exe.parent()?;
+        (deps.file_name()? == "deps").then(|| deps.parent()?.parent().map(Path::to_path_buf))?
+    });
+    from_exe
+        .map(|target| target.join("copperpour-test-home"))
+        .unwrap_or_else(|| {
+            let user = std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "user".into());
+            std::env::temp_dir().join(format!("copperpour-test-home-{user}"))
+        })
 }
 
 /// Point `HOME`, the XDG directories, the Windows profile folders, KiCad's
-/// configuration directory and `COPPERPOUR_STATE_DIR` at [`root`], keeping
-/// `RUSTUP_HOME` and `CARGO_HOME` where they were (without that, a child
-/// `cargo` or `rustup` looks for its toolchain under the new home and
-/// downloads one there; measured). Call it only from a constructor that runs
-/// before any thread.
+/// configuration and documents directories and `COPPERPOUR_STATE_DIR` at
+/// [`root`], keeping `RUSTUP_HOME` and `CARGO_HOME` where they were (without
+/// that, a child `cargo` or `rustup` looks for its toolchain under the new home
+/// and downloads one there; measured), and recording the real home in
+/// [`REAL_HOME`]. Call it only from a constructor that runs before any thread.
 ///
 /// Does nothing when [`UNCHANGED`] is set to `1`: a test that re-runs its own
 /// binary with a deliberate `HOME` (relative, unset, or its own temporary
@@ -47,10 +69,28 @@ pub fn isolate() {
         return;
     }
     let root = root();
-    if let Some(real_home) = std::env::var_os("HOME").map(PathBuf::from) {
+    // Only an absolute home is trusted: a relative one would pin the toolchain
+    // relative to the working directory (review 1).
+    if let Some(real_home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+    {
         keep(&real_home, "RUSTUP_HOME", ".rustup");
         keep(&real_home, "CARGO_HOME", ".cargo");
+        if std::env::var_os(REAL_HOME).is_none() {
+            std::env::set_var(REAL_HOME, &real_home);
+        }
     }
+    // KiCad appends its version folder (`10.0`) to KICAD_CONFIG_HOME
+    // (measured with kicad-cli 10.0.7), so it is set to the same `kicad` base
+    // Copperpour reads KiCad's global tables from (`kicad_config_base`), and
+    // the two read one configuration, as in a real home.
+    #[cfg(target_os = "windows")]
+    let kicad_config = "appdata/roaming/kicad";
+    #[cfg(target_os = "macos")]
+    let kicad_config = "home/Library/Preferences/kicad";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let kicad_config = "home/.config/kicad";
     let dirs = [
         ("HOME", "home"),
         ("USERPROFILE", "home"),
@@ -60,7 +100,9 @@ pub fn isolate() {
         ("XDG_CACHE_HOME", "home/.cache"),
         ("APPDATA", "appdata/roaming"),
         ("LOCALAPPDATA", "appdata/local"),
-        ("KICAD_CONFIG_HOME", "kicad-config"),
+        ("KICAD_CONFIG_HOME", kicad_config),
+        // On Windows kicad-cli would otherwise use the real Documents folder.
+        ("KICAD_DOCUMENTS_HOME", "home/Documents/KiCad"),
         ("COPPERPOUR_STATE_DIR", "copperpour-state"),
     ];
     for (variable, relative) in dirs {
@@ -94,6 +136,10 @@ mod tests {
             super::isolate();
             let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
             assert!(home.starts_with(super::root()), "{home:?}");
+            assert_eq!(
+                std::env::var_os(super::REAL_HOME).map(std::path::PathBuf::from),
+                real_home.clone().filter(|home| home.is_absolute())
+            );
             assert_ne!(Some(home.clone()), real_home);
             for variable in ["XDG_DATA_HOME", "COPPERPOUR_STATE_DIR", "KICAD_CONFIG_HOME"] {
                 let path = std::path::PathBuf::from(std::env::var_os(variable).unwrap());

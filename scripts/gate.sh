@@ -62,11 +62,17 @@ check_space
 # directories set to an empty directory, and the gate fails if anything is written
 # there. RUSTUP_HOME and CARGO_HOME stay on the real ones: without them rustup
 # downloads a toolchain into the empty home (measured).
-real_home="$HOME"
+real_home="${HOME:?gate: HOME is not set}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
 export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
-gate_home="$(mktemp -d "${TMPDIR:-/tmp}/copperpour-gate-home.XXXXXX")"
+gate_home="$(mktemp -d "${TMPDIR:-/tmp}/copperpour-gate-home.XXXXXX")" || {
+    echo "gate: could not create a temporary HOME" | tee -a "$summary"
+    exit 2
+}
 export HOME="$gate_home"
+# The tests' shared directory (crates/copperpour-test-home) starts empty, so a
+# run does not depend on what an earlier run left there.
+rm -rf "$CARGO_TARGET_DIR/copperpour-test-home"
 unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME
 
 status=0

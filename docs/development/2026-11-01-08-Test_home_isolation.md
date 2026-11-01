@@ -27,8 +27,8 @@ run ended and under another session's activity; its API setting was intact.)
 
 - New workspace crate `copperpour-test-home` (`publish = false`): `isolate()` points `HOME`,
   `USERPROFILE`, the four XDG directories, `APPDATA`, `LOCALAPPDATA`, `KICAD_CONFIG_HOME` and
-  `COPPERPOUR_STATE_DIR` at `<temp>/copperpour-test-home` (shared by all test processes, so runs do
-  not leave one directory each), keeping `RUSTUP_HOME`/`CARGO_HOME` on the real ones. It does nothing
+  `COPPERPOUR_STATE_DIR` at a directory shared by all test processes (first `<temp>/copperpour-test-home`;
+  moved to `<target>/copperpour-test-home` in fix pass 1), keeping `RUSTUP_HOME`/`CARGO_HOME` on the real ones. It does nothing
   when `COPPERPOUR_TEST_HOME_UNCHANGED=1`.
 - Every test binary (each crate's library tests, copperpour's `main.rs` tests, 29 integration test
   files, the schematic viewer) calls it from `#[ctor::ctor(unsafe)]`, which runs before any test
@@ -55,3 +55,36 @@ run ended and under another session's activity; its API setting was intact.)
 - Gate (`logs/gate-test-home.summary`): 3,747 passed, 0 failed, 113 ignored, `home-untouched` PASS.
 - Remaining (in `docs/BACKLOG.md`): CI does not run the empty-`HOME` check yet; on Windows the
   native Specctra bridge directory is not redirected.
+
+Committed as `274ba449`.
+
+## Review 1 (implementation, robustness, intent) and fix pass 1
+
+Confirmed: every test binary is covered (29 integration files, each library's unit tests,
+`copperpour`'s `main.rs`, the viewer); `src/bin/konnect.rs` has no tests. Fixed:
+
+1. **A KiCad installed for one user was no longer found** (user flatpak, `~/Applications/KiCad`):
+   kicad-cli tests would print SKIP and pass without running. `isolate()` records the real home in
+   `COPPERPOUR_TEST_REAL_HOME`, and `kicad_install::install_homes` searches it as well as `HOME`.
+   Test `a_per_user_installation_is_searched_in_the_real_home_too`.
+2. **The macOS simulation live test read KiCad's model cache from the temporary `HOME`**: it reads
+   the real home from that variable.
+3. **Copperpour and kicad-cli read different KiCad configurations in tests**: `KICAD_CONFIG_HOME` had
+   its own folder, while Copperpour reads the global tables from `<HOME>/.config/kicad`. Measured:
+   KiCad appends its version folder (`10.0`) to `KICAD_CONFIG_HOME`, so it is now set to the same
+   `kicad` base Copperpour reads, per platform.
+4. **A fixed folder in the shared `/tmp`** could be created first by another user, even as a link
+   into this user's home: the shared directory is now `<target>/copperpour-test-home`, found from the
+   test binary's path (per user and checkout; `cargo clean` removes it), with a per-user temporary
+   folder as fallback.
+5. **Runs could depend on earlier runs** (KiCad configuration, Freerouting state, ever-growing lock
+   files): the gate empties the shared directory before testing.
+6. The toolchain variables are pinned only from an absolute `HOME`.
+7. `KICAD_DOCUMENTS_HOME` is set too, for kicad-cli on Windows; the remaining Windows gaps are
+   stated in the crate's documentation.
+8. `gate.sh` stops cleanly when `HOME` is unset or the temporary home cannot be created.
+9. CI does not run the empty-`HOME` check: kept in `docs/BACKLOG.md` (it can be added and watched
+   only once the branch is pushed).
+
+Gate (`logs/gate-test-home-fix1.summary`): 3,748 passed, 0 failed, 113 ignored, `home-untouched`
+PASS.

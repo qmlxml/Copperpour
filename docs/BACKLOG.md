@@ -225,7 +225,7 @@ Each entry names where it was found, what is wrong, and the condition that close
 
 - **~~Tests write into the developer's real state directories.~~ Fixed 2026-11-01**
   (`docs/development/2026-11-01-08-Test_home_isolation.md`): every test binary points its per-user
-  directories at `<temp>/copperpour-test-home`, and `scripts/gate.sh` fails if anything is written
+  directories at `<target>/copperpour-test-home`, and `scripts/gate.sh` fails if anything is written
   to the empty `HOME` it runs with. Remaining: the CI workflow does not run the empty-`HOME` check
   (it changes only once the branch can be pushed and CI watched); on Windows the native Specctra
   bridge's directory (`dirs::data_local_dir`) is not redirected by any variable.

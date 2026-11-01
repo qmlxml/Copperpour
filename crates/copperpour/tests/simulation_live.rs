@@ -463,7 +463,13 @@ fn project_files(root: &Path) -> Vec<PathBuf> {
 #[test]
 #[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
 fn every_simulation_demo_flattens_or_names_its_export_failure() {
-    let kicad_cache = PathBuf::from(std::env::var_os("HOME").unwrap()).join("Library/Caches/KiCad");
+    // KiCad's real model cache: HOME is the test's temporary one (see
+    // copperpour-test-home), so the developer's home is read from the variable
+    // that records it.
+    let real_home = std::env::var_os("COPPERPOUR_TEST_REAL_HOME")
+        .or_else(|| std::env::var_os("HOME"))
+        .unwrap();
+    let kicad_cache = PathBuf::from(real_home).join("Library/Caches/KiCad");
     let model_dirs = format!("ngspice_model_dirs = [{:?}]\n", kicad_cache);
     let mut vetted = 0;
     let mut failures: Vec<String> = Vec::new();
