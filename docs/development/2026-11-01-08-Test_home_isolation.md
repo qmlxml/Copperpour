@@ -127,3 +127,30 @@ tree starts threads, by reading). Fixed:
 
 Gate (`logs/gate-test-home-fix2.summary`): 3,748 passed, 0 failed, 113 ignored, `home-untouched`
 PASS; nothing left in `/tmp` or the build directory afterwards.
+Committed as `5224f95f`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+Confirmed: no test skips more than before (skips depend on system share roots, `KICAD_*`,
+`KICAD_DEMOS` and `KICAD_CLI`, none on the home; library lookup falls back to the installation's
+own libraries); the only production change is `install_homes` reading `COPPERPOUR_TEST_REAL_HOME`.
+Fixed:
+
+1. **A test file without the call was caught only by `scripts/gate.sh`**, which contributors are not
+   told to run, and not by CI. New test `every_test_binary_calls_isolate` (in
+   `copperpour-test-home`) reads every `tests/*.rs` and the `src/lib.rs`/`src/main.rs` of each crate
+   with unit tests and fails, naming the files, under plain `cargo test`. Control: with the call
+   removed from `copperpour-render/tests/kicad_svg_test.rs` it fails naming that file.
+2. **The gate cannot see that a test skipped** (`cargo test` hides a passing test's output; the gate
+   logs before and after hold the same 25 "skip" matches, all test names): predates this change,
+   recorded in `docs/BACKLOG.md`.
+3. The macOS ngspice search under a per-user KiCad read `HOME`: it uses `install_homes()`.
+4. The test-only variables are documented in `DEV.md` (environment variables are public API).
+5. The limit for a process started with its environment cleared (no `HOME`, so `dirs` falls back to
+   the real home, which the gate's check cannot see) is stated in the crate documentation.
+6. `CONTRIBUTING.md` says how to run a test against the real home on purpose
+   (`COPPERPOUR_TEST_HOME_UNCHANGED=1`).
+7. The Windows `e2e-kicad` workflow has not run with the isolation: recorded in `docs/BACKLOG.md`.
+
+Gate (`logs/gate-test-home-fix3.summary`): 3,749 passed (+1), 0 failed, 113 ignored,
+`home-untouched` PASS.

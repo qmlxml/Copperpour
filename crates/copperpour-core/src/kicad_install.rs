@@ -131,10 +131,8 @@ fn ngspice_candidates() -> Vec<PathBuf> {
         let mut dirs = vec![PathBuf::from(
             "/Applications/KiCad/KiCad.app/Contents/PlugIns/sim",
         )];
-        if let Some(home) = std::env::var_os("HOME") {
-            dirs.push(
-                PathBuf::from(home).join("Applications/KiCad/KiCad.app/Contents/PlugIns/sim"),
-            );
+        for home in install_homes() {
+            dirs.push(home.join("Applications/KiCad/KiCad.app/Contents/PlugIns/sim"));
         }
         dirs.push(PathBuf::from("/opt/homebrew/lib"));
         dirs.push(PathBuf::from("/usr/local/lib"));

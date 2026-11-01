@@ -21,7 +21,14 @@
 //! here (`COPPERPOUR_STATE_DIR`, `APPDATA` read directly); and kicad-cli on
 //! Windows may still use the real profile's cache folder. `UNCHANGED` is
 //! inherited by grandchildren and, if exported in a shell, turns isolation off
-//! for the whole run; the gate's empty-home check is what would show it.
+//! for the whole run; the gate's empty-home check is what would show it. A
+//! process started with its environment cleared and not carrying
+//! `COPPERPOUR_TEST_HOME_ROOT` (the simulation worker launched by a test
+//! server) has no `HOME` at all, so `dirs` falls back to the account's real
+//! home, which the gate's check cannot see; nothing measured writes there.
+//!
+//! The test `every_test_binary_calls_isolate` (below) runs under plain
+//! `cargo test`, so CI catches a test binary added without the call.
 
 use std::path::{Path, PathBuf};
 
@@ -158,6 +165,77 @@ fn keep(real_home: &Path, variable: &str, leaf: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// Every test binary of the workspace and the schematic viewer calls
+    /// `isolate()`: each `tests/*.rs`, and the `src/lib.rs` or `src/main.rs` of
+    /// every crate with unit tests. Reads the sources only, so it runs (and
+    /// fails, naming the files) under plain `cargo test` and in CI, where the
+    /// gate's empty-home check does not run (review 3 of this change).
+    #[test]
+    fn every_test_binary_calls_isolate() {
+        use std::path::Path;
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let has_unit_tests = |src: &Path| -> bool {
+            let mut stack = vec![src.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.extension().is_some_and(|ext| ext == "rs")
+                        && std::fs::read_to_string(&path)
+                            .is_ok_and(|text| text.contains("#[cfg(test)]"))
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        let mut missing = Vec::new();
+        let mut checked = 0;
+        for entry in std::fs::read_dir(crates).unwrap().flatten() {
+            let krate = entry.path();
+            if krate
+                .file_name()
+                .is_some_and(|name| name == "copperpour-test-home")
+            {
+                continue;
+            }
+            let mut must: Vec<std::path::PathBuf> = std::fs::read_dir(krate.join("tests"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+                .collect();
+            if has_unit_tests(&krate.join("src")) {
+                for root in ["src/lib.rs", "src/main.rs"] {
+                    let path = krate.join(root);
+                    if path.is_file() {
+                        must.push(path);
+                    }
+                }
+            }
+            for path in must {
+                checked += 1;
+                let text = std::fs::read_to_string(&path).unwrap();
+                if !text.contains("copperpour_test_home::isolate()") {
+                    missing.push(path.strip_prefix(crates).unwrap().display().to_string());
+                }
+            }
+        }
+        assert!(
+            checked >= 36,
+            "only {checked} test binaries found under {crates:?}"
+        );
+        assert!(
+            missing.is_empty(),
+            "these test binaries do not call copperpour_test_home::isolate() from a \
+             #[ctor::ctor(unsafe)] function (see CONTRIBUTING.md), so their tests write into the \
+             developer's home: {missing:#?}"
+        );
+    }
+
     /// `isolate` changes the process environment, so it runs in a child: this
     /// test binary re-runs itself with a marker variable, and the child checks
     /// what `isolate` set.

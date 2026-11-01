@@ -226,9 +226,16 @@ Each entry names where it was found, what is wrong, and the condition that close
 - **~~Tests write into the developer's real state directories.~~ Fixed 2026-11-01**
   (`docs/development/2026-11-01-08-Test_home_isolation.md`): every test binary points its per-user
   directories at `<target>/copperpour-test-home`, and `scripts/gate.sh` fails if anything is written
-  to the empty `HOME` it runs with. Remaining: the CI workflow does not run the empty-`HOME` check
-  (it changes only once the branch can be pushed and CI watched); on Windows the native Specctra
-  bridge's directory (`dirs::data_local_dir`) is not redirected by any variable.
+  to the empty `HOME` it runs with; `every_test_binary_calls_isolate` catches a test file without
+  the call under plain `cargo test`, so in CI too. Remaining: CI does not run the empty-`HOME` check
+  itself (it changes only once the branch can be pushed and CI watched); on Windows `dirs` ignores
+  the profile variables, so the native Specctra bridge's directory and kicad-cli's cache are not
+  redirected; the Windows `e2e-kicad` workflow has not been run with the isolation (run it by
+  `workflow_dispatch` before a release).
+- **A test that skips counts as a pass, and the gate cannot see skips**: `cargo test` hides the
+  `SKIP:` output of passing tests (measured: the gate logs before and after the test-isolation change
+  hold the same 25 "skip" matches, all test names). No test skips more since that change (read by
+  review). Closing condition: skip messages counted by one helper and reported in the gate summary.
 - **Document lock files are never removed** (`copperpour-sexp/src/writer.rs:588,613-618`): one empty
   file per distinct document path ever written, so the count grows without limit, slowly in normal
   use. Keeping them is deliberate: deleting a lock file another process holds would let the next

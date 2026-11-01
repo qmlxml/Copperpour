@@ -330,6 +330,13 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 | `copperpour-ipc` unit | Protobuf builders, client messages, rigid-body child transform |
 | `crates/copperpour/tests/` | stdio protocol, doc/asset count guards, transaction CLI, `#[ignore]`d live-KiCad tests |
 
+Tests never use the developer's home: every test binary calls `copperpour_test_home::isolate()`
+before any test runs (CONTRIBUTING.md). Test-only environment variables, not part of the server's
+configuration: `COPPERPOUR_TEST_HOME_ROOT` (the shared directory, default
+`target/copperpour-test-home`), `COPPERPOUR_TEST_REAL_HOME` (the developer's real home, recorded for
+tests that must find a per-user KiCad; the server only adds it as one more place to look for an
+installation) and `COPPERPOUR_TEST_HOME_UNCHANGED=1` (turns the isolation off).
+
 `schematic-viewer` is in `[workspace] exclude`, so `--workspace` never builds it; CI's
 `viewer` job runs its `cargo check` and `cargo test`. Locally:
 `cd crates/schematic-viewer && cargo test`. Its unit tests cover the pure logic

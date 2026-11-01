@@ -162,8 +162,11 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
   `target/copperpour-test-home`; `COPPERPOUR_TEST_REAL_HOME` keeps the real home for the few
   tests that must find a per-user KiCad installation. Without it, tests write document locks, call logs and kicad-cli's KiCad
   configuration into the real home. A test that re-runs its own binary with a deliberate `HOME`
-  sets `COPPERPOUR_TEST_HOME_UNCHANGED=1` on that child. `scripts/gate.sh` runs the suite with an
-  empty `HOME` and fails if anything is written there.
+  sets `COPPERPOUR_TEST_HOME_UNCHANGED=1` on that child. The test
+  `every_test_binary_calls_isolate` (in `copperpour-test-home`) fails under plain `cargo test`, naming
+  any test file without the call; `scripts/gate.sh` also runs the suite with an empty `HOME` and
+  fails if anything is written there. To debug a test against your real KiCad configuration, run it
+  with `COPPERPOUR_TEST_HOME_UNCHANGED=1`: it then writes into your home.
 - **A fixture test that fails only on your machine** may be reading a stale
   copy. Fixtures are `-text`, but a checkout made before that rule keeps the
   line endings `core.autocrlf` gave it, `git status` stays clean, and
