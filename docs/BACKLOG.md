@@ -225,16 +225,18 @@ Each entry names where it was found, what is wrong, and the condition that close
 
 ## Before the first push (owner ruling 2026-11-01)
 
-- **Rewrite the commit identity before `integration` is pushed anywhere.** Owner ruling: the e-mail
-  `qmlxml@gmail.com` is to appear only with the name "Vasyl Melnichuk". Measured 2026-11-01: all
-  149 commits on `integration` have "another name" as committer, and 87 also as author (the other
-  62 keep their fork authors: Yuval Tal 29, Pierre Grasswill 18, wilfredo-a14 11, halthinks 2,
-  AryanSenthil 1, Marcus Junström 1); no commit message contains that name. Rewrite author and
-  committer "another name" to "Vasyl Melnichuk <qmlxml@gmail.com>", leaving other authors as
-  they are (for example with `git filter-repo --mailmap`, on a copy of the branch first), then check
-  `git log --format='%an %ae %cn %ce'`. Since 2026-11-01 this repository's own identity is
-  Vasyl Melnichuk, so later commits need no rewrite. Closing condition: done, and checked, before
-  the first push.
+- **Rewrite the commit identity and messages before `integration` is pushed anywhere.** Owner
+  rulings 2026-11-01: the e-mail `qmlxml@gmail.com` appears only with the name "Vasyl Melnichuk";
+  the owner's commits never name AI tools, in messages or in the development documents (product code
+  that names a supported MCP client stays); Copperpour's own published commits on `main` are not
+  changed. A trial on a copy passed on 2026-11-01 (a first attempt without a range dropped the
+  signatures of 473 of `main`'s commits and changed their IDs; the rewrite is now limited to
+  `main..integration`). The procedure is a script kept outside the repository, because its search
+  patterns name the tools: `~/.local/share/copperpour-publish/rewrite_before_push.sh <repository>
+  <work-dir>`. It works on a copy, rewrites author and committer, removes the tool trailers from
+  messages, rewords the development documents in every version, adds a commit updating the 82 quoted
+  commit IDs, and prints its checks. Since 2026-11-01 this repository's own identity is
+  Vasyl Melnichuk. Closing condition: run, checked by the owner, before the first push.
 
 ## Test isolation and state files (found 2026-11-01)
 
