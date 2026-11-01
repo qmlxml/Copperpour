@@ -789,11 +789,14 @@ fn freerouting_log_path() -> Option<PathBuf> {
 /// `$XDG_STATE_HOME/freerouting`, else `~/.local/state/freerouting`: where
 /// Freerouting already keeps its logs.
 fn freerouting_state_dir() -> Option<PathBuf> {
+    // A relative XDG_STATE_HOME is ignored, as the XDG specification says, and
+    // HOME comes through Copperpour's helper, which refuses a relative HOME
+    // (#171): either would put crash reports under the working directory,
+    // which is the project (merge review, plan step 5).
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
-        })?;
+        .filter(|path| path.is_absolute())
+        .or_else(|| crate::app_dirs::home_dir().map(|home| home.join(".local/state")))?;
     Some(state.join("freerouting"))
 }
 

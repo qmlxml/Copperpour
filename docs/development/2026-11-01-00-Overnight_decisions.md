@@ -19,3 +19,14 @@ listed here with where it is recorded, so it can be confirmed or changed. Nothin
 4. **The engine-not-found message** names the configuration key and that a server restart is needed (`reload_server` also works with the stdio transport on Unix).
 
 Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
+
+## Step 5 (daGrumpf-bxp, Freerouting), review 1
+
+5. **HTTP clients get no progress notifications.** The contribution broadcast them to every open
+   event stream, which leaked one client's progress to another; removed rather than rebuilt per
+   request. Reverse: restore the `sse_senders` loop in `progress_reporter` (handler.rs).
+6. **`route_specctra_dsn` keeps `success: true` when Freerouting's log could not be read**, with the
+   new `unrouted_connections_checked: false` and a message that completeness is unknown. The
+   alternative was to report such runs as failures.
+7. **The CPL policy id changed to `konnect-jlcpcb-cpl-v2`** because the rule set changed. Reverse:
+   the `policy_id` in `jlcpcb_cpl_corrections_v1.json`.

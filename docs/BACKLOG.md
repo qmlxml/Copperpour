@@ -72,6 +72,19 @@ Each entry names where it was found, what is wrong, and the condition that close
 - **Between the include size check and the read a file could be swapped** past the 64 MiB inline
   limit. Closing condition: read with a bound instead of checking first.
 
+## Freerouting (plan step 5)
+
+- **No progress over the HTTP transport.** The contribution broadcast progress to every open GET
+  event stream (other clients received it); that was removed when merged. Closing condition:
+  progress sent on the POST request's own response stream, as the MCP Streamable HTTP
+  specification describes.
+- **Freerouting's log is looked for only where Freerouting keeps it on Linux** (or at
+  `FREEROUTING_LOG`), so on macOS and Windows unrouted connections are never counted and
+  `optimize_seconds` never takes effect. Closing condition: the log location on each platform, or a
+  count taken from the SES itself.
+- **Building the Freerouting command in a unit test creates `~/.local/state/freerouting`** in the
+  real home directory. Closing condition: the state directory injected in tests.
+
 ## Custom-shape pads (plan step 1, not merged)
 
 - **Footprints with custom-shape pads cannot be placed** (about 3.9% of KiCad's library). KiCad's

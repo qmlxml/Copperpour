@@ -3206,6 +3206,22 @@ async fn handle_route_specctra_dsn(
         let optimize = args["optimize_seconds"].as_u64().unwrap_or(0);
         900u64.saturating_add(optimize).min(86_400)
     });
+    // With no overall_timeout_seconds given, a very large optimize_seconds
+    // leaves the capped default no time for routing. Name the argument the
+    // caller sent, not one they did not (merge review, plan step 5).
+    if args["overall_timeout_seconds"].is_null() {
+        if let Some(optimize) = args["optimize_seconds"].as_u64() {
+            if overall_timeout_seconds <= optimize {
+                return Ok(crate::tools::invalid_arg(
+                    "optimize_seconds",
+                    &format!(
+                        "{optimize} s leaves no time for routing within the 86400 s limit on one \
+                         call; lower it, or set overall_timeout_seconds above it"
+                    ),
+                ));
+            }
+        }
+    }
     // Freerouting does not find these rules in the DSN; without them it
     // routes to its own defaults, or with none at all through its job API.
     let project = route_project(args, &dsn)?;
@@ -3250,17 +3266,31 @@ async fn handle_route_specctra_dsn(
     // The SES is still written, for inspection. An unknown count (log not
     // readable) is not turned into a failure.
     let fully_routed = evidence.unrouted.is_none_or(|unrouted| unrouted == 0);
-    let message = (!fully_routed).then(|| {
-        format!(
+    let message = if !fully_routed {
+        Some(format!(
             "Freerouting left {} connection(s) unrouted; the SES at {} is incomplete",
             evidence.unrouted.unwrap_or_default(),
             ses_output.display()
-        )
-    });
+        ))
+    } else if evidence.unrouted.is_none() {
+        // Freerouting's log is looked for only where Freerouting keeps it on
+        // Linux (or at FREEROUTING_LOG), so elsewhere the count is unknown.
+        // Not a failure, but never a claim of a complete routing (merge
+        // review, plan step 5).
+        Some(format!(
+            "Freerouting's log could not be read, so whether every connection was routed is \
+             not known; check the SES at {} with plan_specctra_ses_import and DRC, or set \
+             FREEROUTING_LOG",
+            ses_output.display()
+        ))
+    } else {
+        None
+    };
     Ok(CallToolResult::json(&json!({
         "success": fully_routed,
         "message": message,
         "unrouted_connections": evidence.unrouted,
+        "unrouted_connections_checked": evidence.unrouted.is_some(),
         "method": "local_freerouting_native_mcp",
         "engine": {
             "name": "Freerouting",

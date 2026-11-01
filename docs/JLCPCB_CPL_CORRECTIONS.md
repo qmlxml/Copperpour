@@ -182,7 +182,7 @@ the Copperpour project and identifies its provenance in every response.
 
 ## Built-in rules
 
-`konnect-jlcpcb-cpl-v1`, observed on KiCad 10 library footprints:
+`konnect-jlcpcb-cpl-v2` (renamed from `-v1` when merged into this fork, because the rule set changed from 2 rules to 29; plan step 5), observed on KiCad 10 library footprints:
 
 | Footprints | Correction | Seen on |
 |---|---|---|

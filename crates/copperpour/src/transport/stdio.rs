@@ -40,16 +40,12 @@ pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
     // notifications/progress is emitted *during* a tool call, while this loop
     // is still awaiting handle_message, so it cannot wait for the drain below:
     // a separate task writes it as it arrives.
+    // This loop writes them itself while it waits (below), so a notification
+    // can never be written after the response it belongs to: a separate
+    // writer task could still hold one when the response went out (merge
+    // review, plan step 5).
     let (immediate_tx, mut immediate_rx) = mpsc::channel::<String>(64);
     handler.register_immediate_sink(immediate_tx);
-    let immediate_out = stdout.clone();
-    tokio::spawn(async move {
-        while let Some(notif) = immediate_rx.recv().await {
-            if write_line(&immediate_out, notif).await.is_err() {
-                break;
-            }
-        }
-    });
 
     loop {
         line.clear();
@@ -68,7 +64,24 @@ pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
         debug!("STDIO recv: {}", trimmed);
 
         let response = match serde_json::from_str::<Value>(trimmed) {
-            Ok(msg) => handler.handle_message(msg).await,
+            Ok(msg) => {
+                let call = handler.handle_message(msg);
+                tokio::pin!(call);
+                let response = loop {
+                    tokio::select! {
+                        biased;
+                        response = &mut call => break response,
+                        Some(notif) = immediate_rx.recv() => {
+                            write_line(&stdout, notif).await?;
+                        }
+                    }
+                };
+                // Progress queued just before the call returned goes first.
+                while let Ok(notif) = immediate_rx.try_recv() {
+                    write_line(&stdout, notif).await?;
+                }
+                response
+            }
             Err(e) => {
                 error!("Failed to parse JSON: {}", e);
                 Some(JsonRpcResponse::error(

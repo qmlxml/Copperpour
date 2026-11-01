@@ -43,3 +43,41 @@ builds; `Cargo.lock` unchanged.
 Gate after the merge (`logs/gate-step5-merge.summary`): 3,685 passed (+31), 1 failed (the known
 baseline failure), 109 ignored. A first run failed fmt (the merged test was not formatted) and
 Copperpour's count test, which read a phrase in the step 4 log as a stale toolset count; both fixed.
+Committed as `c9f429c`.
+
+## Review 1 (implementation, focused on the merge) and fix pass 1
+
+The three conflict resolutions were confirmed correct (all JVM options before `-jar` in every
+command built). Findings and what was done:
+
+1. **The Freerouting state directory read `HOME` directly** (and accepted a relative
+   `XDG_STATE_HOME`), so with a relative `HOME` crash reports went under the project, which the
+   contribution meant to prevent. Now uses `app_dirs::home_dir()` and ignores a relative
+   `XDG_STATE_HOME`.
+2. **On macOS and Windows unrouted connections are never counted**, and the result read as a
+   complete routing. `success` keeps its meaning (the job finished), but the response now has
+   `unrouted_connections_checked`, and `message` says completeness is unknown when it is false.
+   The missing log locations are recorded in `docs/BACKLOG.md`.
+3. **No migration notes**: added `docs/api-migrations/freerouting-route-specctra-dsn.md` and
+   `docs/api-migrations/jlcpcb-cpl-rotations-v2.md`; tool-directory rows for `check_freerouting` and
+   `route_specctra_dsn` updated.
+4. **The CPL rule set grew from 2 rules to 29 under the same policy id.** Renamed
+   `konnect-jlcpcb-cpl-v2` so responses tell the two apart; the migration note says which parts now
+   rotate differently. (The step log above said the id "is data the code reads"; the code only
+   reports it.)
+5. **Progress over HTTP was broadcast to every open GET event stream**, so one client received
+   another's progress. The broadcast is removed; HTTP clients get no progress; per-request streams
+   recorded in `docs/BACKLOG.md`.
+6. **On stdio a progress notification could be written after its response**: a separate writer task
+   could still hold it. The task is removed; the main loop writes progress while it waits for the
+   call (`tokio::select!`) and drains what is left before writing the response.
+7. **A large `optimize_seconds` with no `overall_timeout_seconds` was refused naming
+   `overall_timeout_seconds`**, which the caller never sent. Now refused as an invalid
+   `optimize_seconds` with the reason.
+8. `plane_nets` drops non-string entries; the schema check at dispatch refuses them first (array of
+   strings). No change.
+
+Not covered by new tests: 1 (would change environment variables shared by every test in the
+process), 2 and 7 (need a Freerouting installation or the full handler), 5 and 6 (need a transport
+test with a tool that reports progress). Gate (`logs/gate-step5-fix1.summary`): 3,685 passed,
+1 failed (the known baseline failure), 109 ignored.

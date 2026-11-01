@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_id": "konnect-jlcpcb-cpl-v1",
+  "policy_id": "konnect-jlcpcb-cpl-v2",
   "provenance": "KiCad 10 library footprints compared with JLCPCB Component Placements (2D top view): Konnect issue #518 board, 2026-09-10; grumpf-bord, 2026-10-30. Every verified rule carries its observations; unverified families only raise warnings.",
   "rotation_insensitive_prefixes": [
     "R_",

@@ -180,17 +180,15 @@ impl McpHandler {
     ) -> Option<crate::progress::ProgressReporter> {
         let token = params.progress_token()?.clone();
         let sinks = self.immediate_sinks.clone();
-        let sse = self.sse_senders.clone();
+        // Progress goes only to the stdio transport's immediate sink. It is
+        // not broadcast to HTTP GET event streams: those belong to every
+        // client, so one client would receive another's progress, and a client
+        // that opened none would get nothing anyway (merge review, plan step 5;
+        // per-request streams are recorded in docs/BACKLOG.md).
         Some(crate::progress::ProgressReporter::new(token, move |json| {
             if let Ok(sinks) = sinks.read() {
                 for tx in sinks.iter() {
                     let _ = tx.try_send(json.clone());
-                }
-            }
-            if let Ok(senders) = sse.try_read() {
-                let event = Event::default().data(json);
-                for tx in senders.iter() {
-                    let _ = tx.try_send(event.clone());
                 }
             }
         }))
