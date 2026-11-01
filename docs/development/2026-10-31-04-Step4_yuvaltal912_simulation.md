@@ -151,3 +151,45 @@ The reviewer measured on this machine (Arch Linux, ngspice 47). Nothing found st
 
 Gate after fix pass 2 (`logs/gate-step4-fix2.summary`): 3,654 passed, 1 failed (the known baseline
 failure), 108 ignored. Simulation live tests: 47 passed.
+Committed as `131aa5a`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+No state the system can enter and not leave was found. Four ways a result could read as a pass
+while the circuit simulated differed from the schematic, and two exits that were hard to find.
+The owner was asleep; the corrections below report more and are easy to reverse, and are listed in
+`2026-11-01-00-Overnight_decisions.md` for the owner's review.
+
+1. **A part marked "exclude from simulation" vanished, and the result read `as_drawn`** (measured
+   on the rectifier demo with R2, the 100k load: the SPICE export loses its line; nothing in the
+   simulation code knew). Such parts (in the KiCad netlist, no SPICE element, not a `#` power
+   symbol) are now listed as `excluded_in_schematic` in the readiness report, in `circuit`, and as
+   a warning, and make `simulated_circuit` `modified`. Live test
+   `a_part_excluded_in_the_schematic_is_named_and_the_circuit_is_modified` (passes; control: with
+   the new condition removed it fails). SIMULATION_NOTES' open item updated.
+2. **The protection stand-ins' caveat was only in the skill.** New warning
+   `testbench_elements_added` whenever caller lines were added; the skill now says the fuse block
+   models melting I²t at one current only (no arc, never cools) and is not evidence that a real fuse
+   protects the circuit. The stand-in test now expects exactly this one warning.
+3. **A dropped `.control` block did not change anything reported where callers read.** New warning
+   `control_block_dropped`. The schematic's own analysis line (`.tran` etc.), which is always
+   replaced, is deliberately not warned about.
+4. **Approximations did not affect the reading of a result.** The skill now says an approximation
+   on a protection or inrush part means the result is not evidence about that part.
+5. **An open editor was reported only in `source_evidence`.** New warning
+   `schematic_open_in_editor`.
+6. **`engine_not_found` did not say how to recover.** The message and the skill now name
+   `ngspice_library`, the configuration file, and that a restart is needed (`reload_server` exists only with the stdio transport on Unix).
+7. Merge decisions checked: kill on timeout only for private copies (supported: the reviewer
+   measured a killed `kicad-cli pcb drc` leaving its lock), `stopped.instance` correct. `.op` not
+   haltable moved from SIMULATION_NOTES to `docs/BACKLOG.md`.
+- First gate after these changes: Copperpour's check `backticked_tool_names_in_prose_exist_in_the_registry`
+  rejected the new warning codes in the skill (it treats backticked names as tools) and
+  `reload_server` (a meta-tool offered only with the stdio transport on Unix). The codes were added
+  to its list of known non-tool words, `reload_server` beside the other meta-tools, and the skill
+  and message now say "restart the server (with the stdio transport on Unix, `reload_server` also
+  works)". Seven protection live tests asserted no warnings at all; they now expect exactly
+  `testbench_elements_added`.
+
+Gate after fix pass 3 (`logs/gate-step4-fix3.summary`): 3,654 passed, 1 failed (the known baseline
+failure), 109 ignored (+1, the new live test). Simulation live tests: 48 passed.

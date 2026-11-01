@@ -119,7 +119,7 @@ This harness gives 480.04 A and 2.399 V at the output, as 12 V over 20 mohm plus
 
 ### I²t fuse
 
-Opens for good once the integral of the current squared reaches `fz_rated`, in A²s. `v(fz_q)` is that integral. The fuse must sit in series, with `VFZS` in the path to read the current. The block includes the short, so it opens at 5 ms.
+Opens for good once the integral of the current squared reaches `fz_rated`, in A²s. `v(fz_q)` is that integral. This models melting I²t at one current only: it has no arc, so the energy let through downstream (clearing I²t) is understated, and it never cools, so at a modest overload it opens far sooner than a real fuse's time-current curve. Take clearing I²t and the time-current behaviour from the datasheet; a run where this block opens is not evidence that a real fuse protects the circuit. The fuse must sit in series, with `VFZS` in the path to read the current. The block includes the short, so it opens at 5 ms.
 
 ```
 * I2t fuse into a short. Your circuit supplies the supply, RSRC and the load.
@@ -215,9 +215,9 @@ Nothing in `testbench` touches the schematic. Use the `spice_name` values from r
 - **`outcome.status`:** `complete` means the requested range was covered and every measurement found its signal. `partial` means the data is real but stops early or a signal was missing, and `stopped.reason` says why it stopped: `timeout`, `size_limit`, `no_convergence` or `incomplete_coverage`.
 - **`analysis.coverage_ratio`:** how much of the requested time ran. On a partial run every measurement and summary carries `window_truncated: true`, because it describes only the part that ran. Say so, and never report such a peak as the run's peak. On a complete run the same flag means that measurement's window reached past the saved data, such as before `start_save_seconds`, so its number leaves out that stretch.
 - **`finding: "signal_not_found"`:** the run does not hold that signal. Only voltage sources keep their currents in circuits with digital parts, or with `.ic` or `.nodeset` under `use_initial_conditions`, and `device_currents_not_saved` says which. Digital nets have no `v()`.
-- **`simulated_circuit`:** `modified` means parts were excluded or added. Never present such a result as describing the schematic as drawn.
-- **`circuit.approximations`:** parts whose behaviour rests on an assumption. Say so when they matter.
-- **`warnings`:** read them. `engine_messages` lists what ngspice ignored or changed, which can alter the circuit. `device_currents_not_saved` means only node voltages and voltage source currents were saved.
+- **`simulated_circuit`:** `modified` means parts were excluded (by `exclude_references`, or by the schematic's own "exclude from simulation", listed in `circuit.excluded_in_schematic`) or added. Never present such a result as describing the schematic as drawn.
+- **`circuit.approximations`:** parts whose behaviour rests on an assumption, such as a varistor at its library default or a thermistor as an ideal resistor. A result with an approximation on a protection or inrush part is not evidence about that part; say so.
+- **`warnings`:** read them before reporting a result. `engine_messages` lists what ngspice ignored or changed, which can alter the circuit. `device_currents_not_saved` means only node voltages and voltage source currents were saved. `excluded_in_schematic` names parts that were not simulated. `testbench_elements_added` means results depend on lines you added, such as a stand-in: they describe those lines, not a real part. `control_block_dropped` means the schematic's `.control` block, which can change the circuit, was not run. `schematic_open_in_editor` means KiCad has the schematic open, and the result reflects the saved files, not unsaved edits.
 - **`operating_point.rows`:** currents read positive into a device's first pin, so a delivering source reads negative.
 - **Full data:** `artifacts.table_path` holds every row, and `artifacts.deck_path` holds the deck that ran.
 
@@ -239,7 +239,7 @@ Branch on `error.reason`, and show `error.items`.
 | `engine_failed` | The simulator stopped on a fatal error | Read `error.items` and the log |
 | `engine_crashed` | The simulator process died | The server is unaffected. Read the log |
 | `unbalanced_deck_block` | A `.if` or `.subckt` is left open | Close it. Check `spice_lines` first |
-| `engine_not_found` | No libngspice was found | Set `ngspice_library`, using the listed locations |
+| `engine_not_found` | No libngspice was found | Set `ngspice_library` in Copperpour's configuration file, using the listed locations, then restart the server (with the stdio transport on Unix, `reload_server` also works): the setting is read only at startup |
 
 A run that stops early with data is not an error. For `stopped.reason: "size_limit"`, raise `max_raw_bytes`, shorten the run or raise `max_step_seconds`. For `timeout`, do the same with `timeout_seconds`. For `no_convergence`, `stopped.node` (ngspice 44) or `stopped.instance` (ngspice 47) names where it failed; either may be absent if the engine named neither.
 

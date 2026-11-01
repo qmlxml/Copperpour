@@ -228,6 +228,57 @@ fn file_names(dir: &Path) -> Vec<String> {
     names
 }
 
+/// A part the schematic marks "exclude from simulation" vanishes from KiCad's
+/// SPICE export. It must be named, and the circuit must not read `as_drawn`
+/// (found by review 3 of plan step 4; measured on the rectifier demo, where
+/// R2 is the 100k load and its symbol holds the 13th `exclude_from_sim`).
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_part_excluded_in_the_schematic_is_named_and_the_circuit_is_modified() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let schematic = project.path().join("rectifier.kicad_sch");
+    let text = std::fs::read_to_string(&schematic).unwrap();
+    let flag = "(exclude_from_sim no)";
+    let at = text
+        .match_indices(flag)
+        .nth(12)
+        .expect("13 exclude_from_sim flags")
+        .0;
+    let edited = format!(
+        "{}(exclude_from_sim yes){}",
+        &text[..at],
+        &text[at + flag.len()..]
+    );
+    std::fs::write(&schematic, edited).unwrap();
+
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({ "schematic": schematic }),
+    );
+    assert_eq!(
+        report["excluded_in_schematic"]["items"],
+        json!(["R2"]),
+        "{report}"
+    );
+
+    let result = run_operating_point(project.path(), "rectifier.kicad_sch");
+    assert_eq!(result["simulated_circuit"], "modified", "{result}");
+    assert_eq!(
+        result["circuit"]["excluded_in_schematic"],
+        json!(["R2"]),
+        "{result}"
+    );
+    assert!(
+        result["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "excluded_in_schematic"),
+        "{result}"
+    );
+}
+
 #[test]
 #[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
 fn a_real_project_is_read_from_a_snapshot_and_left_untouched() {
@@ -1299,7 +1350,15 @@ fn transient(stop: f64, step: f64) -> Value {
 fn assert_clean_and_modified(result: &Value) {
     assert_eq!(result["outcome"]["status"], "complete", "{result}");
     assert_eq!(result["simulated_circuit"], "modified", "{result}");
-    assert_eq!(result["warnings"], json!([]), "{result}");
+    // A stand-in is caller lines, so the one warning is the disclosure that
+    // results depend on them (plan step 4, review 3).
+    let codes: Vec<&str> = result["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect();
+    assert_eq!(codes, ["testbench_elements_added"], "{result}");
     assert_eq!(result["analysis"]["coverage_ratio"], 1.0, "{result}");
 }
 
@@ -1541,7 +1600,13 @@ fn every_stand_in_runs_under_initial_conditions_and_keeps_its_device_currents() 
             .iter()
             .filter_map(|warning| warning["code"].as_str())
             .collect();
-        assert_eq!(codes, ["no_point_at_start"], "{name}: {result}");
+        let mut codes = codes;
+        codes.sort_unstable();
+        assert_eq!(
+            codes,
+            ["no_point_at_start", "testbench_elements_added"],
+            "{name}: {result}"
+        );
         near(
             measured(&result, "value"),
             expected,

@@ -654,7 +654,10 @@ async fn usable_engine(
         None,
         engine.searched_locations,
         format!(
-            "The simulator is not usable: {} {detail}",
+            "The simulator is not usable: {} {detail}. To point Copperpour at libngspice, set \
+             ngspice_library (and ngspice_code_models_dir if needed) in Copperpour's \
+             configuration file, then restart the server (with the stdio transport on Unix, \
+             reload_server also works): the setting is read only at startup.",
             engine.probe_status
         ),
     ))
@@ -1320,6 +1323,46 @@ impl RunEnd<'_> {
                 "items": messages,
             }));
         }
+        // Added when merged (plan step 4, review 3): differences between the
+        // schematic and what ran, reported where callers read.
+        if !self.design.excluded_in_schematic.is_empty() {
+            warnings.push(json!({
+                "code": "excluded_in_schematic",
+                "detail": "The schematic marks these parts \"exclude from simulation\", so they \
+                           were not simulated. The result is not evidence about them.",
+                "items": self.design.excluded_in_schematic,
+            }));
+        }
+        if !self.request.testbench.spice_lines.is_empty() {
+            warnings.push(json!({
+                "code": "testbench_elements_added",
+                "detail": "Lines the caller added were simulated with the circuit. Results that \
+                           depend on them describe those lines, not any real part, and are not \
+                           evidence that a protection part meets its rating.",
+            }));
+        }
+        // The schematic's own analysis line (.tran, .ac, ...) is always replaced
+        // by the requested one, so only a dropped .control block is reported.
+        if self
+            .deck
+            .dropped_directives
+            .iter()
+            .any(|directive| directive == ".control block")
+        {
+            warnings.push(json!({
+                "code": "control_block_dropped",
+                "detail": "The schematic's .control block was not run. It can hold commands \
+                           (alter, option, set) that change the circuit the schematic describes.",
+            }));
+        }
+        if !self.design.locks_present.is_empty() {
+            warnings.push(json!({
+                "code": "schematic_open_in_editor",
+                "detail": "KiCad has the schematic open. The simulation used the saved files, so \
+                           unsaved edits in the editor are not in this result.",
+                "items": self.design.locks_present,
+            }));
+        }
         if self.run.old_runs_kept > 0 {
             warnings.push(json!({
                 "code": "old_runs_kept",
@@ -1340,9 +1383,12 @@ impl RunEnd<'_> {
             .filter(|warning| APPROXIMATIONS.contains(&warning.code))
             .map(|warning| json!({ "code": warning.code, "items": warning.items }))
             .collect();
-        let modified = !design.excluded_references.is_empty() || !testbench.spice_lines.is_empty();
+        let modified = !design.excluded_references.is_empty()
+            || !design.excluded_in_schematic.is_empty()
+            || !testbench.spice_lines.is_empty();
         let circuit = json!({
             "excluded_references": design.excluded_references,
+            "excluded_in_schematic": design.excluded_in_schematic,
             "added_line_count": testbench.spice_lines.len(),
             "dropped_directives": self.deck.dropped_directives,
             "approximations": approximations,
@@ -1518,6 +1564,12 @@ struct Design {
     deck: Result<FlatDeck, Refusal>,
     ignored_model_dirs: Vec<String>,
     excluded_references: Vec<String>,
+    /// Components the schematic itself keeps out of the simulation (KiCad's
+    /// "exclude from simulation"): in the KiCad netlist, but with no element in
+    /// the SPICE netlist. Power symbols (`#...`) are not listed. Added when
+    /// merged (plan step 4, review 3): such parts used to vanish while the
+    /// result still read `as_drawn`.
+    excluded_in_schematic: Vec<String>,
     preflight: Option<Preflight>,
     project_dir: PathBuf,
     inputs_hash: String,
@@ -1655,9 +1707,15 @@ async fn inspect_design(
             has_testbench_lines: !inputs.testbench.spice_lines.is_empty(),
         })
     });
+    let excluded_in_schematic: Vec<String> = elements
+        .iter()
+        .filter(|element| element.element_name.is_none() && !element.reference.starts_with('#'))
+        .map(|element| element.reference.clone())
+        .collect();
     let inlined = deck.as_ref().map_or(&[][..], |deck| &deck.inlined_files);
     let inputs_hash = inputs_hash(sources_hash, inlined)?;
     Ok(Design {
+        excluded_in_schematic,
         compatibility,
         inputs_hash,
         project_dir,
@@ -1795,6 +1853,10 @@ fn readiness_report(
         if !design.excluded_references.is_empty() {
             report["excluded_references"] =
                 json!(listing(design.excluded_references.iter(), limit));
+        }
+        if !design.excluded_in_schematic.is_empty() {
+            report["excluded_in_schematic"] =
+                json!(listing(design.excluded_in_schematic.iter(), limit));
         }
         report["source_evidence"] = json!({
             "excludes_unsaved_editor_state": true,
@@ -1981,6 +2043,7 @@ mod tests {
             deck: Ok(FlatDeck::default()),
             ignored_model_dirs: Vec::new(),
             excluded_references: Vec::new(),
+            excluded_in_schematic: Vec::new(),
             preflight: None,
             project_dir: PathBuf::new(),
             inputs_hash: String::new(),
@@ -2907,7 +2970,15 @@ mod tests {
                         call(&scene, protection_args(&scene.root, &lines, uic)).await;
                     assert!(!failed, "{name}: {body}");
                     assert_eq!(body["simulated_circuit"], "modified", "{name}");
-                    assert_eq!(body["warnings"], json!([]), "{name}, uic {uic}");
+                    // The stand-ins are lines the caller adds, so the one warning
+                    // is the disclosure that results depend on added lines.
+                    let codes: Vec<&str> = body["warnings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|warning| warning["code"].as_str())
+                        .collect();
+                    assert_eq!(codes, ["testbench_elements_added"], "{name}, uic {uic}");
 
                     let dirs = run_dirs(&scene);
                     let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();

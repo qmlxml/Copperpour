@@ -83,7 +83,7 @@ cargo deny check licenses
 - A `.ic` in a dead `.if` still drops device currents under `uic`. It fails loudly.
 - `p(REF)` on a subcircuit counts only the pins it shows, so a hidden ground or supply reads short.
 - A net named `time` or `frequency`, and `/out#branch`, read `signal_not_found`. No wrong number comes out.
-- A part with `Sim.Enable` off reads `as_drawn`. The first PR 7 review reported this from before PR 7, and it has not been rechecked.
+- A part with `Sim.Enable` off read `as_drawn`. Confirmed by review 3 of plan step 4 (a part marked "exclude from simulation" vanished from the deck); fixed then: such parts are listed in `circuit.excluded_in_schematic` and the circuit reads `modified`.
 - On a partial run, a measurement wholly inside the data reads `window_truncated: true` and counts as failed, as the plan says, though its number is exact.
 - Code-model `ic=` under probes, and `bg_halt` when one step takes over a second, have not been tested.
 - A value computed from a model parameter can still appear in an engine message, because nothing can recognise it. Worth knowing, not worth more code.

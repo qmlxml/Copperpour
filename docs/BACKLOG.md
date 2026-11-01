@@ -63,6 +63,9 @@ Each entry names where it was found, what is wrong, and the condition that close
   `timed_out`; with the stdio transport this blocks other tool calls for the whole budget. Part of
   the known limit Q17 (data files named in a deck). Closing condition: data-file paths vetted like
   includes, or the cause named in the error.
+- **An `.op` analysis cannot be halted early**: it has no pause point, so it runs until the worker's
+  own deadline (the budget plus a grace period). Moved here from `docs/SIMULATION_NOTES.md` (known
+  open items) by review 3 of step 4. Closing condition: an earlier stop, or the cause named.
 - **A code-model path is placed inside an engine command** (`codemodel '<path>'`), against the
   contributor's own recorded rule; the quoting is untested for `$`, `{`, backticks and Windows
   backslashes. Closing condition: tested, or the path passed another way.

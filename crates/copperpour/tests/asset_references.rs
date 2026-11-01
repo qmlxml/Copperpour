@@ -678,6 +678,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "rb_knee",
         "rect_out",
         "load_toolset",
+        // Meta-tool offered only with the stdio transport on Unix.
+        "reload_server",
         "unload_toolset",
         "list_toolboxes",
         "get_active_toolsets",
@@ -766,6 +768,11 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "not_found",
         // Simulation result fields and failure codes.
         "at_seconds",
+        // Warning codes added when merged (plan step 4, review 3).
+        "excluded_in_schematic",
+        "testbench_elements_added",
+        "control_block_dropped",
+        "schematic_open_in_editor",
         "band_percent",
         "circuit_not_parsed",
         "copy_library_sim_fields",
