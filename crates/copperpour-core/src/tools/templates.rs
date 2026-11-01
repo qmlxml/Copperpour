@@ -584,23 +584,35 @@ async fn handle_apply_template(
 
     // Wire what the connection map describes (#784): each pin it names gets
     // a stub and a label for its net, drawn as connect_to_net draws one.
-    let wiring =
-        match wire_template_connections(&sch_path, &tmpl, &net_mappings, ref_start, ctx).await {
-            Ok(wiring) => wiring,
-            Err(error) => {
-                return Ok(crate::tools::mutation_outcome_uncertain(
+    let wiring = match wire_template_connections(&sch_path, &tmpl, &net_mappings, ref_start, ctx)
+        .await
+    {
+        Ok(wiring) => wiring,
+        Err(error) => {
+            // Enough to finish by hand: what was placed, and which placed
+            // reference each template reference became (merge review,
+            // plan step 6). Re-running would place a second copy.
+            let references = template_references(&tmpl, ref_start);
+            return Ok(crate::tools::mutation_outcome_uncertain(
                     &sch_path,
                     "apply_template",
-                    format!("the parts were placed, but wiring them failed: {error:#}"),
-                ))
-            }
-        };
+                    format!(
+                        "the parts were placed ({}), with template references placed as {}, but \
+                         wiring them failed: {error:#}. Do not apply the template again; finish the \
+                         remaining nets with batch_connect_to_net on the placed references.",
+                        serde_json::to_string(&placed).unwrap_or_default(),
+                        serde_json::to_string(&references).unwrap_or_default()
+                    ),
+                ));
+        }
+    };
     let mut response = json!({
         "template": template_id,
         "components_placed": placed,
         "connections_made": wiring.made,
         "connections_unresolved": wiring.unresolved,
         "unconnected_pins": wiring.unconnected,
+        "joined_existing_nets": wiring.joined_existing,
         "design_notes": tmpl["design_notes"],
     });
     if !response["connections_unresolved"]
@@ -611,8 +623,9 @@ async fn handle_apply_template(
             .is_some_and(Vec::is_empty)
     {
         response["next_steps"] = json!(
-            "Wire the pins in unconnected_pins, and the entries in connections_unresolved, \
-             with connect_to_net or connect_pins."
+            "Wire the pins in unconnected_pins that the design needs, mark the rest no-connect, \
+             and resolve the entries in connections_unresolved, with connect_to_net or \
+             connect_pins."
         );
     }
     Ok(CallToolResult::text(serde_json::to_string(&response)?))
@@ -625,6 +638,9 @@ struct TemplateWiring {
     made: Vec<serde_json::Value>,
     unresolved: Vec<serde_json::Value>,
     unconnected: Vec<String>,
+    /// Template nets the caller did not map that already exist in the
+    /// schematic, so the template's parts were joined to them.
+    joined_existing: Vec<String>,
 }
 
 /// A placed pin: its symbol's reference and the pin number.
@@ -722,6 +738,35 @@ async fn wire_template_connections(
             );
         }
     }
+    // Nets already in the schematic, by name, before anything is wired: an
+    // unmapped template net of the same name joins them, which the response
+    // must say (merge review, plan step 6: a template's 6 V VIN joined a
+    // project's 24 V VIN without a word).
+    let existing_nets: HashSet<String> = copperpour_sexp::schematic::extract_labels(&tree)
+        .into_iter()
+        .chain(copperpour_sexp::schematic::extract_power_symbol_labels(
+            &tree,
+        ))
+        .map(|label| label.net)
+        .collect();
+    // The template's own net names, as the connection map below reads them:
+    // `to_net`, or `from` when an entry connects a net to a pin (`to`).
+    let joined_existing: Vec<String> = tmpl["connections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|conn| {
+            let from = conn["from"].as_str().unwrap_or_default();
+            match (conn["to_net"].as_str(), conn["to"].as_str()) {
+                (Some(net), _) => Some(net.to_string()),
+                (None, Some(_)) if !from.contains('.') => Some(from.to_string()),
+                _ => None,
+            }
+        })
+        .filter(|net| !net_mappings.contains_key(net) && existing_nets.contains(net))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let mapped = |net: &str| {
         net_mappings
             .get(net)
@@ -911,6 +956,7 @@ async fn wire_template_connections(
         made,
         unresolved,
         unconnected,
+        joined_existing,
     })
 }
 

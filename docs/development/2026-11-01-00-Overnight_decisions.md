@@ -48,3 +48,8 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
     KiCad. Merge them only if the fork should depend on that KiCad build: cherry-pick both.
 12. **`c2143d2` was reverted** as superseded by Copperpour's own custom-field support (it wrote
     fields twice).
+13. **`apply_template` reports `joined_existing_nets`** (template nets not mapped by the caller that
+    already exist in the schematic) rather than refusing them; the alternative was to require a
+    mapping for every such net.
+14. **Step 6 review 3's finding that decoupling should not be pooled was not adopted**: the pooled
+    check is about the net; local decoupling is `audit_decoupling`, which is not pooled.

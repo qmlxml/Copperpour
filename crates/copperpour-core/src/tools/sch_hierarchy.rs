@@ -2026,6 +2026,11 @@ fn natural_compare(a: &str, b: &str) -> std::cmp::Ordering {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
+/// Whether two lengths are the same as KiCad writes them (six decimals).
+fn same_mm(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
+}
+
 /// The largest coordinate or size accepted, in mm. KiCad keeps schematic
 /// coordinates as integers; far beyond this, rounding to six decimals
 /// overflows to infinity and the file gets `inf`, which KiCad cannot load
@@ -2279,7 +2284,16 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     let grid = |value: f64| snap_to_grid(value, 1.27);
     if let (Some(x), Some(y)) = (opt_f64(args, "x"), opt_f64(args, "y")) {
         requested.push("position");
-        let (x, y) = (grid(x), grid(y));
+        // Restating the current position changes nothing, even off the grid:
+        // snapping it would move the sheet's pins away from the parent wires
+        // that end on them (merge review, plan step 6; 19 sheet coordinates
+        // in KiCad's demos are on the 0.635 mm half-grid). Only a new
+        // position is snapped.
+        let (x, y) = if same_mm(x, sheet.at.x) && same_mm(y, sheet.at.y) {
+            (sheet.at.x, sheet.at.y)
+        } else {
+            (grid(x), grid(y))
+        };
         if sheet.at.x != x || sheet.at.y != y {
             sheet.move_to(x, y);
             changed.push("position");
@@ -2287,7 +2301,12 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     }
     if let (Some(w), Some(h)) = (requested_width, requested_height) {
         requested.push("size");
-        let (w, h) = (grid(w).max(1.27), grid(h).max(1.27));
+        // As for the position: restating the current size changes nothing.
+        let (w, h) = if same_mm(w, sheet.width) && same_mm(h, sheet.height) {
+            (sheet.width, sheet.height)
+        } else {
+            (grid(w).max(1.27), grid(h).max(1.27))
+        };
         // Like eeschema, never shrink the box past a pin: clamping two pins
         // onto the same corner would join their nets on the parent sheet.
         let (left, top) = sheet.position();
@@ -2326,16 +2345,31 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
             ));
         }
         if sheet.width != w || sheet.height != h {
+            let before: Vec<(f64, f64)> =
+                sheet.pins.iter().map(|pin| (pin.at.x, pin.at.y)).collect();
             sheet.set_size(w, h);
             // Shrinking can move a pin on one edge onto the corner where a pin
             // of the other edge already is, joining their nets on the parent
             // sheet (merge review, plan step 6).
+            // Only a pin the resize moved is blamed: two pins a file already
+            // had on one point are not this request's doing.
             let round6 = copperpour_sexp::geometry::round6;
-            let mut seen: std::collections::HashMap<(String, String), &str> =
-                std::collections::HashMap::new();
-            for pin in &sheet.pins {
-                let point = (round6(pin.at.x).to_string(), round6(pin.at.y).to_string());
-                if let Some(other) = seen.insert(point.clone(), pin.name.as_str()) {
+            let point_of = |x: f64, y: f64| (round6(x).to_string(), round6(y).to_string());
+            for (index, pin) in sheet.pins.iter().enumerate() {
+                let (old_x, old_y) = before[index];
+                if same_mm(pin.at.x, old_x) && same_mm(pin.at.y, old_y) {
+                    continue;
+                }
+                let point = point_of(pin.at.x, pin.at.y);
+                let other = sheet
+                    .pins
+                    .iter()
+                    .enumerate()
+                    .find(|(other_index, other)| {
+                        *other_index != index && point_of(other.at.x, other.at.y) == point
+                    })
+                    .map(|(_, other)| other.name.as_str());
+                if let Some(other) = other {
                     return Ok(invalid_arg(
                         if too_short { "height" } else { "width" },
                         &format!(
@@ -2386,12 +2420,13 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    // Snapped below, unless they restate the sheet's current position.
     let x = match require_f64(args, "x") {
-        Ok(v) => snap_to_grid(v, 1.27),
+        Ok(v) => v,
         Err(e) => return Ok(e),
     };
     let y = match require_f64(args, "y") {
-        Ok(v) => snap_to_grid(v, 1.27),
+        Ok(v) => v,
         Err(e) => return Ok(e),
     };
 
@@ -2400,6 +2435,11 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     match sch.sheets.by_name_mut(&sheet_name) {
         Some(sheet) => {
             let sheet_uuid = sheet.uuid.clone();
+            let (x, y) = if same_mm(x, sheet.at.x) && same_mm(y, sheet.at.y) {
+                (sheet.at.x, sheet.at.y)
+            } else {
+                (snap_to_grid(x, 1.27), snap_to_grid(y, 1.27))
+            };
             let changed = sheet.at.x != x || sheet.at.y != y;
             if changed {
                 sheet.move_to(x, y);
@@ -3732,6 +3772,45 @@ mod tests {
             before,
             "a no-op edit leaves the file alone"
         );
+    }
+
+    /// A sheet KiCad or a hand edit left off the grid: restating its position
+    /// must not snap it, which would move its pins away from the parent wires
+    /// ending on them (merge review, plan step 6).
+    #[tokio::test]
+    async fn restating_an_off_grid_position_moves_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.32, 20.32).await;
+        let text = std::fs::read_to_string(&root).unwrap();
+        assert!(text.contains("(at 20.32 20.32"), "{text}");
+        std::fs::write(&root, text.replacen("(at 20.32 20.32", "(at 20 20", 1)).unwrap();
+        let before = std::fs::read_to_string(&root).unwrap();
+
+        for (tool, result) in [
+            (
+                "edit_sheet",
+                handle_edit_sheet(
+                    &json!({"schematic": root, "sheet_name": "Power", "x": 20.0, "y": 20.0}),
+                    &ctx,
+                )
+                .await
+                .unwrap(),
+            ),
+            (
+                "move_sheet",
+                handle_move_sheet(
+                    &json!({"schematic": root, "sheet_name": "Power", "x": 20.0, "y": 20.0}),
+                    &ctx,
+                )
+                .await
+                .unwrap(),
+            ),
+        ] {
+            assert!(!result.is_error, "{tool}");
+            assert_eq!(result_json(&result)["changed"], json!(false), "{tool}");
+            assert_eq!(std::fs::read_to_string(&root).unwrap(), before, "{tool}");
+        }
     }
 
     #[tokio::test]

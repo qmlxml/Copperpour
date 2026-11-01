@@ -120,3 +120,39 @@ unparsable batch body) is not reachable in practice, since the body is produced 
 Gate after fix pass 2 (`logs/gate-step6-fix2.summary`): 3,703 passed, 1 failed (the known baseline
 failure), 110 ignored (+1, the live test). A first run failed clippy on the live test's
 configuration; fixed.
+Committed as `f4c6e3f`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+Confirmed: no merged commit depends on the two not merged or the reverted one; no sheet can be made
+impossible to edit through the tools (a pin can always be moved with `edit_sheet_pin` x+y first).
+Findings and what was done:
+
+1. **Restating a sheet's current off-grid position moved it**, and its pins with it, away from the
+   parent wires ending on them (19 sheet coordinates in KiCad's demos are on the 0.635 mm half-grid;
+   inferred for the vme-wren FPGA sheet). The tests had been changed to on-grid inputs, which hid it.
+   `edit_sheet` and `move_sheet` now compare the raw request with the current value (`same_mm`,
+   1e-6 mm) before snapping; restating changes nothing, and only new values are snapped (the size the
+   same way). Test `restating_an_off_grid_position_moves_nothing`; control: with the comparison
+   disabled it fails.
+2. Sheet pins are not snapped: recorded in `docs/BACKLOG.md`.
+3. **"Pooling counts decoupling across the whole net"**: not adopted. The power-rail audit's "no
+   decoupling capacitors" asks whether a rail has any capacitor, a property of the net; whether each
+   IC's power pins are decoupled locally is `audit_decoupling`, which checks per pin and per sheet
+   and is not pooled. The contributor's tests encode this intent.
+4. The pooled verdict does not list its sources: recorded in `docs/BACKLOG.md`.
+5. **After a wiring failure the caller could not finish**: the error now names the parts placed, the
+   placed reference of each template reference, and the nets already written, and says not to apply
+   the template again.
+6. **Unmapped template nets joined existing project nets of the same name without a word** (for
+   example a template's 6 V `VIN` joining a 24 V `VIN`): new `joined_existing_nets` in the response
+   (overnight decision 13).
+7. **The documents named `unresolved_connections`; the response uses `connections_unresolved`**:
+   the migration note and tool directory corrected.
+8. **`next_steps` said to wire every unconnected pin** (unused GPIOs, an NC pin): now "the pins the
+   design needs; mark the rest no-connect".
+9. **A file that already had two pins on one point was refused on every resize**: only pins the
+   resize moved are now checked.
+
+Gate after fix pass 3 (`logs/gate-step6-fix3.summary`): 3,704 passed (+1), 1 failed (the known
+baseline failure), 110 ignored.

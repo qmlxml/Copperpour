@@ -117,6 +117,13 @@ Each entry names where it was found, what is wrong, and the condition that close
   netlist's sheet path as well.
 - **Moving an off-grid sheet keeps its pins' offsets along the edge**, so those pins stay off the
   grid. Closing condition: pins snapped with the sheet.
+- **Sheet pins are not put on the grid**: `add_sheet_pin` and `edit_sheet_pin` with `side` alone do not
+  snap a pin's place along the edge, while `add_wire` snaps to 1.27 mm and cannot reach it. Closing
+  condition: pin positions snapped or refused off the grid.
+- **A pooled global-rail verdict does not list what it covered**: per-sheet results still show the
+  findings the pooled top level removed, and a rail judged fine has no record of which sheets
+  supplied it; rails are pooled by name, so a rail named differently on two sheets is not pooled.
+  Closing condition: a pooled `rail_coverage` with its sources.
 - **`f517fd8` and `d2961f4` from wilfredo-a14/agent-hub were not merged** (activity reporting to,
   and editor control of, a modified KiCad build). Closing condition: an owner decision.
 

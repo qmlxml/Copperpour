@@ -13,5 +13,10 @@
 - `audit_power_rails` judges global power rails on the whole design in a hierarchy review and adds
   `rail_coverage`, `global_rail` and `rail` fields; `(power local)` symbols are not treated as global.
 - `apply_template` now wires its connection map instead of returning `connections_to_wire` (removed):
-  the response has `connections_made`, `unresolved_connections` and `unconnected_pins`. If wiring one
-  net fails, the error names the nets already written.
+  the response has `connections_made`, `connections_unresolved`, `unconnected_pins` and
+  `joined_existing_nets` (template nets the caller did not map in `net_map` that already exist in the
+  schematic, so the template's parts were joined to them). If wiring fails, the error names the
+  parts placed, the placed reference of each template reference, and the nets already written;
+  applying the template again would place a second copy.
+- Restating a sheet's current position or size (even off the grid) changes nothing; only new values
+  are snapped.
