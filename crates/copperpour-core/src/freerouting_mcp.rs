@@ -412,6 +412,10 @@ fn negative_settings(settings: &Map<String, Value>) -> Vec<String> {
             Value::Number(number) if number.as_f64().is_some_and(|n| n < 0.0) => {
                 out.push(format!("{path}: {number}"))
             }
+            // A number sent as a string, such as "-5", is refused the same way.
+            Value::String(text) if text.trim().parse::<f64>().is_ok_and(|n| n < 0.0) => {
+                out.push(format!("{path}: {text:?}"))
+            }
             _ => {}
         }
     }
@@ -1001,13 +1005,22 @@ impl LocalMcpClient {
             .stderr
             .take()
             .context("Freerouting MCP has no stderr")?;
+        // Keep the last MAX_STDERR_BYTES, read to the end so the pipe never
+        // fills: Freerouting logs to stderr, and the cause of a failure is at
+        // the end (merge review, plan step 5; it kept the first 64 KiB).
         let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut bytes = Vec::new();
-            let _ = reader
-                .take(MAX_STDERR_BYTES as u64)
-                .read_to_end(&mut bytes)
-                .await;
+            let mut reader = BufReader::new(stderr);
+            let mut kept = std::collections::VecDeque::with_capacity(MAX_STDERR_BYTES);
+            let mut chunk = [0u8; 8192];
+            while let Ok(read) = reader.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                kept.extend(&chunk[..read]);
+                let excess = kept.len().saturating_sub(MAX_STDERR_BYTES);
+                kept.drain(..excess);
+            }
+            let bytes: Vec<u8> = kept.into_iter().collect();
             String::from_utf8_lossy(&bytes).trim().to_string()
         });
         Ok(Self {
@@ -1421,7 +1434,11 @@ fn settings_mismatches(sent: &Map<String, Value>, effective: &Map<String, Value>
 /// Equality that lets 3 match 3.0: Freerouting echoes some integers as floats.
 fn same_value(a: &Value, b: &Value) -> bool {
     match (a.as_f64(), b.as_f64()) {
-        (Some(x), Some(y)) => (x - y).abs() <= 1e-9 * x.abs().max(1.0),
+        // Freerouting holds some settings as Java `float` (for example
+        // optimizer.improvement_threshold), which keeps about 7 significant
+        // digits, so a tolerance of 1e-9 refused valid values (merge review,
+        // plan step 5).
+        (Some(x), Some(y)) => (x - y).abs() <= 1e-6 * x.abs().max(1.0),
         _ => a == b,
     }
 }
@@ -2218,5 +2235,31 @@ mod tests {
             wait_for_process_exit(pid).await,
             "Freerouting child {pid} survived cancellation"
         );
+    }
+}
+
+#[cfg(test)]
+mod settings_check_tests {
+    use super::*;
+
+    #[test]
+    fn a_float_setting_echoed_with_float_precision_is_the_same_value() {
+        // 2.555555555 sent, 2.5555556 echoed by a Java float.
+        assert!(same_value(
+            &serde_json::json!(2.555555555),
+            &serde_json::json!(2.5555556)
+        ));
+        assert!(!same_value(
+            &serde_json::json!(2.5),
+            &serde_json::json!(2.6)
+        ));
+    }
+
+    #[test]
+    fn a_negative_number_sent_as_a_string_is_refused() {
+        let settings = serde_json::json!({"autorouter": {"max_passes": "-5", "ok": "5"}});
+        let found = negative_settings(settings.as_object().unwrap());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("autorouter.max_passes"), "{found:?}");
     }
 }

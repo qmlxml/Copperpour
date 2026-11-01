@@ -85,6 +85,22 @@ Each entry names where it was found, what is wrong, and the condition that close
 - **Building the Freerouting command in a unit test creates `~/.local/state/freerouting`** in the
   real home directory. Closing condition: the state directory injected in tests.
 
+- **A slow snapshot download during optimisation ends the whole route** (no missed-poll tolerance on
+  `download_running_output`), deleting the temporary SES; and a job that completes between the
+  status poll and the download is labelled `OPTIMIZATION_STOPPED` and cancelled. Closing condition:
+  the same tolerance as the status polls, and the final state read after the download.
+- **The stdio transport does not read stdin while a tool call runs**, so a client that disconnects
+  or sends `notifications/cancelled` is not noticed; a routing call then runs to its overall
+  timeout (up to 86,400 s) with nothing reported. Predates this work. Closing condition: stdin read
+  during calls, with cancellation honoured.
+- **The temporary `.konnect-*.tmp.ses` is left behind** when a routing call is dropped, or on a read
+  or parse failure in `route_local`. Closing condition: removed on every exit.
+- **Two concurrent routing calls share Freerouting's fixed ports and log file**; a log rollover (at
+  50 MB) by one loses the other's lines. Closing condition: per-call ports and log.
+- **The bottom-side CPL formula has no bottom-side observation behind it.** Bottom-side parts with a
+  non-zero correction are now listed for review (plan step 5, review 2). Closing condition: a
+  bottom-side observation per rule, recorded in the policy.
+
 ## Custom-shape pads (plan step 1, not merged)
 
 - **Footprints with custom-shape pads cannot be placed** (about 3.9% of KiCad's library). KiCad's

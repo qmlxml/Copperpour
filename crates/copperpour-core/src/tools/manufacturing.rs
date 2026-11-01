@@ -748,11 +748,35 @@ impl JlcpcbCorrectionPolicies {
     }
 
     fn rotation_insensitive(&self, footprint: &str) -> bool {
+        // A common-mode choke's winding dots make its rotation matter, though
+        // its name starts with the inductor prefix `L_` (merge review, plan
+        // step 5).
+        if POLARISED_DESPITE_PREFIX
+            .iter()
+            .any(|prefix| footprint.starts_with(prefix))
+        {
+            return false;
+        }
         self.project
             .iter()
             .chain(std::iter::once(&self.built_in))
             .flat_map(|policy| &policy.rotation_insensitive_prefixes)
             .any(|prefix| footprint.starts_with(prefix.as_str()))
+    }
+}
+
+/// Footprint name starts that a rotation-insensitive prefix would otherwise
+/// cover but whose rotation matters.
+const POLARISED_DESPITE_PREFIX: &[&str] = &["L_CommonModeChoke"];
+
+/// An angle in [0, 360): `rem_euclid` can return 360.0 for a tiny negative
+/// input, and -0.0 would print as "-0.000000".
+fn normalised_degrees(angle: f64) -> f64 {
+    let wrapped = angle.rem_euclid(360.0);
+    if wrapped >= 360.0 || wrapped == 0.0 {
+        0.0
+    } else {
+        wrapped
     }
 }
 
@@ -1150,10 +1174,28 @@ fn jlcpcb_cpl_from_kicad_csv(
             x += offset_x;
             y += offset_y;
             let corrected = if layer == "bottom" {
-                (180.0 - (angle - rotation_delta)).rem_euclid(360.0)
+                normalised_degrees(180.0 - (angle - rotation_delta))
             } else {
-                (angle + rotation_delta).rem_euclid(360.0)
+                normalised_degrees(angle + rotation_delta)
             };
+            // Every observation behind the rules is of a top-side part, so the
+            // bottom-side formula is unverified for a non-zero correction; the
+            // other mirror convention differs by 180 degrees for the 270-degree
+            // rules (merge review, plan step 5).
+            if layer == "bottom" && rotation_delta.rem_euclid(360.0) != 0.0 {
+                unverified_footprints.push(JlcpcbUnverifiedFootprint {
+                    designator: designator.to_string(),
+                    footprint: footprint.to_string(),
+                    side: layer.to_string(),
+                    policy_id: policy_id.to_string(),
+                    rule_id: rule_id.to_string(),
+                    note: Some(
+                        "bottom-side part: the correction was observed on top-side parts only; \
+                         check its rotation in JLCPCB's preview"
+                            .to_string(),
+                    ),
+                });
+            }
             applied_corrections.push(JlcpcbAppliedCorrection {
                 designator: designator.to_string(),
                 footprint: footprint.to_string(),
@@ -1180,9 +1222,9 @@ fn jlcpcb_cpl_from_kicad_csv(
                 });
             }
             if layer == "bottom" {
-                (180.0 - angle).rem_euclid(360.0)
+                normalised_degrees(180.0 - angle)
             } else {
-                angle.rem_euclid(360.0)
+                normalised_degrees(angle)
             }
         };
         writer.write_record([
@@ -1867,13 +1909,20 @@ mod jlcpcb_assembly_tests {
         assert_eq!(rows[4][4], "0.000000");
         let evidence = &export.orientation_evidence;
         assert_eq!(evidence.applied_corrections.len(), 2);
-        assert_eq!(evidence.unverified_footprints.len(), 1);
+        // J1 is unverified; U2 is corrected, and also listed because every
+        // observation behind the SOIC rule is of a top-side part (plan step 5).
+        assert_eq!(evidence.unverified_footprints.len(), 2);
         assert_eq!(evidence.unverified_footprints[0].designator, "J1");
+        assert_eq!(evidence.unverified_footprints[1].designator, "U2");
+        assert!(evidence.unverified_footprints[1]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("bottom-side")));
         assert_eq!(evidence.unmatched_footprints.len(), 1);
         assert_eq!(evidence.unmatched_footprints[0].designator, "R1");
         assert!(!evidence.unmatched_footprints[0].review_required);
         let warnings = evidence.review_warnings();
-        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings.len(), 2);
         assert!(warnings[0].starts_with(
             "JLCPCB rotation not verified for footprint USB_C_Receptacle_HRO_TYPE-C-31-M-12"
         ));
@@ -2786,5 +2835,26 @@ mod copper_layer_count_tests {
 
         let control = validate(TWO_LAYER).await;
         assert_eq!(control["board_info"]["copper_layers"], 2);
+    }
+}
+
+#[cfg(test)]
+mod cpl_angle_tests {
+    use super::*;
+
+    #[test]
+    fn angles_are_kept_in_zero_to_360() {
+        assert_eq!(normalised_degrees(270.0 + 180.0), 90.0);
+        assert_eq!(normalised_degrees(-1e-15), 0.0);
+        assert!(normalised_degrees(-0.0).is_sign_positive());
+        assert_eq!(normalised_degrees(360.0), 0.0);
+        assert_eq!(normalised_degrees(-90.0), 270.0);
+    }
+
+    #[test]
+    fn a_common_mode_choke_is_not_rotation_insensitive() {
+        assert!(POLARISED_DESPITE_PREFIX
+            .iter()
+            .any(|prefix| "L_CommonModeChoke_Wuerth_WE-SL5".starts_with(prefix)));
     }
 }

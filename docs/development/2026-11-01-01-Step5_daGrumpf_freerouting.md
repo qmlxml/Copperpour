@@ -81,3 +81,39 @@ Not covered by new tests: 1 (would change environment variables shared by every 
 process), 2 and 7 (need a Freerouting installation or the full handler), 5 and 6 (need a transport
 test with a tool that reports progress). Gate (`logs/gate-step5-fix1.summary`): 3,685 passed,
 1 failed (the known baseline failure), 109 ignored.
+Committed as `d8460a1`.
+
+## Review 2 (robustness) and fix pass 2
+
+The reviewer could not run Freerouting (the JAR needs Java 25; Java 17 and 21 are installed), so
+most findings are from reading; the float and log behaviour were checked with `javap`/`jshell` and
+the JAR's own configuration. The new stdio loop was confirmed correct. Fixed:
+
+- **Freerouting's stderr kept only its first 64 KiB**, and the reader then stopped, so the cause of
+  a failure on a long run was lost. Now the last 64 KiB are kept and the pipe is read to the end.
+- **A valid float setting could be refused**: Freerouting holds some settings as Java `float`
+  (measured: `optimizer.improvement_threshold`), and the echo comparison used a tolerance of 1e-9.
+  Now 1e-6. A negative number sent as a string (`"-5"`) is now refused like a negative number.
+  Tests `a_float_setting_echoed_with_float_precision_is_the_same_value`,
+  `a_negative_number_sent_as_a_string_is_refused`.
+- **A non-executable `JAVA_HOME/bin/java` was chosen** over a working one on the PATH. Now only an
+  executable file is chosen (Unix).
+- **CPL bottom-side parts**: every observation behind the rules is of a top-side part, so a
+  bottom-side part with a non-zero correction is now listed for review (still corrected), with a
+  note to check JLCPCB's preview. **Common-mode chokes** (`L_CommonModeChoke*`) are no longer
+  treated as rotation-insensitive. **Angles** are kept in [0, 360) (`normalised_degrees`; no 360.0 or
+  -0.0). Tests `angles_are_kept_in_zero_to_360`, `a_common_mode_choke_is_not_rotation_insensitive`;
+  `built_in_rules_correct_soic_on_both_sides_and_leave_usb_c_for_review` now expects the bottom-side
+  SOIC in the review list.
+
+Recorded in `docs/BACKLOG.md`: a slow snapshot download ending the route, and the final-state race;
+stdin not read during a call on stdio (disconnect and cancellation not noticed; predates this work);
+the temporary SES left behind on some exits; concurrent calls sharing ports and the log; the
+bottom-side CPL formula itself; manifest parsing limits (also below).
+
+Minor, not changed: the JAR manifest is read without a size limit and with case-sensitive attribute
+names (the check is then skipped and the run goes ahead); a non-UTF-8 JAR path; reading the whole new
+part of the log on each poll.
+
+Gate after fix pass 2 (`logs/gate-step5-fix2.summary`): 3,689 passed (+4), 1 failed (the known
+baseline failure), 109 ignored.

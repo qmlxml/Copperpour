@@ -30,3 +30,5 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
    alternative was to report such runs as failures.
 7. **The CPL policy id changed to `konnect-jlcpcb-cpl-v2`** because the rule set changed. Reverse:
    the `policy_id` in `jlcpcb_cpl_corrections_v1.json`.
+8. **Bottom-side CPL parts with a non-zero correction are now listed for review** (still
+   corrected). This adds review warnings to existing two-sided boards.

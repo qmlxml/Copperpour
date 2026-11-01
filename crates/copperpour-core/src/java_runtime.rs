@@ -27,8 +27,24 @@ pub(crate) fn java_executable() -> PathBuf {
         cfg!(target_os = "macos"),
     )
     .into_iter()
-    .find(|path| path.is_file())
+    .find(|path| is_executable_file(path))
     .unwrap_or_else(|| PathBuf::from("java"))
+}
+
+/// A regular file this process may execute: a `JAVA_HOME/bin/java` without
+/// the execute bit must not win over a working `java` on the PATH (merge
+/// review, plan step 5).
+fn is_executable_file(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 fn candidates(java_home: Option<OsString>, path: Option<OsString>, macos: bool) -> Vec<PathBuf> {
