@@ -61,3 +61,34 @@ Fixed:
    `pcb_footprint_text`. (`editor_navigation` is missing from it too, as it was before the merge.)
 3. The `footprint_text_tools` comment and the migration note said `pcb_board` was at the limit of
    20; it has 19.
+
+Commit `50bd7118`. Gate (`logs/gate-merge-fix1.summary`): 3,814 passed, 0 failed. CI run
+41334561437 on the merge commit passes on all ten jobs, Windows included.
+
+## Review 2 (robustness) and fix pass 2
+
+Confirmed:
+- `set_erc_severity` refuses an empty map and unknown check names, and handles a project file
+  without an `erc` section.
+- `text_overlap` cannot panic on NaN coordinates and is fast enough on large sheets (a quadratic
+  loop of a few float operations per pair).
+- Nothing loads toolsets by a fixed list that would miss `pcb_footprint_text`: the starter kit is
+  `project` and `config`, and the hooks are built from the registry.
+
+Fixed (a combination defect): `set_board_stackup` checks its result by re-saving a private copy of
+the board with kicad-cli (`resave_board`). That call used the general 600 s limit, and did not use
+this branch's option to kill kicad-cli when the limit is reached (`run_cli_owned`'s
+`kill_on_timeout`, for calls on a private copy). Upstream has no such option. A stalled kicad-cli
+kept the copy open for ten minutes and then went on running; on Windows the copy's temporary
+folder could not be removed. `resave_board` now kills kicad-cli on timeout, with a limit of 120 s.
+Measured: kicad-cli re-saves the largest demo board, `jetson-agx-thor-baseboard` (85 MB), in
+6.2 s (KiCad 10.0.7).
+
+Run afterwards, for the first time since the merge: the ignored real-KiCad test
+`live_kicad_saves_the_written_stack_unchanged` passes against kicad-cli 10.0.7 (it prints no skip,
+and took 2.7 s).
+
+Recorded in `docs/BACKLOG.md` as upstream's own issues, to report there, not changed here:
+- the kicad-cli check runs even when the stackup is unchanged;
+- `set_erc_severity` reads the project file without the shared lock;
+- two approximations in `text_overlap`.

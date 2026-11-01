@@ -2061,9 +2061,22 @@ pub(crate) async fn upgrade_legacy_footprint(
 /// (`PCBNEW_JOBS_HANDLER::JobUpgrade`).
 pub(crate) async fn resave_board(cli: &str, board: &Path) -> Result<()> {
     let board = board.to_str().context("board path is not UTF-8")?;
-    run_cli(cli, &["pcb", "upgrade", "--force", board], LONG_TIMEOUT).await?;
+    // The callers pass a private copy, so kicad-cli may be killed on timeout;
+    // otherwise it keeps the copy open, and on Windows its temporary folder
+    // cannot be removed. 120 s: the 85 MB jetson-agx-thor-baseboard demo
+    // re-saves in 6.2 s (KiCad 10.0.7, measured 2026-11-01).
+    run_cli_owned(
+        cli,
+        &["pcb", "upgrade", "--force", board],
+        RESAVE_TIMEOUT,
+        true,
+    )
+    .await?;
     Ok(())
 }
+
+/// Limit for [`resave_board`].
+const RESAVE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// KiCAD 10: `pcb export dxf --output <dir> [--layers <csv>] --mode-multi <input>`
 ///

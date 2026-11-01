@@ -54,6 +54,14 @@ Each entry names where it was found, what is wrong, and the condition that close
 
 ## SPICE simulation (plan step 4)
 
+- **Upstream issues found in review 2 of the merge with Copperpour `main`**
+  (`docs/development/2026-11-01-10-Merge_Copperpour_main.md`), Copperpour's own code, to report
+  there rather than change here: `set_board_stackup` runs its kicad-cli check even when the
+  requested stackup equals the board's (`changed` is computed after the round trip);
+  `set_erc_severity` reads the project file without the shared document lock, so a half-written
+  file fails as a handler error rather than a retryable `conflict`; `text_overlap` takes a reused
+  sheet's Reference text from one instance only, and gives a field of spaces a box KiCad does not
+  draw. Closing condition: reported upstream, or fixed there.
 - **A model include on a network location is touched before it is refused** (review 2 of the Windows
   CI fixes, `docs/development/2026-11-01-09-Windows_CI_fixes.md`; existed before). The include
   check refuses a path written as a network location, but a mapped network drive (`Z:\m.lib`), or a
