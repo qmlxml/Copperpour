@@ -57,3 +57,19 @@ Not changed:
 - The schematic viewer's CI job runs only on Windows, where this check does not apply.
 - The cache save after a changed `Cargo.lock` has not run with these steps yet. `CARGO_HOME` is set
   explicitly and `HOME` is now restored before post-job steps.
+
+Commit `5793fc5b`. Gate (`logs/gate-ci-home.summary`): 3,815 passed, 0 failed, 115 ignored,
+`home-untouched` PASS. CI run 41343986384 passes on all ten jobs. On both Linux and macOS its log
+shows:
+- "selftest passed: written file reported, empty directory passed, missing directory refused";
+- `XDG_CONFIG_HOME` inside the empty home in the test step's environment;
+- "nothing written" from the check.
+
+## As shipped, against the plan
+
+Planned (backlog): CI runs the empty-`HOME` check. Shipped on Linux and macOS, with a self-test of
+the failing result on every build, the XDG directories redirected, and the same listing-failure fix
+in `scripts/gate.sh`. Not shipped: a check on Windows, recorded in `docs/BACKLOG.md`.
+
+Documentation review: this log was checked against the commits, the gate summary and the CI log
+by its author, not by an independent reviewer.
