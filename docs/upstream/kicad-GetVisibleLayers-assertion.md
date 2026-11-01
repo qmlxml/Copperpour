@@ -1,7 +1,8 @@
 # KiCad report draft: API `GetVisibleLayers` fails an assertion per unnamed layer ID
 
-Prepared 2026-11-01 for KiCad's issue tracker (gitlab.com/kicad/code/kicad). To be filed from the
-owner's GitLab account (Vasyl Melnichuk); a merge request, if made, is authored
+**Filed 2026-11-01 as KiCad issue #25967**
+(https://gitlab.com/kicad/code/kicad/-/work_items/25967), from the owner's GitLab account
+(Vasyl Melnichuk, @vasylmeln), with the title and text below and the patch inline; a merge request, if made, is authored
 `Vasyl Melnichuk <qmlxml@gmail.com>`, set for that repository only. Patch: `kicad-GetVisibleLayers-enabled-only.patch` (against
 master, file `pcbnew/api/api_handler_board.cpp`; in 10.0.7 the same loop is in
 `pcbnew/api/api_handler_pcb.cpp`, `API_HANDLER_PCB::handleGetVisibleLayers`).
