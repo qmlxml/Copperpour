@@ -105,3 +105,10 @@ fn the_skill_says_what_a_stand_in_is_and_is_not() {
         assert!(section.contains(scenario), "no {scenario}");
     }
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

@@ -3250,3 +3250,10 @@ mod board_stackup {
         );
     }
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

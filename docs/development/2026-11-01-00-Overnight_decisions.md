@@ -147,3 +147,6 @@ not; the owner is asked only for actions needing their hands or credentials.
   cannot use the effect; the fork's version is useful only with its fork-only `deferred`,
   `close_dialog` and `run_checker`; `editor_navigation.rs` already excludes raw `RunAction` strings
   by design (#395). 2 models agree. Recorded in `docs/BACKLOG.md`.
+- **Test isolation from the home directory: per-test-binary startup isolation plus the gate's
+  empty-`HOME` check** (`2026-11-01-08-Test_home_isolation.md`). First opinion: the startup
+  isolation; the second reviewer's: the same plus the gate as a detector. 2 models agree.

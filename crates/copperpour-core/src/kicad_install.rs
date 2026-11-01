@@ -576,6 +576,7 @@ mod tests {
                 .current_dir(cwd.path())
                 .env(CHILD, "1")
                 .env("HOME", "home")
+                .env(copperpour_test_home::UNCHANGED, "1")
                 .env("XDG_DATA_HOME", "")
                 .env("COPPERPOUR_BRIDGE_DIR", "")
                 .env("KONNECT_BRIDGE_DIR", "")

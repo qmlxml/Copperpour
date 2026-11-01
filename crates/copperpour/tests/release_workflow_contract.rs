@@ -142,3 +142,10 @@ fn real_kicad_workflow_remains_reusable_and_opt_in_for_pull_requests() {
         "weekly and manual real-KiCad entry points must remain available"
     );
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

@@ -840,3 +840,10 @@ fn board_extents_live_and_saved_agree_on_an_unedited_board() {
         }
     }
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

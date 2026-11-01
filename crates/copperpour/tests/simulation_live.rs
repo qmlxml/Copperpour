@@ -1750,3 +1750,10 @@ fn exp_in_an_expression_is_linear_above_an_argument_of_fourteen() {
     near(measured(&result, "pow"), 1e9, 1.0);
     near(measured(&result, "low"), 10f64.exp(), 1e-6);
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

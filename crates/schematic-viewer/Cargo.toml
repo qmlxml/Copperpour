@@ -22,6 +22,9 @@ copperpour-schematic-editor = { path = "../copperpour-schematic-editor" }
 
 [dev-dependencies]
 tempfile = "3"
+# Keep the tests out of the developer's home (see crates/copperpour-test-home).
+copperpour-test-home = { path = "../copperpour-test-home" }
+ctor = "1"
 
 [package.metadata.bundle]
 identifier = "com.konnect.schematic-viewer"

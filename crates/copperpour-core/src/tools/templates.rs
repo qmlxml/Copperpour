@@ -1042,6 +1042,7 @@ mod tests {
             .env(CHILD, "1")
             .env("APPDATA", home.path())
             .env("HOME", home.path())
+            .env(copperpour_test_home::UNCHANGED, "1")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);

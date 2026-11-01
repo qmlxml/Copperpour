@@ -56,6 +56,19 @@ check_space() {
 }
 check_space
 
+# Home-directory check (2026-11-01). Every test binary points its per-user
+# directories at a temporary one (crates/copperpour-test-home). To catch a binary
+# that does not, and doctests, which cannot, the checks run with HOME and the XDG
+# directories set to an empty directory, and the gate fails if anything is written
+# there. RUSTUP_HOME and CARGO_HOME stay on the real ones: without them rustup
+# downloads a toolchain into the empty home (measured).
+real_home="$HOME"
+export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
+export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
+gate_home="$(mktemp -d "${TMPDIR:-/tmp}/copperpour-gate-home.XXXXXX")"
+export HOME="$gate_home"
+unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME
+
 status=0
 run() {
     local name="$1"; shift
@@ -75,6 +88,19 @@ run reliability    cargo test -p copperpour-core --locked --no-fail-fast reliabi
 run test           cargo test --workspace --locked --no-fail-fast --lib --tests
 run doctest        cargo test --workspace --locked --no-fail-fast --doc
 run viewer-test    cargo test --locked --manifest-path crates/schematic-viewer/Cargo.toml
+
+# Anything in the gate's home was written by something not isolated.
+written="$(cd "$gate_home" && find . -mindepth 1 | sort)"
+if [ -z "$written" ]; then
+    echo "PASS home-untouched" >> "$summary"
+    rmdir "$gate_home"
+else
+    echo "FAIL home-untouched (kept: $gate_home)" >> "$summary"
+    echo "===== home-untouched: written under the gate's HOME" >> "$log"
+    echo "$written" >> "$log"
+    echo "$written" | head -20 | sed 's/^/  /' >> "$summary"
+    status=1
+fi
 
 # Test-result totals, so two runs can be compared by number as well as by verdict.
 grep -E '^test result:' "$log" | awk '{p+=$4; f+=$6; i+=$8} END {printf "TOTAL passed=%d failed=%d ignored=%d\n", p, f, i}' >> "$summary"

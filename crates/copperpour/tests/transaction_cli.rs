@@ -82,3 +82,10 @@ fn malformed_journal_requires_force_and_can_be_abandoned() {
     assert!(stdout.contains("without modifying target files"));
     assert!(stdout.contains("complete before/after schematic images"));
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

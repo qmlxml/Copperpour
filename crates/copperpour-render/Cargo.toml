@@ -13,4 +13,6 @@ image.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
+copperpour-test-home.workspace = true
+ctor.workspace = true
 image.workspace = true

@@ -20,3 +20,11 @@ pub(crate) mod specctra_ses;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
+
+/// Keep this crate's unit tests out of the developer's home (see
+/// `copperpour-test-home`).
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

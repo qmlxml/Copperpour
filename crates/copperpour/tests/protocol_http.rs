@@ -265,3 +265,10 @@ fn sse_stream_delivers_tools_list_changed() {
         "tools/list_changed never arrived on the SSE stream"
     );
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

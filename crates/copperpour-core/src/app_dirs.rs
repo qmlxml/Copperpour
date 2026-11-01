@@ -178,6 +178,7 @@ mod tests {
                 ])
                 .env(CHILD, "1")
                 .env("HOME", "relative")
+                .env(copperpour_test_home::UNCHANGED, "1")
                 .env("APPDATA", "relative")
                 .env("XDG_DATA_HOME", "")
                 .output()

@@ -28,6 +28,8 @@ libc = "0.2"
 prost-build = "0.13"
 
 [dev-dependencies]
+copperpour-test-home.workspace = true
+ctor.workspace = true
 tempfile = "3"
 
 # Builds a pipe whose security descriptor refuses this account, the condition a

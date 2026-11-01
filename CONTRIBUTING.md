@@ -155,6 +155,14 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
   refused every stock demo board, because KiCAD writes
   `(property ki_fp_filters "…")` — no position, no layer — into every footprint
   it places from a library, and the hand-written fixture had no such thing.
+- **A new test binary must keep out of your home directory.** Each crate's library tests and each
+  `tests/*.rs` file start with a `#[ctor::ctor(unsafe)]` function that calls
+  `copperpour_test_home::isolate()` (copy one from an existing file), which points `HOME`, the XDG
+  and Windows profile directories, `KICAD_CONFIG_HOME` and `COPPERPOUR_STATE_DIR` at a shared
+  temporary directory. Without it, tests write document locks, call logs and kicad-cli's KiCad
+  configuration into the real home. A test that re-runs its own binary with a deliberate `HOME`
+  sets `COPPERPOUR_TEST_HOME_UNCHANGED=1` on that child. `scripts/gate.sh` runs the suite with an
+  empty `HOME` and fails if anything is written there.
 - **A fixture test that fails only on your machine** may be reading a stale
   copy. Fixtures are `-text`, but a checkout made before that rule keeps the
   line endings `core.autocrlf` gave it, `git status` stays clean, and

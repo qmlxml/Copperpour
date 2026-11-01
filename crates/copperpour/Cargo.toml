@@ -46,6 +46,8 @@ libc.workspace = true
 [build-dependencies]
 
 [dev-dependencies]
+copperpour-test-home.workspace = true
+ctor.workspace = true
 prost.workspace = true
 serde_yaml_ng = "0.10"
 tempfile = "3"

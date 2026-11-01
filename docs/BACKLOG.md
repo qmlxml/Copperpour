@@ -87,8 +87,8 @@ Each entry names where it was found, what is wrong, and the condition that close
   `FREEROUTING_LOG`), so on macOS and Windows unrouted connections are never counted and
   `optimize_seconds` never takes effect. Closing condition: the log location on each platform, or a
   count taken from the SES itself.
-- **Building the Freerouting command in a unit test creates `~/.local/state/freerouting`** in the
-  real home directory. Closing condition: the state directory injected in tests.
+- **~~Building the Freerouting command in a unit test creates `~/.local/state/freerouting`.~~** Fixed
+  2026-11-01 by the test-home isolation: the test now writes under the temporary `HOME`.
 
 - **A slow snapshot download during optimisation ends the whole route** (no missed-poll tolerance on
   `download_running_output`), deleting the temporary SES; and a job that completes between the
@@ -223,13 +223,12 @@ Each entry names where it was found, what is wrong, and the condition that close
 
 ## Test isolation and state files (found 2026-11-01)
 
-- **Tests write into the developer's real state directories.** Only
-  `crates/copperpour/tests/simulation_live.rs` and `copperpour-sexp/src/writer.rs`'s own tests set
-  `COPPERPOUR_STATE_DIR`; the rest of the suite wrote `~/.copperpour/logs/calls.jsonl` (8 MB, through
-  `observability.rs`'s `user_state_dir()`), test EasyEDA cache entries, and 107,778 document lock
-  files into `~/.local/share/konnect/locks` in one session (deleted by owner ruling, 2026-11-01).
-  Same class as the Freerouting entry above. Closing condition: the test harness points
-  `COPPERPOUR_STATE_DIR` and the user state directory at a temporary directory for every test.
+- **~~Tests write into the developer's real state directories.~~ Fixed 2026-11-01**
+  (`docs/development/2026-11-01-08-Test_home_isolation.md`): every test binary points its per-user
+  directories at `<temp>/copperpour-test-home`, and `scripts/gate.sh` fails if anything is written
+  to the empty `HOME` it runs with. Remaining: the CI workflow does not run the empty-`HOME` check
+  (it changes only once the branch can be pushed and CI watched); on Windows the native Specctra
+  bridge's directory (`dirs::data_local_dir`) is not redirected by any variable.
 - **Document lock files are never removed** (`copperpour-sexp/src/writer.rs:588,613-618`): one empty
   file per distinct document path ever written, so the count grows without limit, slowly in normal
   use. Keeping them is deliberate: deleting a lock file another process holds would let the next

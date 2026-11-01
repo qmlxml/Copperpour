@@ -361,3 +361,10 @@ fn docs_quote_the_meta_tool_count() {
         "DEV.md must state \"{meta} meta-tools\" — the registry defines {meta}"
     );
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}
