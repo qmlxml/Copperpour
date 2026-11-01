@@ -179,6 +179,10 @@ enum CopperPiece {
 #[derive(Debug, Clone, PartialEq, Default)]
 struct RoutedCopper {
     pieces: BTreeMap<String, Vec<CopperPiece>>,
+    /// Nets with a routed item whose geometry could not be read (wrong
+    /// declared type, no start, end, position or width): copper of these
+    /// nets counts as reaching every pad, since where it is is unknown.
+    incomplete_nets: BTreeSet<String>,
     zone_nets: BTreeSet<String>,
     unreadable_zone: bool,
 }
@@ -198,7 +202,10 @@ impl RoutedCopper {
             .iter()
             .filter(|pad| pad.number == number)
             .collect();
-        if pads.is_empty() || pads.iter().any(|pad| pad.radius.is_none()) {
+        if pads.is_empty()
+            || pads.iter().any(|pad| pad.radius.is_none())
+            || self.incomplete_nets.contains(net)
+        {
             return true;
         }
         let Some(pieces) = self.pieces.get(net) else {
@@ -2180,84 +2187,91 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
             .filter(|name| !name.is_empty())
     };
     let half = |width: Option<&kiapi::common::types::Distance>| {
-        width.map_or(0.0, |w| {
-            copperpour_ipc::builders::nm_to_mm(w.value_nm) / 2.0
-        })
+        width.map(|w| copperpour_ipc::builders::nm_to_mm(w.value_nm) / 2.0)
     };
     // The geometry is read only from items of their declared type: whether
     // a trace query also lists arcs and vias has not been measured here, and
-    // decoding one message as another would place copper at random. The
-    // routed-net count keeps reading every item, which can only refuse more.
+    // decoding one message as another would place copper at random. An item
+    // with a net whose geometry is not read puts that net in
+    // `incomplete_nets`, so it still refuses (review 1 of plan step 7).
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
         if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, track.net.as_ref());
-            if !copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Track") {
+            let Some(net) = net_of(track.net.as_ref()) else {
                 continue;
-            }
-            if let (Some(net), Some(a), Some(b)) = (
-                net_of(track.net.as_ref()),
+            };
+            match (
+                copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Track"),
                 mm(track.start.as_ref()),
                 mm(track.end.as_ref()),
+                half(track.width.as_ref()),
             ) {
-                copper
+                (true, Some(a), Some(b), Some(half_width)) => copper
                     .pieces
                     .entry(net)
                     .or_default()
-                    .push(CopperPiece::Segment {
-                        a,
-                        b,
-                        half_width: half(track.width.as_ref()),
-                    });
+                    .push(CopperPiece::Segment { a, b, half_width }),
+                _ => {
+                    copper.incomplete_nets.insert(net);
+                }
             }
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
         if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, arc.net.as_ref());
-            if !copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Arc") {
+            let Some(net) = net_of(arc.net.as_ref()) else {
                 continue;
-            }
-            if let (Some(net), Some(a), Some(m), Some(b)) = (
-                net_of(arc.net.as_ref()),
+            };
+            match (
+                copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Arc"),
                 mm(arc.start.as_ref()),
                 mm(arc.mid.as_ref()),
                 mm(arc.end.as_ref()),
+                half(arc.width.as_ref()),
             ) {
-                copper.pieces.entry(net).or_default().extend(arc_pieces(
-                    a,
-                    m,
-                    b,
-                    half(arc.width.as_ref()),
-                ));
+                (true, Some(a), Some(m), Some(b), Some(half_width)) => copper
+                    .pieces
+                    .entry(net)
+                    .or_default()
+                    .extend(arc_pieces(a, m, b, half_width)),
+                _ => {
+                    copper.incomplete_nets.insert(net);
+                }
             }
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
         if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, via.net.as_ref());
-            if !copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Via") {
+            let Some(net) = net_of(via.net.as_ref()) else {
                 continue;
-            }
-            if let (Some(net), Some(at)) = (net_of(via.net.as_ref()), mm(via.position.as_ref())) {
-                // The largest copper size on any layer; a via with none read
-                // is given 1 mm, larger than any standard via, so it errs
-                // towards touching.
-                let radius = via
-                    .pad_stack
-                    .as_ref()
-                    .into_iter()
-                    .flat_map(|stack| stack.copper_layers.iter())
-                    .filter_map(|layer| layer.size.as_ref())
-                    .map(|size| copperpour_ipc::builders::nm_to_mm(size.x_nm.max(size.y_nm)) / 2.0)
-                    .fold(None, |max: Option<f64>, r| {
-                        Some(max.map_or(r, |m| m.max(r)))
-                    })
-                    .unwrap_or(1.0);
-                copper
+            };
+            let at = mm(via.position.as_ref())
+                .filter(|_| copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Via"));
+            // The largest copper size on any layer; a via with none read is
+            // given 1 mm, larger than any standard via, so it errs towards
+            // touching.
+            let radius = via
+                .pad_stack
+                .as_ref()
+                .into_iter()
+                .flat_map(|stack| stack.copper_layers.iter())
+                .filter_map(|layer| layer.size.as_ref())
+                .map(|size| copperpour_ipc::builders::nm_to_mm(size.x_nm.max(size.y_nm)) / 2.0)
+                .fold(None, |max: Option<f64>, r| {
+                    Some(max.map_or(r, |m| m.max(r)))
+                })
+                .unwrap_or(1.0);
+            match at {
+                Some(at) => copper
                     .pieces
                     .entry(net)
                     .or_default()
-                    .push(CopperPiece::Disc { at, radius });
+                    .push(CopperPiece::Disc { at, radius }),
+                None => {
+                    copper.incomplete_nets.insert(net);
+                }
             }
         }
     }
@@ -2265,7 +2279,12 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
         match zone_net(item.value.as_slice()) {
             ZoneNet::Copper(net) => {
-                copper.zone_nets.insert(net.name.clone());
+                // A copper zone on no net pours nothing a pad is on; recording
+                // its empty name would refuse every pad gaining or losing a
+                // net (review 1 of plan step 7).
+                if !net.name.is_empty() {
+                    copper.zone_nets.insert(net.name.clone());
+                }
                 record_routed_net(&mut routed_nets, Some(&net))
             }
             ZoneNet::RuleArea => {}
@@ -4943,6 +4962,7 @@ mod tests {
         board.routed_nets = BTreeMap::from([("VCC".to_string(), vcc.len())]);
         board.copper = Some(RoutedCopper {
             pieces: BTreeMap::from([("VCC".to_string(), vcc)]),
+            incomplete_nets: BTreeSet::new(),
             zone_nets: zone_nets.iter().map(|net| net.to_string()).collect(),
             unreadable_zone,
         });
@@ -6469,6 +6489,8 @@ mod tests {
     struct HeldBoard {
         footprints: Vec<prost_types::Any>,
         zones: Vec<prost_types::Any>,
+        /// Tracks the board answers a `KotPcbTrace` query with.
+        tracks: Vec<prost_types::Any>,
         nets: Vec<&'static str>,
     }
 
@@ -6541,10 +6563,18 @@ mod tests {
                         .map(|id| id.value)
                         .unwrap_or_default()
                 }))
+                .chain(held.tracks.iter().map(|item| {
+                    kiapi::board::types::Track::decode(item.value.as_slice())
+                        .ok()
+                        .and_then(|track| track.id)
+                        .map(|id| id.value)
+                        .unwrap_or_default()
+                }))
                 .collect::<Vec<_>>();
             let held_footprints = std::sync::Arc::new(std::sync::Mutex::new(held.footprints));
             let board_held = held_footprints.clone();
             let held_zones = held.zones;
+            let held_tracks = held.tracks;
             let held_nets = held.nets;
             let board_text = std::sync::Arc::new(std::sync::Mutex::new(
                 String::from_utf8_lossy(include_bytes!(
@@ -6611,6 +6641,12 @@ mod tests {
                                 )
                                 .collect(),
                             _ if request.types.contains(&zones) => held_zones.clone(),
+                            _ if request.types.contains(
+                                &(kiapi::common::types::KiCadObjectType::KotPcbTrace as i32),
+                            ) =>
+                            {
+                                held_tracks.clone()
+                            }
                             _ => Vec::new(),
                         };
                         return Some(copperpour_ipc::builders::pack_any(
@@ -7017,6 +7053,7 @@ mod tests {
         let served = ServedSync::holding(HeldBoard {
             footprints: vec![schematic_backed_resistor()],
             zones,
+            tracks: Vec::new(),
             nets: vec!["VCC", "GND"],
         })
         .await;
@@ -7030,6 +7067,148 @@ mod tests {
             .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
             .replace("/Power/VCC", "VCC")
             .replace(&format!("(name \"{net}\")"), "(name \"NEW_NET\")")
+    }
+
+    /// A track on `net` from `(x, y)` to 2 mm right of it, 0.25 mm wide.
+    fn track_item(net: &str, x_nm: i64, y_nm: i64) -> prost_types::Any {
+        use copperpour_ipc::gen::kiapi;
+        let track = kiapi::board::types::Track {
+            id: Some(kiapi::common::types::Kiid {
+                value: format!("track-{x_nm}-{y_nm}"),
+            }),
+            start: Some(kiapi::common::types::Vector2 { x_nm, y_nm }),
+            end: Some(kiapi::common::types::Vector2 {
+                x_nm: x_nm + 2_000_000,
+                y_nm,
+            }),
+            width: Some(kiapi::common::types::Distance { value_nm: 250_000 }),
+            net: Some(kiapi::board::types::Net {
+                name: net.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        copperpour_ipc::builders::pack_any(&track, "kiapi.board.types.Track")
+    }
+
+    /// The board position, in nm, of the captured `R1`'s pad on `net`, read
+    /// from the capture directly rather than through the snapshot.
+    fn captured_pad_on(net: &str) -> (i64, i64) {
+        use copperpour_ipc::gen::kiapi;
+        let footprint = kiapi::board::types::FootprintInstance::decode(
+            schematic_backed_resistor().value.as_slice(),
+        )
+        .unwrap();
+        footprint
+            .definition
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+            .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
+            .find(|pad| pad.net.as_ref().is_some_and(|n| n.name == net))
+            .and_then(|pad| pad.position)
+            .map(|at| (at.x_nm, at.y_nm))
+            .unwrap_or_else(|| panic!("the captured R1 has a pad on {net}"))
+    }
+
+    async fn plan_moving_off_with_tracks(
+        net: &str,
+        tracks: Vec<prost_types::Any>,
+    ) -> serde_json::Value {
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![schematic_backed_resistor()],
+            zones: Vec::new(),
+            tracks,
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        served.dry_run(&netlist_moving_off(net)).await
+    }
+
+    /// Through `tools/call`, with the captured `R1` and the tracks read by
+    /// `snapshot_board` (review 1 of plan step 7: the pad-reach tests built
+    /// the copper by hand). (a) Not refusing is right for a VCC track 20 mm
+    /// from the pad: moving the pad strands nothing. (b) Refusing is right
+    /// for a VCC track that starts on the pad, and for one whose geometry
+    /// is unreadable, both asserted here.
+    #[tokio::test]
+    async fn served_tracks_far_from_or_on_the_pad_decide_the_change() {
+        let (x, y) = captured_pad_on("VCC");
+        let far =
+            plan_moving_off_with_tracks("VCC", vec![track_item("VCC", x, y + 20_000_000)]).await;
+        assert_eq!(far["status"], "ready", "{far:#}");
+        assert_eq!(routed_pad_conflicts(&far), Vec::<String>::new());
+
+        let on = plan_moving_off_with_tracks("VCC", vec![track_item("VCC", x, y)]).await;
+        assert_eq!(on["status"], "conflict", "{on:#}");
+        assert_eq!(routed_pad_conflicts(&on).len(), 1, "{on:#}");
+
+        let mut unreadable = track_item("VCC", x, y + 20_000_000);
+        let mut track =
+            copperpour_ipc::gen::kiapi::board::types::Track::decode(unreadable.value.as_slice())
+                .unwrap();
+        track.width = None;
+        unreadable = copperpour_ipc::builders::pack_any(&track, "kiapi.board.types.Track");
+        let unknown = plan_moving_off_with_tracks("VCC", vec![unreadable]).await;
+        assert_eq!(unknown["status"], "conflict", "{unknown:#}");
+    }
+
+    /// A copper zone on no net (its net name empty) pours nothing a pad is
+    /// on. The board's R1 has its VCC pad on no net and the schematic gives
+    /// it VCC, so the change starts from the empty net, the case review 1 of
+    /// plan step 7 found refused: the empty name was recorded as poured.
+    /// (a) Not refusing is right: no copper touches the pad and no zone pours
+    /// VCC. (b) Refusing would be right if a zone poured VCC, or its net could
+    /// not be read (`a_pour_blocks_a_pad_moving_onto_its_net`,
+    /// `with_copper_read_a_pour_or_unreadable_zone_still_blocks`).
+    #[tokio::test]
+    async fn a_zone_on_no_net_does_not_block_a_pad_gaining_a_net() {
+        use copperpour_ipc::gen::kiapi;
+        use kiapi::board::types::{zone::Settings, Zone};
+        let mut zone = Zone::decode(GND_POUR).unwrap();
+        let Some(Settings::CopperSettings(copper)) = zone.settings.as_mut() else {
+            panic!("the captured pour is a copper zone");
+        };
+        copper.net.as_mut().unwrap().name = String::new();
+        let no_net = copperpour_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone");
+
+        let mut footprint = kiapi::board::types::FootprintInstance::decode(
+            schematic_backed_resistor().value.as_slice(),
+        )
+        .unwrap();
+        let mut cleared = 0;
+        for item in &mut footprint.definition.as_mut().unwrap().items {
+            if !copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            if pad.net.as_ref().is_some_and(|net| net.name == "VCC") {
+                pad.net = None;
+                *item = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+                cleared += 1;
+            }
+        }
+        assert_eq!(cleared, 1, "the captured R1 has one VCC pad");
+        let footprint =
+            copperpour_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![footprint],
+            zones: vec![no_net],
+            tracks: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        let plan = served
+            .dry_run(
+                &ONE_RESISTOR
+                    .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
+                    .replace("/Power/VCC", "VCC"),
+            )
+            .await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(routed_pad_conflicts(&plan), Vec::<String>::new());
     }
 
     /// The messages of a served dry run's `routed_pad_net_change` conflicts.
@@ -7089,6 +7268,7 @@ mod tests {
         let served = ServedSync::holding(HeldBoard {
             footprints: vec![schematic_backed_resistor()],
             zones: vec![zone_item(GND_POUR)],
+            tracks: Vec::new(),
             nets: vec!["VCC", "GND"],
         })
         .await;
@@ -7112,6 +7292,7 @@ mod tests {
         let served = ServedSync::holding(HeldBoard {
             footprints: vec![schematic_backed_resistor()],
             zones: vec![zone_item(GND_POUR), zone_item(RULE_AREA)],
+            tracks: Vec::new(),
             nets: vec!["VCC", "GND"],
         })
         .await;
@@ -7755,10 +7936,6 @@ mod tests {
         assert_eq!(applied["staging"], expected, "{applied:#}");
     }
 
-    /// The schematic decides DNP, over whatever the library footprint says,
-    /// as KiCad's own Update PCB from Schematic does. The library data is
-    /// applied first and the schematic's fields second, so the order is what
-    /// this pins: both directions, on the KiCad-written 0603.
     /// A part the sync adds from a library with net-tie pad groups and a
     /// footprint-level zone connection carries both (merge of the `marju212`
     /// fork); a solder jumper added without its ties is a short in DRC.
@@ -7797,6 +7974,10 @@ mod tests {
         );
     }
 
+    /// The schematic decides DNP, over whatever the library footprint says,
+    /// as KiCad's own Update PCB from Schematic does. The library data is
+    /// applied first and the schematic's fields second, so the order is what
+    /// this pins: both directions, on the KiCad-written 0603.
     #[test]
     fn the_schematic_decides_dnp_over_the_library() {
         use copperpour_ipc::gen::kiapi;
@@ -7969,6 +8150,7 @@ mod tests {
         let served = ServedSync::holding(HeldBoard {
             footprints: vec![held],
             zones: Vec::new(),
+            tracks: Vec::new(),
             nets: vec!["VCC", "GND"],
         })
         .await;

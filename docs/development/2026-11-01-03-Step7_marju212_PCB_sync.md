@@ -39,8 +39,9 @@ already in Copperpour, and its `LibraryExtras` duplicated Copperpour's `LibraryF
   `an_added_solder_jumper_carries_its_net_ties_and_zone_connection`.
 - Placement: `LibraryFootprintData` gains both, with `read` and `apply_to_item`, used by
   `place_component`, and now also by `place_array` and `duplicate_component`, which before sent the
-  bare built footprint with none of the library data. `duplicate_component` on B.Cu builds on that
-  layer instead of flipping, so the models are left off there (backlog). Test
+  bare built footprint with none of the library data. (A first version left the models off a B.Cu
+  duplicate; review 1 found that case unreachable, since `duplicate_component` refuses back-side
+  sources, and it was removed.) Test
   `placed_items_carry_net_ties_and_the_zone_connection`.
 - Library refresh: both clauses accepted; both copied onto the rebuilt footprint; new changed domains
   `net_ties` and `zone_connection`. Without them a refresh that differed only in net ties planned a
@@ -66,8 +67,9 @@ reports `deleted_type: "via"`. (Overnight decision 16.)
 The snapshot records each pad's board position and reach (`PadReach`), and the routed copper by net
 (`RoutedCopper`: tracks and arc chords as segments, vias as discs, zone nets, an unreadable zone).
 The planner refuses when copper of the old net reaches the pad, or a zone pours either net (kept from
-Copperpour, #862; `6dad58a` waits for the owner), or a zone's net is unreadable. Without the copper
-read (a closed board, the test boards) the old rule applies. Differences from the fork:
+Copperpour, #862; `6dad58a` waits for the owner), or a zone's net is unreadable. `snapshot_board`
+always reads the copper, so the older rule (any routed net refuses) is now reached only from unit
+tests that build a board without it. Differences from the fork:
 
 - **An arc's chords are widened by its sagitta.** The fork used the two chords alone; copper on the
   bulge of an arc then did not count as reaching the pad, which would allow the change. Test
@@ -89,3 +91,38 @@ statement of when refusing would be right), `copper_reaching_the_pad_still_block
 
 Gate (`logs/gate-step7-7fa1510.summary`): 3,724 passed (+5), 1 failed (the known baseline
 failure), 110 ignored.
+
+Committed as `d31f5fb`.
+
+## Review 1 (implementation) and fix pass 1
+
+Confirmed: `footprint_text.rs` matches the fork's after the rename and depends on nothing of
+`a7886a9`; the zone-connection mapping; pads in board coordinates; the sagitta widening covers any
+arc; the tests fail if the behaviour regresses. Fixed:
+
+1. **A copper zone on no net was recorded as pouring the empty net**, so every pad gaining or losing
+   a net was refused on a board with such a zone. Only named zone nets are recorded now. Served test
+   `a_zone_on_no_net_does_not_block_a_pad_gaining_a_net` (R1's VCC pad starts on no net); control:
+   with the fix disabled it fails. (A first version of this test moved a pad between two named nets
+   and passed with the fix disabled; it was rewritten.)
+2. **A routed item whose geometry was not read was ignored by the new rule**, so the change was
+   allowed (the old count still saw it, but the planner no longer reads the count when copper is
+   read). Such an item's net now goes in `incomplete_nets`, which counts as reaching every pad; a
+   missing track width is treated the same way instead of as zero.
+3. Pad-stack offset: the IPC messages carry none (checked in the proto), so nothing to read; recorded
+   in `docs/BACKLOG.md`.
+4. **The "B.Cu duplicate keeps no models" branch was unreachable** (`duplicate_component` refuses
+   back-side sources first): removed, with its backlog entry and documentation.
+5. A doc comment of `the_schematic_decides_dnp_over_the_library` had moved onto the new test: moved
+   back.
+6. **The pad-reach tests built the copper by hand**, so nothing tested `snapshot_board`'s reading:
+   the served test board now holds tracks, and
+   `served_tracks_far_from_or_on_the_pad_decide_the_change` runs a dry run with the real KiCad
+   capture of R1 and a VCC track 20 mm away (ready), on the pad (conflict), and with no width
+   (conflict); control: with `incomplete_nets` disabled it fails.
+7. The step log said a closed board used the old rule; there is no closed-board sync path. Corrected
+   above.
+8. **Net-tie groups were split on commas only**: now on commas and white space, as KiCad reads them.
+
+Gate (`logs/gate-step7-fix1.summary`): 3,726 passed (+2), 1 failed (the known baseline failure),
+110 ignored.

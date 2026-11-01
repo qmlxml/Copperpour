@@ -129,10 +129,9 @@ Each entry names where it was found, what is wrong, and the condition that close
 
 ## PCB sync and library data (plan step 7)
 
-- **`duplicate_component` on B.Cu leaves the library's 3D models off**, as before the merge: that path
-  builds the footprint directly on B.Cu instead of flipping it, and where KiCad then puts a front-side
-  model has not been checked. Closing condition: measured on a live board, or the copy flipped as
-  `place_component` does.
+- **A pad's reach ignores a pad-stack offset**: KiCad's IPC `PadStack` and `PadStackLayer` messages
+  carry no offset or trapezoid delta, so a pad whose copper is offset from its position is judged by
+  a circle around its position. Closing condition: measured on a live board with an offset pad.
 - **A library that drops its `zone_connect` clause leaves the board footprint's earlier override in
   place** (KiCad's refresh would reset it to inherited). Closing condition: decided against KiCad's
   behaviour on a live board.

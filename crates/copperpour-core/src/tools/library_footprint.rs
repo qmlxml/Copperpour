@@ -60,9 +60,11 @@ pub(crate) fn net_ties(root: &SexpNode) -> Result<Vec<kiapi::board::types::NetTi
         let group = group
             .as_str()
             .context("footprint net_tie_pad_groups contains a non-atom")?;
+        // KiCad splits a group on commas and white space alike (review 1 of
+        // plan step 7: a hand-written `"1 2"` read as one pad named "1 2"
+        // would never match KiCad's own reading).
         let pad_number = group
-            .split(',')
-            .map(str::trim)
+            .split(|c: char| c == ',' || c.is_whitespace())
             .filter(|pad| !pad.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
@@ -861,6 +863,8 @@ mod tests {
         assert!(zone_connection(&bad).is_err());
         let empty = root("(footprint \"X\" (net_tie_pad_groups \" , \"))");
         assert!(net_ties(&empty).is_err());
+        let spaced = root("(footprint \"X\" (net_tie_pad_groups \"1 2,3\"))");
+        assert_eq!(net_ties(&spaced).unwrap()[0].pad_number, ["1", "2", "3"]);
     }
 
     #[test]
