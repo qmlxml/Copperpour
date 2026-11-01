@@ -19,7 +19,7 @@ Not merged:
 - `00f2307` (name the viewer binary this platform looks for): Copperpour had already fixed this,
   more thoroughly (platform suffix, PATH search, never the working directory, #184).
 - `c2143d2` (copy custom library fields onto placed symbols): merged, then **reverted**
-  (`e97b45f`). Copperpour already carries library custom fields into placed components (`817ea51`,
+  (`5b3e3cd`). Copperpour already carries library custom fields into placed components (`817ea51`,
   closes #3); with both, a field such as LCSC was written twice, Copperpour's placement read-back
   refused the result as ambiguous (`mutation_outcome_uncertain`), and three placement tests failed.
 - **`f517fd8` and `d2961f4`, left for the owner** (overnight decision 11): they report every tool
@@ -33,7 +33,7 @@ descriptions (the contributor's grid wording, Copperpour's shared `project_name`
 duplicate-sheet offset (Copperpour's code, the contributor's 20.32 mm, 16 grid steps);
 `schematic.rs` (Copperpour already rounds these coordinates). The viewer commit was skipped.
 
-Adaptation (`17ec356`): three lines still used `konnect_` crate names; `along_stub` had been placed
+Adaptation (`1de85f3`): three lines still used `konnect_` crate names; `along_stub` had been placed
 by the cherry-pick inside an unrelated function (Copperpour had added code where the contributor's
 context lines were) and was moved into `impl StubDirection`; the connection-map test adapted to
 Copperpour's template fixture.
@@ -43,9 +43,9 @@ Gate (`logs/gate-step6-merge.summary`): 3,701 passed (+10), 1 failed (the known 
 
 A process slip, recorded: a first `git revert` was refused because the adaptation edits were not
 yet committed, and the `git commit --amend` that followed rewrote the previous commit's message.
-The branch was reset to the original commit (`f68faec`) before anything else was committed; the
+The branch was reset to the original commit (`d574a81`) before anything else was committed; the
 edits were then committed on their own and the revert redone.
-Committed as `5e851e9` (step log), with the merge commits before it.
+Committed as `2d6402d` (step log), with the merge commits before it.
 
 ## Review 1 (implementation, focused on the merge) and fix pass 1
 
@@ -84,7 +84,7 @@ tests do not set up for these cases).
 
 Gate after fix pass 1 (`logs/gate-step6-fix1.summary`): 3,703 passed (+2), 1 failed (the known
 baseline failure), 109 ignored. After the full run, `~/.copperpour/templates` does not exist.
-Committed as `dd92bdf`.
+Committed as `7edf9cc`.
 
 ## Review 2 (robustness) and fix pass 2
 
@@ -120,7 +120,7 @@ unparsable batch body) is not reachable in practice, since the body is produced 
 Gate after fix pass 2 (`logs/gate-step6-fix2.summary`): 3,703 passed, 1 failed (the known baseline
 failure), 110 ignored (+1, the live test). A first run failed clippy on the live test's
 configuration; fixed.
-Committed as `f4c6e3f`.
+Committed as `1105574`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 

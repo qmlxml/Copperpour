@@ -30,7 +30,7 @@ The first gate run failed the documentation test on the skill's `not_in_spice_ne
 to `NOT_TOOLS` beside `excluded_in_schematic`. Gate (`logs/gate-step4b.summary`): 3,736 passed (+2),
 1 failed (the known baseline failure), 110 ignored.
 
-Committed as `bbbe1252`.
+Committed as `468e6d76`.
 
 ## Review 1 (implementation) and fix pass 1
 
@@ -58,7 +58,7 @@ the whole part; a library symbol's flag and `dnp` have no effect. Fixed:
 
 Gate (`logs/gate-step4b-fix1.summary`): 3,737 passed (+1), 1 failed (the known baseline failure),
 111 ignored (+1, the new live test).
-Committed as `55b1aef8`.
+Committed as `cad73ce1`.
 
 ## Review 2 (robustness) and fix pass 2
 
@@ -80,7 +80,7 @@ written outside it, and there are no symlinks); KiCad refuses `exclude_from_sim`
 
 Gate (`logs/gate-step4b-fix2.summary`): 3,737 passed, 1 failed (the known baseline failure), 112
 ignored (+1, the new live test).
-Committed as `5142f1ca`.
+Committed as `a51ebf69`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -106,7 +106,7 @@ The first gate runs failed the documentation test on the skill's `sheets_not_rea
 (`logs/gate-step4b-fix3.summary`): 3,737 passed, 1 failed (the known baseline failure), 112
 ignored.
 
-Committed as `c8b10ae3`.
+Committed as `6b774f7a`.
 
 ## Documentation review
 

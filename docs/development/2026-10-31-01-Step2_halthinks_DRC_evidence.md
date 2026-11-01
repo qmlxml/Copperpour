@@ -8,8 +8,8 @@ Cherry-picked onto `integration` with `git cherry-pick -x`, author kept:
 
 | Here | Original | Subject |
 |---|---|---|
-| `28873e8` | `36eec43` | fix(routing): preserve unavailable SES import DRC evidence |
-| `1e3457e` | `44c3935` | fix(drc): withhold silent parity zero when root schematic is absent |
+| `deb98ac` | `36eec43` | fix(routing): preserve unavailable SES import DRC evidence |
+| `ab07b9b` | `44c3935` | fix(drc): withhold silent parity zero when root schematic is absent |
 
 What the two commits change:
 - `apply_specctra_ses` used to turn a DRC category that was not checked (`null`) into 0 and
@@ -68,7 +68,7 @@ Review 1 found no defect in the logic. Its findings and what was done:
    `a_silent_empty_parity_array_with_its_root_present_is_a_checked_zero`.
 
 Gate after fix pass 1 (`logs/gate-step2-fix1.summary`): same as after the merge — 3,140 passed,
-1 failed (the known baseline failure), 58 ignored. Committed as `414422f`.
+1 failed (the known baseline failure), 58 ignored. Committed as `c4f214a`.
 
 ## Review 2 (robustness) and fix pass 2
 
@@ -108,7 +108,7 @@ non-UTF-8 board path still panics at `pcb.to_str().unwrap()` in `run_drc`; that 
 change and is not part of this step.
 
 Gate after fix pass 2 (`logs/gate-step2-fix2.summary`): 3,142 passed (the two new tests),
-1 failed (the known baseline failure), 58 ignored. Committed as `ff8c657`.
+1 failed (the known baseline failure), 58 ignored. Committed as `ae5a848`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -147,7 +147,7 @@ files. Three tests added. The real fix is plan step 2b (Fork Survey
    directory. Not pursued.
 
 Gate after fix pass 3 (`logs/gate-step2-fix3.summary`): 3,145 passed (the three new rules
-tests), 1 failed (the known baseline failure), 58 ignored. Committed as `3115795`.
+tests), 1 failed (the known baseline failure), 58 ignored. Committed as `d060bad`.
 
 ## Documentation review (sub-step 16)
 

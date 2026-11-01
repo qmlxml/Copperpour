@@ -4,9 +4,9 @@ Plan: `2026-10-31-00-Fork_Survey.md`, section 7. Feature description: `docs/LIVE
 
 ## Merge
 
-Cherry-picked `97dbaa4` (branch `live-editor`) as `a21e1ed`, author kept. The fork was based on
+Cherry-picked `97dbaa4` (branch `live-editor`) as `d0a0a0f`, author kept. The fork was based on
 upstream Konnect before Copperpour renamed its crates, so the merge adapted it; these changes are
-part of `a21e1ed`:
+part of `d0a0a0f`:
 - `konnect_sexp::` → `copperpour_sexp::` in the five changed files; a message "Konnect did not modify
   it" → "Copperpour did not modify it" (handler.rs), matching Copperpour's other lock messages.
 - Environment variables read through `copperpour_core::app_dirs::env_var`, so
@@ -27,7 +27,7 @@ Review 1 read the module for API mismatches and found none.
 
 Gate (`logs/gate-step3-merge.summary`): tests as the baseline plus earlier steps (3,163 passed, the
 known failure), but clippy failed on two needless borrows in the contributed code (rust 1.96
-`needless_borrows_for_generic_args`). Fixed in `9c822b7`; clippy then passes.
+`needless_borrows_for_generic_args`). Fixed in `d5d41be`; clippy then passes.
 
 ## Review 1 (implementation) and fix pass 1
 
@@ -69,7 +69,7 @@ other test in the process.
 
 Gate after fix pass 1 (`logs/gate-step3-fix1.summary`): 3,167 passed (+4), 1 failed (the known
 baseline failure), 60 ignored; clippy passes.
-Committed as `48d4d93`.
+Committed as `c2eb463`.
 
 ## Review 2 (robustness) and fix pass 2
 
@@ -99,7 +99,7 @@ Done:
 
 Gate after fix pass 2 (`logs/gate-step3-fix2.summary`): 3,168 passed (+1), 1 failed (the known
 baseline failure), 60 ignored.
-Committed as `f81fe5a`.
+Committed as `15e0fb1`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -135,7 +135,7 @@ permanent (a retry re-reads the file). Findings and what was done:
    added for the missing CI job.
 
 Gate after fix pass 3 (`logs/gate-step3-fix3.summary`): 3,171 passed (+3), 1 failed (the known
-baseline failure), 60 ignored. Committed as `4ab7a13`.
+baseline failure), 60 ignored. Committed as `8120d45`.
 
 ## Documentation review (sub-step 16)
 

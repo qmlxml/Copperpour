@@ -1,7 +1,7 @@
 # Step 7: marju212 PCB sync (per behaviour)
 
 Plan: `2026-10-31-00-Fork_Survey.md`, "Step 7 method". Base: `integration` after step 6
-(`19fffad`), gate 3,704 passed. The six behaviours judged already present in Copperpour were
+(`f2bca2a`), gate 3,704 passed. The six behaviours judged already present in Copperpour were
 checked before work began: `f341fb3`, `10c16e3`, `27b0aec`, `6312362`, `109f890`, `a0583b3` and
 `958153e` are ancestors of `integration`, and the tests cited for them exist.
 
@@ -23,7 +23,7 @@ KiCad 10 board.
 
 Gate (`logs/gate-step7-merge.summary`): 3,715 passed (+11, the fork's footprint-text tests), 1
 failed (the known baseline failure), 110 ignored.
-Committed as `b388cc1` (author kept: Marcus Junström).
+Committed as `eac2200` (author kept: Marcus Junström).
 
 ## `a7886a9`: net ties and footprint zone connection (re-implemented)
 
@@ -54,7 +54,7 @@ Migration note `docs/api-migrations/footprint-net-ties-and-zone-connection.md`.
 
 Gate (`logs/gate-step7-a7886a9.summary`): 3,719 passed (+4), 1 failed (the known baseline
 failure), 110 ignored.
-Committed as `9c801a7`.
+Committed as `ce5e70e`.
 
 ## `04afb36`: not applied
 
@@ -93,7 +93,7 @@ statement of when refusing would be right), `copper_reaching_the_pad_still_block
 Gate (`logs/gate-step7-7fa1510.summary`): 3,724 passed (+5), 1 failed (the known baseline
 failure), 110 ignored.
 
-Committed as `d31f5fb`.
+Committed as `30d6019`.
 
 ## Review 1 (implementation) and fix pass 1
 
@@ -127,7 +127,7 @@ arc; the tests fail if the behaviour regresses. Fixed:
 
 Gate (`logs/gate-step7-fix1.summary`): 3,726 passed (+2), 1 failed (the known baseline failure),
 110 ignored.
-Committed as `325b083`.
+Committed as `41aca18`.
 
 ## Review 2 (robustness) and fix pass 2
 
@@ -165,7 +165,7 @@ re-taken at apply. Fixed:
 
 Gate (`logs/gate-step7-fix2.summary`): 3,730 passed (+4), 1 failed (the known baseline failure),
 110 ignored.
-Committed as `1a600e4`.
+Committed as `06b2dab`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -197,7 +197,7 @@ Fixed:
    cannot be read** (`(attr virtual)`, a KiCad 5 model offset), which they placed before: they place
    them without it again and report `library_data_not_applied`. Migration notes corrected.
 
-Committed as `564be3e`.
+Committed as `cabca34`.
 
 Gate (`logs/gate-step7-fix3.summary`): 3,730 passed (unchanged: existing tests were updated, none
 added), 1 failed (the known baseline failure), 110 ignored.
@@ -208,5 +208,5 @@ An independent check confirmed the commit hashes, names, JSON fields and gate co
 `a7886a9` section still described the zone connection as copied (superseded by review 3); the review
 3 section lacked its commit; the plan's table did not account for the 13 behaviours of the method
 section; "one commit" in that table meant one KiCad commit; overnight decision 15 named tracks only;
-the prepared question's "one count mixes them" was already met by `d31f5fb`; "served test" was
+the prepared question's "one count mixes them" was already met by `30d6019`; "served test" was
 undefined (now "test through `tools/call`").

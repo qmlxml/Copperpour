@@ -58,7 +58,7 @@ run ended and under another session's activity; its API setting was intact.)
 - Remaining (in `docs/BACKLOG.md`): CI does not run the empty-`HOME` check yet; on Windows the
   native Specctra bridge directory is not redirected.
 
-Committed as `274ba449`.
+Committed as `ace80978`.
 
 ## Review 1 (implementation, robustness, intent) and fix pass 1
 
@@ -90,7 +90,7 @@ Confirmed: every test binary is covered (29 integration files, each library's un
 
 Gate (`logs/gate-test-home-fix1.summary`): 3,748 passed, 0 failed, 113 ignored, `home-untouched`
 PASS.
-Committed as `e1b8c172`.
+Committed as `837f1eb9`.
 
 ## Review 2 (robustness) and fix pass 2
 
@@ -129,7 +129,7 @@ tree starts threads, by reading). Fixed:
 
 Gate (`logs/gate-test-home-fix2.summary`): 3,748 passed, 0 failed, 113 ignored, `home-untouched`
 PASS; nothing left in `/tmp` or the build directory afterwards.
-Committed as `5224f95f`.
+Committed as `0a59855a`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -157,7 +157,7 @@ Fixed:
 Gate (`logs/gate-test-home-fix3.summary`): 3,749 passed (+1), 0 failed, 113 ignored,
 `home-untouched` PASS.
 
-Committed as `848ebd50`.
+Committed as `5ef79928`.
 
 ## As shipped, against the plan
 

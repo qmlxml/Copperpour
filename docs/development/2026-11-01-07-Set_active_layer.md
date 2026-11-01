@@ -22,7 +22,7 @@ measurement (`stock_editor_command_probe`, 2026-11-01).
 
 Gate (`logs/gate-set-active-layer.summary`): 3,740 passed (+3), 1 failed (the known baseline
 failure), 113 ignored.
-Committed as `4012a292`.
+Committed as `3b565a3c`.
 
 ## `run_editor_action`: not implemented
 
@@ -56,7 +56,7 @@ fork's unbounded version. Recorded in `docs/BACKLOG.md`.
 
 Gate (`logs/gate-set-active-layer-fix1.summary`): 3,743 passed (+3), 1 failed (the known baseline
 failure), 113 ignored.
-Committed as `c6a6f4e3`.
+Committed as `a6f48e84`.
 
 ## Review 2 (robustness) and fix pass 2
 
@@ -82,7 +82,7 @@ change with a failed read-back reported as accepted). Fixed:
 
 Gate (`logs/gate-set-active-layer-fix2.summary`): 3,744 passed (+1), 1 failed (the known baseline
 failure), 113 ignored.
-Committed as `ef263151`.
+Committed as `e77d5e7b`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -105,7 +105,7 @@ new state needs a person to leave it. Fixed:
    opinions and the #395 reference.
 6. The probe's comment is in the past tense.
 
-Committed as `c842a4b4`.
+Committed as `465830ed`.
 
 ## Documentation review
 

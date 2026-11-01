@@ -75,7 +75,7 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
   data that `refill_zones` regenerates, while a track is not. Conditions: report `zones_to_refill` in
   the plan as well as after apply, as a warning naming the next action; collect zone nets separately
   from track nets in `snapshot_board`, so a track still refuses and an unreadable zone still refuses
-  (already met since `d31f5fb`: `RoutedCopper` keeps zone nets and unreadable zones apart from track
+  (already met since `30d6019`: `RoutedCopper` keeps zone nets and unreadable zones apart from track
   geometry, and an unreadable zone refuses); migration note; the tests asserting "not blocked"
   name the states where blocking is right (Rule A).
 - **First opinion (this session):** option 2, with the same conditions. 2 models agree.

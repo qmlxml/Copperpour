@@ -43,7 +43,7 @@ builds; `Cargo.lock` unchanged.
 Gate after the merge (`logs/gate-step5-merge.summary`): 3,685 passed (+31), 1 failed (the known
 baseline failure), 109 ignored. A first run failed fmt (the merged test was not formatted) and
 Copperpour's count test, which read a phrase in the step 4 log as a stale toolset count; both fixed.
-Committed as `c9f429c`.
+Committed as `6644ed7`.
 
 ## Review 1 (implementation, focused on the merge) and fix pass 1
 
@@ -81,7 +81,7 @@ Not covered by new tests: 1 (would change environment variables shared by every 
 process), 2 and 7 (need a Freerouting installation or the full handler), 5 and 6 (need a transport
 test with a tool that reports progress). Gate (`logs/gate-step5-fix1.summary`): 3,685 passed,
 1 failed (the known baseline failure), 109 ignored.
-Committed as `d8460a1`.
+Committed as `a3b7728`.
 
 ## Review 2 (robustness) and fix pass 2
 
@@ -117,7 +117,7 @@ part of the log on each poll.
 
 Gate after fix pass 2 (`logs/gate-step5-fix2.summary`): 3,689 passed (+4), 1 failed (the known
 baseline failure), 109 ignored.
-Committed as `e097248`.
+Committed as `3b0e4ec`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -157,7 +157,7 @@ lines are filtered by the job's tag). Findings and what was done; decisions are 
 11. HTTP: nothing taken away (progress was new in this step).
 
 Gate (`logs/gate-step5-fix3.summary`): 3,691 passed (+2), 1 failed (the known baseline failure),
-109 ignored. Committed as `6675dff`.
+109 ignored. Committed as `d213d3c`.
 
 ## Documentation review (sub-step 16)
 

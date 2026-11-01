@@ -2,7 +2,7 @@
 
 Owner ruling 2026-11-01 (overnight decision 15; second opinion from a second reviewer; 2 models agree): allow the
 change and report the pours to refill, as KiCad's Update PCB does and as the `marju212` fork's
-`6dad58a` does. Base: `integration` at `61e97e13` (gate 3,730 passed after step 7).
+`6dad58a` does. Base: `integration` at `1c920aa6` (gate 3,730 passed after step 7).
 
 ## Implementation
 
@@ -25,7 +25,7 @@ change and report the pours to refill, as KiCad's Update PCB does and as the `ma
 
 Gate (`logs/gate-step7b.summary`): 3,731 passed (+1), 1 failed (the known baseline failure), 110
 ignored.
-Committed as `922977f9`.
+Committed as `108b9876`.
 
 ## Review 1 and fix pass 1
 
@@ -54,7 +54,7 @@ not hash it (it is derived from the zones, whose count the revision hashes). Fix
 
 Gate (`logs/gate-step7b-fix1.summary`): 3,732 passed (+1), 1 failed (the known baseline failure),
 110 ignored.
-Committed as `a3eea5e6`.
+Committed as `78f1b51e`.
 
 ## Review 2 (robustness) and fix pass 2
 
@@ -77,7 +77,7 @@ returns; the dry run, no-op, stale-revision and preflight returns all happen bef
 
 Gate (`logs/gate-step7b-fix2.summary`): 3,733 passed (+1), 1 failed (the known baseline failure),
 110 ignored.
-Committed as `dacb8ebe`.
+Committed as `3bd51cc1`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -106,12 +106,12 @@ A first gate run failed Copperpour's documentation test, which read the skill's 
 (`logs/gate-step7b-fix3.summary`): 3,734 passed (+1), 1 failed (the known baseline failure), 110
 ignored.
 
-Committed as `d428bd17`.
+Committed as `fee1297a`.
 
 ## Documentation review
 
 An independent check confirmed the hashes, gate counts, names and quoted wording. Corrected: the
-plan's record named "the review 3 commit" instead of `d428bd17`; the fix lists' numbering is now
+plan's record named "the review 3 commit" instead of `fee1297a`; the fix lists' numbering is now
 explained; two unclear sentences rewritten; "served test" replaced by the test's name. It also found
 that **`run_drc` with `sync_live_board: true` and `refill_zones: true`, the alternative the warning
 offers, still reported a failed refill under `synchronize_drc_source` with the "do not repeat"

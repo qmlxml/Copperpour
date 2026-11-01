@@ -90,7 +90,7 @@ The adaptation commit after them makes the result compile.
   `both_engine_versions_name_what_the_run_stalled_on`); the live test accepts either form, and the
   version test accepts any non-empty version. Then all 47 pass. The DRC live tests (steps 2 and 2b)
   also pass, including step 2's parity test, which could not be run before.
-- Committed as `6cd887a` (adaptation) and `050f14d` (ngspice 47 and live tests).
+- Committed as `3a61136` (adaptation) and `ab1d770` (ngspice 47 and live tests).
 
 ## Review 1 (implementation, focused on the merge) and fix pass 1
 
@@ -127,7 +127,7 @@ Nothing found would stop a normal simulation run. Findings and what was done:
 Gate after fix pass 1 (`logs/gate-step4-fix1.summary`): 3,654 passed (+1), 1 failed (the known
 baseline failure), 108 ignored. Simulation live tests: 47 passed (`logs/live-simulation.log` was later
 overwritten by fix pass 3's run).
-Committed as `b4df684`.
+Committed as `31291a2`.
 
 ## Review 2 (robustness, Linux) and fix pass 2
 
@@ -156,7 +156,7 @@ The reviewer measured on this machine (Arch Linux, ngspice 47). Nothing found st
 
 Gate after fix pass 2 (`logs/gate-step4-fix2.summary`): 3,654 passed, 1 failed (the known baseline
 failure), 108 ignored. Simulation live tests: 47 passed.
-Committed as `131aa5a`.
+Committed as `fcee043`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -198,7 +198,7 @@ The owner was asleep; the corrections below report more and are easy to reverse,
 
 Gate after fix pass 3 (`logs/gate-step4-fix3.summary`): 3,654 passed, 1 failed (the known baseline
 failure), 109 ignored (+1, the new live test). Simulation live tests: 48 passed.
-Committed as `414e90c`.
+Committed as `8bccfa3`.
 
 ## Documentation review (sub-step 16)
 

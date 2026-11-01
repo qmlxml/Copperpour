@@ -14,7 +14,7 @@ own stem and no such files, so it was checked with KiCad's defaults. Measured wi
 `invalid_outline: ignore`): source board 0 violations, candidate alone 1, candidate with the
 project file copied under its stem 0.
 
-## Implementation (commit `5ec098d`)
+## Implementation (commit `e1199ea`)
 
 - New `candidate_drc` (crates/copperpour-core/src/tools/pcb_routing.rs): copies the candidate
   into a temporary directory together with the source's `.kicad_pro` and `.kicad_dru`, renamed to
@@ -51,7 +51,7 @@ migration note say it is not design acceptance. Tests:
 `routing_is_not_clean_when_connectivity_was_not_checked` (states why not acting is correct and
 when it would be wrong), `routing_is_not_clean_with_a_violation_or_an_unconnected_item`.
 
-Routing verdict committed as `59733ab`. Gate (`logs/gate-step2b-verdict.summary`): 3,148 passed
+Routing verdict committed as `0d2cde0`. Gate (`logs/gate-step2b-verdict.summary`): 3,148 passed
 (+3 routing tests), 1 failed (the known baseline failure), 59 ignored.
 
 ## Review 1 (implementation) and fix pass 1
@@ -87,7 +87,7 @@ enrichment reads a byte-identical copy; `routing_clean` matches its documentatio
 
 Gate after fix pass 1 (`logs/gate-step2b-fix1.summary`): 3,148 passed, 1 failed (the known
 baseline failure), 60 ignored (+1: the library live test).
-Committed as `9f5d843`.
+Committed as `9d09939`.
 
 ## Review 2 (robustness) and fix pass 2
 
@@ -123,7 +123,7 @@ table in `rules_applied` is correct because the table carries no rules.
 
 Gate after fix pass 2 (`logs/gate-step2b-fix2.summary`): 3,152 passed (+4), 1 failed (the known
 baseline failure), 60 ignored.
-Committed as `7c5e5e7`.
+Committed as `2846b92`.
 
 ## Review 3 (intent and liveness) and fix pass 3
 
@@ -166,11 +166,11 @@ Put to the owner (see the rulings below):
   boards `routing_clean` can never be true.
 
 Gate after fix pass 3 (`logs/gate-step2b-fix3.summary`): 3,155 passed (+3), 1 failed (the known
-baseline failure), 60 ignored. Committed as `4eaeb50`.
+baseline failure), 60 ignored. Committed as `275a59f`.
 
 ### Ruling on finding 1 (owner, 2026-10-31): keep the import when only the check failed, and add a re-check
 
-Recorded in commit `6210e02`.
+Recorded in commit `481b027`.
 
 Both models recommended option C; the owner chose it. To implement:
 - Roll back only for failures that say something about the import: IPC read-back mismatch and
@@ -188,7 +188,7 @@ Both models recommended option C; the owner chose it. To implement:
 
 ### Ruling on finding 3 (owner, 2026-10-31): classify findings by the items they name
 
-Recorded in commit `d280165`.
+Recorded in commit `d3be7b1`.
 
 Both models recommended this (the second reviewer proposed it; the first had listed only a second DRC run and
 agreed after checking the code). To implement: a finding is `introduced` if any item it names
@@ -227,11 +227,11 @@ editor: the item IDs KiCad returns over IPC are the UUIDs it writes into the sav
   `check_specctra_candidate_reports_the_candidates_drc_or_why_it_did_not_run`.
 - Gate (`logs/gate-step2b-rulings.summary`): 3,160 passed (+5), 1 failed (the known baseline
   failure), 60 ignored. A first run failed `no_toolset_exceeds_max_size` until the tool moved.
-Committed as `9d5ddc1`.
+Committed as `ddf96fa`.
 
 ### Review of the ruling implementation, and fixes
 
-An extra independent review of commit `9d5ddc1` (all three stances) confirmed that rollback now
+An extra independent review of commit `ddf96fa` (all three stances) confirmed that rollback now
 happens exactly for the import-side failures (the post-commit `get_items_in` calls, the count
 mismatch, `save_document_to_string_in`, `write_new_atomic`) and that every DRC failure keeps the
 import. Its findings and the fixes:
@@ -259,7 +259,7 @@ Tests added: `a_timeout_is_recognised_through_the_error_chain`,
 test: building the apply response when the check did not run; it needs the live test.
 
 Gate (`logs/gate-step2b-ruling-review.summary`): 3,163 passed (+3), 1 failed (the known baseline
-failure), 60 ignored. Committed as `2f4d194`.
+failure), 60 ignored. Committed as `7ec397b`.
 
 ## Documentation review (sub-step 16)
 
