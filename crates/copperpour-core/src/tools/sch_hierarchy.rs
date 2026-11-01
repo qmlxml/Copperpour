@@ -822,7 +822,7 @@ impl SheetBox {
     fn edge(&self, side: &str) -> Option<SheetEdge> {
         // Rounded like every coordinate KiCad writes: 49.53 + 80.01 is
         // 129.54000000000002 in f64, which then shows up in messages.
-        let round = konnect_sexp::geometry::round6;
+        let round = copperpour_sexp::geometry::round6;
         let (axis, coordinate) = match side {
             "right" => ("x", round(self.x + self.width)),
             "left" => ("x", self.x),

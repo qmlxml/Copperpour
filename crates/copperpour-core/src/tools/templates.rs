@@ -711,7 +711,7 @@ async fn wire_template_connections(
 
     let references = template_references(tmpl, ref_start);
     let placed: HashSet<&String> = references.values().collect();
-    let (_, tree) = konnect_sexp::schematic::read_schematic(sch_path)?;
+    let (_, tree) = copperpour_sexp::schematic::read_schematic(sch_path)?;
     let mut pins: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for (instance, instance_pins) in crate::tools::placed_pins_by_reference(&tree) {
         if placed.contains(&instance.reference) {
@@ -992,12 +992,11 @@ mod tests {
     /// with why, and pins no entry reaches are listed as still unconnected.
     #[tokio::test]
     async fn apply_template_wires_its_connection_map() {
-        let (dir, schematic, _environment) = template_fixture();
-        let template_dir = if cfg!(target_os = "windows") {
-            dir.path().join("config").join("konnect").join("templates")
-        } else {
-            dir.path().join("config").join(".konnect").join("templates")
-        };
+        // Copperpour's fixture writes templates to user_templates_dir(); the
+        // contributor's fixture had its own directory and environment guard
+        // (adapted when merged, plan step 6).
+        let (_dir, schematic) = template_fixture();
+        let template_dir = user_templates_dir().unwrap();
         std::fs::write(
             template_dir.join("pullups.json"),
             serde_json::to_vec_pretty(&json!({

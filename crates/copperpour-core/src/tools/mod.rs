@@ -1562,6 +1562,16 @@ impl StubDirection {
         use copperpour_sexp::geometry::round6;
         (round6(x + self.dx * length), round6(y + self.dy * length))
     }
+
+    /// Turn the label to run along its stub, 90° up or 270° down, instead of
+    /// the horizontal default. A row of vertical pins a few millimetres apart
+    /// otherwise gets horizontal labels written over one another.
+    pub(crate) fn along_stub(mut self) -> Self {
+        if let Some(row) = STUB_DIRECTIONS.iter().find(|row| row.0 == self.name) {
+            self.label_rotation = row.3;
+        }
+        self
+    }
 }
 
 /// Numbers in `text` with more than the six decimals KiCad writes, such as
@@ -1591,16 +1601,6 @@ pub(crate) fn noisy_numbers(value: &Value) -> Vec<String> {
         Value::Array(items) => items.iter().flat_map(noisy_numbers).collect(),
         Value::Object(fields) => fields.values().flat_map(noisy_numbers).collect(),
         _ => Vec::new(),
-    }
-
-    /// Turn the label to run along its stub, 90° up or 270° down, instead of
-    /// the horizontal default. A row of vertical pins a few millimetres apart
-    /// otherwise gets horizontal labels written over one another.
-    pub(crate) fn along_stub(mut self) -> Self {
-        if let Some(row) = STUB_DIRECTIONS.iter().find(|row| row.0 == self.name) {
-            self.label_rotation = row.3;
-        }
-        self
     }
 }
 

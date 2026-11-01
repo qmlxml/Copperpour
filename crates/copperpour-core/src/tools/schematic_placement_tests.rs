@@ -1332,7 +1332,7 @@ async fn served_placement_copies_custom_library_fields() {
 
     let committed = std::fs::read_to_string(&path).unwrap();
     let (start, end) = crate::tools::find_symbol_instance_block(&committed, "U9").unwrap();
-    let placed = konnect_schematic_editor::sexp::parser::parse(&committed[start..end]).unwrap();
+    let placed = copperpour_schematic_editor::sexp::parser::parse(&committed[start..end]).unwrap();
     let field = |name: &str| {
         placed
             .find_all("property")
