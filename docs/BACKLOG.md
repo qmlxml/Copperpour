@@ -9,9 +9,10 @@ Each entry names where it was found, what is wrong, and the condition that close
   off unless `COPPERPOUR_LIVE_EDITOR` is `1`, `on` or `true` (owner ruling 2026-10-31). Closing condition: each defect
   fixed and tested by hand on a Windows build with KiCad 10's Schematic Editor open, on a named
   machine, with the result recorded in `docs/development/`.
-- **No Windows CI job.** Copperpour's CI has no job that compiles the Windows-only module, so a
-  change that breaks it is not noticed. Closing condition: a CI job that runs
-  `cargo check --target` for a Windows target, or a recorded decision not to add one.
+- **~~No Windows CI job.~~ Corrected 2026-11-01:** Copperpour's CI `check` job runs
+  `cargo check --workspace` and the unit and integration tests on `windows-latest` as well as Linux
+  and macOS (`.github/workflows/ci.yml`, job `check`, matrix `os`), which compiles the Windows-only
+  module. It runs only when the branch is pushed to GitHub with Actions enabled.
 - **Windows build not checked.** `crates/copperpour/src/live_editor.rs` was adapted at the merge but
   not compiled for Windows: `cargo check --target x86_64-pc-windows-gnu` needs the MinGW C compiler
   for `nng-sys`. Closing condition: the module compiles for a Windows target.
