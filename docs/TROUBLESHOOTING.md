@@ -20,7 +20,9 @@ Stop automatic retries. Copperpour sent a request but could not establish its
 outcome, or a transaction's attempted rollback failed. The live board may
 contain some or all of the requested changes; this is not proof that nothing
 happened. The structured error reports `board_state: unknown` and
-`retry_safe: false`.
+`retry_safe: false`. (`set_active_layer` is the exception: its uncertain outcome reports
+`board_state: editor_state_only` and `retry_safe: true`, because the active layer is editor state
+with no undo entry and setting it again is harmless.)
 
 Inspect the requested board in KiCad and reconcile what was actually applied
 before repeating any mutation. Do not edit the saved file as a workaround:

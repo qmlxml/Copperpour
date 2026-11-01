@@ -55,3 +55,29 @@ fork's unbounded version. Recorded in `docs/BACKLOG.md`.
 
 Gate (`logs/gate-set-active-layer-fix1.summary`): 3,743 passed (+3), 1 failed (the known baseline
 failure), 113 ignored.
+Committed as `c6a6f4e3`.
+
+## Review 2 (robustness) and fix pass 2
+
+Confirmed: retrying is harmless (the board is rebound by path each call; `Recovered` cannot occur
+here); the reliability contract's rules are met (read-back, nothing changed on refusal, an accepted
+change with a failed read-back reported as accepted). Fixed:
+
+1. **Three board states were all told "KiCad does not hold this board open"**: each refusal now
+   says only what KiCad's answer established (no PCB editor at the endpoint; a build that does not
+   name its documents, so nothing is claimed; KiCad not reachable; a board this process saw live and
+   lost, with the `board_previously_observed_live` code).
+2. **The uncertain outcome said both "safe to repeat" and "do not retry the mutation"**: the
+   transport's generic instruction is stripped from the cause (`uncertain_cause`).
+3. **KiCad busy (`AS_BUSY`) gave an untyped refusal**: it now says nothing was changed and the call
+   can be repeated. Test `a_busy_kicad_changed_nothing_and_the_call_can_be_repeated`.
+4. **`AS_BAD_REQUEST` to the first read was reported as a bad layer**: only `SetActiveLayer`'s
+   answer is mapped to `invalid_argument` on `layer`.
+5. The new `board_state: "editor_state_only"` is documented in the migration note and
+   `docs/TROUBLESHOOTING.md`.
+6. The mock answers `GetOpenDocuments` in KiCad 10's shape (bare file name plus project directory)
+   and asserts both commands name that document.
+7. The migration note says a successful call records the board as observed live.
+
+Gate (`logs/gate-set-active-layer-fix2.summary`): 3,744 passed (+1), 1 failed (the known baseline
+failure), 113 ignored.
