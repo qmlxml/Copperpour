@@ -1,6 +1,6 @@
 # Step 4b: read the schematic's "exclude from simulation" flag
 
-Owner review of overnight decision 1 (2026-11-01; the second reviewer second opinion; 2 models agree): MODIFY.
+Owner review of overnight decision 1 (the decision, taken overnight in step 4's review 3, to list parts missing from what ran as `excluded_in_schematic`; 2026-11-01; the second reviewer second opinion; 2 models agree): MODIFY.
 Since step 4's review 3, a part in KiCad's netlist with no line in its SPICE netlist was listed as
 `excluded_in_schematic`, with a warning saying the schematic marks it excluded. That was inferred,
 not read. (The premise that a part with no model has no line was wrong: review 1 measured that
@@ -14,7 +14,7 @@ excluded by a symbol or sheet flag.)
   its symbol UUIDs (`tstamps`), now kept as `Component::symbol_uuids`.
 - `sim_excluded_symbols` reads the snapshot's copies of every sheet file and collects the UUIDs of
   placed symbols marked `(exclude_from_sim yes)`; library symbols are not visited, and a sheet that
-  cannot be parsed contributes nothing (its parts are then reported as `not_in_spice_netlist`, still
+  cannot be parsed contributes nothing (changed in fix pass 3: such a sheet is now named) (its parts are then reported as `not_in_spice_netlist`, still
   `modified`).
 - Parts missing from what ran are split: flagged ones stay `excluded_in_schematic`; the rest go to
   the new `not_in_spice_netlist` (field in `circuit`, readiness report and warning, with a true
@@ -40,7 +40,8 @@ UUIDs between its instances; a multi-unit part has one string per unit, and flag
 the whole part; a library symbol's flag and `dnp` have no effect. Fixed:
 
 1. **A sheet instance flagged `exclude_from_sim` was not read**: KiCad dropped its 29 parts and they
-   were reported as unexplained. `sim_exclusions` now also reads `(sheet …)` flags, `Component`
+   were reported as unexplained. `sim_exclusions` (renamed from `sim_excluded_symbols`; its test is now
+   `sim_exclusions_reads_symbols_and_sheets_in_every_sheet_file`) now also reads `(sheet …)` flags, `Component`
    keeps its `sheetpath` UUIDs, and a part counts as excluded when its symbol or a sheet on its path
    is flagged. Live test `the_parts_of_a_sheet_excluded_from_simulation_are_reported_as_excluded`
    (complex_hierarchy, `ampli_ht_vertical` flagged, the horizontal instance not); control: with the
@@ -104,3 +105,15 @@ The first gate runs failed the documentation test on the skill's `sheets_not_rea
 `excluded_references` (a warning code and a result field); both were added to `NOT_TOOLS`. Gate
 (`logs/gate-step4b-fix3.summary`): 3,737 passed, 1 failed (the known baseline failure), 112
 ignored.
+
+Committed as `c8b10ae3`.
+
+## Documentation review
+
+An independent check confirmed hashes, names, codes and gate counts. Corrected: the plan's record
+named "the review 3 commit"; the log lacked the fix 3 commit and did not record the rename of
+`sim_excluded_symbols`; four places (migration note, three in the skill) and a code comment still
+said "for a reason the schematic does not show", which fix 3 replaced because a sheet that could not
+be read may show the reason; the skill's `warnings` bullet said "none of these parts" next to a list
+of files; "overnight decision 1" is now explained; "each with a control" now says which tests have
+one.

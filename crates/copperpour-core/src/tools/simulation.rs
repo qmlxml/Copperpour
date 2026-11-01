@@ -1586,9 +1586,9 @@ struct Design {
     /// merged (plan step 4, review 3): such parts used to vanish while the
     /// result still read `as_drawn`.
     excluded_in_schematic: Vec<String>,
-    /// Parts in KiCad's netlist with no line in its SPICE netlist for a
-    /// reason the schematic does not show: neither their symbol nor a sheet on
-    /// their path carries a flag Copperpour found (owner review of overnight
+    /// Parts in KiCad's netlist with no line in its SPICE netlist for which
+    /// Copperpour found no flag on their symbol or on a sheet on their path,
+    /// so the cause is not known (owner review of overnight
     /// decision 1; step 4b).
     not_in_spice_netlist: Vec<String>,
     /// Sheet files whose flags could not be read (see `SimExclusions`).
@@ -1670,11 +1670,11 @@ fn allowed_roots(project_dir: &Path, model_dirs: &[PathBuf]) -> (Vec<PathBuf>, V
     (roots, ignored)
 }
 
-/// What the sheet files under `dir` (the snapshot's copy) flag
-/// `(exclude_from_sim yes)`: placed symbols and sheet instances, by UUID. A
-/// file that cannot be read or parsed contributes nothing; its parts are then
-/// reported as `not_in_spice_netlist`, which still marks the result
-/// `modified`.
+/// What the sheet files under the snapshot's copy flag as excluded from
+/// simulation (see `excluded_by_flag`): placed symbols and sheet instances,
+/// by UUID. A file that cannot be read or parsed is named in `unread`; its
+/// parts are then reported as `not_in_spice_netlist`, which still marks the
+/// result `modified`.
 #[derive(Debug, Default, PartialEq)]
 struct SimExclusions {
     symbols: std::collections::HashSet<String>,
