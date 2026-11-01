@@ -9,6 +9,7 @@ pub mod net;
 pub mod parser;
 pub mod paths;
 pub mod schematic;
+pub mod text_bounds;
 pub mod title_block;
 pub mod transaction;
 pub mod writer;
@@ -30,3 +31,11 @@ pub use writer::{
     apply_edits, read_consistent, transact_atomic, write_atomic, write_atomic_if_unchanged,
     write_new_atomic, write_new_atomic_verified, SexpEdit,
 };
+
+/// Keep this crate's unit tests out of the developer's home (see
+/// `copperpour-test-home`).
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

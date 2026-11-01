@@ -950,6 +950,48 @@ struct LibraryFootprintData {
     attributes: copperpour_ipc::gen::kiapi::board::types::FootprintAttributes,
     description_and_keywords: copperpour_ipc::gen::kiapi::board::types::FootprintAttributes,
     models: Vec<copperpour_ipc::gen::kiapi::board::types::Footprint3DModel>,
+    /// Net-tie pad groups and the footprint-level zone connection (from the
+    /// `marju212` fork): a solder jumper placed without its ties is a short.
+    net_ties: Vec<copperpour_ipc::gen::kiapi::board::types::NetTieDefinition>,
+    zone_connection: Option<copperpour_ipc::gen::kiapi::board::types::ZoneConnectionStyle>,
+}
+
+impl LibraryFootprintData {
+    fn read(root: &copperpour_sexp::SexpNode) -> anyhow::Result<Self> {
+        Ok(Self {
+            attributes: super::library_footprint::attributes(root)?,
+            description_and_keywords: super::library_footprint::description_and_keywords(root),
+            models: super::library_footprint::models(root)?,
+            net_ties: super::library_footprint::net_ties(root)?,
+            zone_connection: super::library_footprint::zone_connection(root)?,
+        })
+    }
+
+    /// Put this library data on an F.Cu `FootprintInstance` item built from
+    /// pads, drawings and fields.
+    fn apply_to_item(&self, item: prost_types::Any) -> anyhow::Result<prost_types::Any> {
+        let mut footprint = copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+            item.value.as_slice(),
+        )?;
+        footprint.attributes = Some(self.attributes.clone());
+        super::library_footprint::apply_net_ties_and_zone_connection(
+            &mut footprint,
+            &self.net_ties,
+            self.zone_connection,
+        )?;
+        let definition = footprint
+            .definition
+            .as_mut()
+            .context("built footprint has no definition")?;
+        definition.attributes = Some(self.description_and_keywords.clone());
+        definition.items.extend(self.models.iter().map(|model| {
+            copperpour_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
+        }));
+        Ok(copperpour_ipc::builders::pack_any(
+            &footprint,
+            "kiapi.board.types.FootprintInstance",
+        ))
+    }
 }
 
 impl PreparedFootprintPlacement {
@@ -997,11 +1039,7 @@ impl PreparedFootprintPlacement {
         let graphics = extract_graphic_definitions(&prepared)?;
         let fields = extract_field_placement(&prepared);
         let root = copperpour_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
-        let library = LibraryFootprintData {
-            attributes: super::library_footprint::attributes(&root)?,
-            description_and_keywords: super::library_footprint::description_and_keywords(&root),
-            models: super::library_footprint::models(&root)?,
-        };
+        let library = LibraryFootprintData::read(&root)?;
         let library_path =
             resolve_footprint_path(lib_id, project_dir).map_err(anyhow::Error::msg)?;
         let board_sexp = board_footprint_sexp(
@@ -1077,22 +1115,7 @@ impl PreparedFootprintPlacement {
         let Some(library) = &self.library else {
             return Ok(item);
         };
-        let mut footprint = copperpour_ipc::gen::kiapi::board::types::FootprintInstance::decode(
-            item.value.as_slice(),
-        )?;
-        footprint.attributes = Some(library.attributes.clone());
-        let definition = footprint
-            .definition
-            .as_mut()
-            .context("built footprint has no definition")?;
-        definition.attributes = Some(library.description_and_keywords.clone());
-        definition.items.extend(library.models.iter().map(|model| {
-            copperpour_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
-        }));
-        Ok(copperpour_ipc::builders::pack_any(
-            &footprint,
-            "kiapi.board.types.FootprintInstance",
-        ))
+        library.apply_to_item(item)
     }
 
     /// The block the closed-board path inserts: the prepared F.Cu block, or
@@ -2008,6 +2031,65 @@ fn indent_block(block: &str, indent: &str, eol: &str) -> String {
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
+/// The footprint-text tools, listed as their own toolset, `pcb_footprint_text`.
+/// They live in this file next to the other placed-footprint edits, but the
+/// per-toolset limit is 20, and `pcb_components` has 20 and `pcb_board` 19.
+pub fn footprint_text_tools() -> Vec<ToolDef> {
+    vec![
+        tool!(
+            "list_board_footprint_texts",
+            "List the texts of footprints placed on the board: the reference and value fields, custom fields such as LCSC, and plain text items. Each reports its field name (or UUID for a plain text), text, layer, absolute board 'position' in mm (the coordinates DRC and KiCad's properties dialog use), footprint-local 'local' mm (as the .kicad_mod shows them), absolute 'angle', 'size' and 'visible'. Use it with run_drc's silk_overlap / silk_over_copper locations to decide where move_footprint_texts should put a reference. Requires KiCAD running with the board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":      { "type": "string" },
+                    "references": { "type": "array", "items": { "type": "string" }, "description": "Only these reference designators (optional; default every footprint)" },
+                    "layer":      { "type": "string", "description": "Only texts on this layer, e.g. 'F.SilkS' (optional)" },
+                    "field":      { "type": "string", "description": "Only this field, e.g. 'Reference' (optional)" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_list_board_footprint_texts(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "move_footprint_texts",
+            "Move, rotate, re-layer or hide texts of footprints placed on the board (reference designators, values, custom fields, plain texts) without moving the footprints. Each move names a footprint and a field ('Reference', 'Value', a custom field name; 'ref'/'val' work) or the UUID of a plain text, then at most one of: x/y (absolute board mm), dx/dy (board mm from where the text is now) or local_x/local_y (footprint-local mm, follows the part's rotation); plus optional angle (absolute board degrees), layer and visible. Every move is checked first and the whole batch is sent as one KiCad edit (one undo step); a refused move sends nothing. Save with save_project afterwards. Requires KiCAD running with the board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "moves": {
+                        "type": "array",
+                        "description": "The text edits, applied in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string", "description": "Footprint reference designator, e.g. 'R12'" },
+                                "field":     { "type": "string", "description": "Field name; default 'Reference' when no uuid is given" },
+                                "uuid":      { "type": "string", "description": "UUID of a plain text item, from list_board_footprint_texts" },
+                                "x":         { "type": "number" },
+                                "y":         { "type": "number" },
+                                "dx":        { "type": "number" },
+                                "dy":        { "type": "number" },
+                                "local_x":   { "type": "number" },
+                                "local_y":   { "type": "number" },
+                                "angle":     { "type": "number", "description": "Absolute text angle in degrees" },
+                                "layer":     { "type": "string", "description": "e.g. 'F.SilkS', 'F.Fab'" },
+                                "visible":   { "type": "boolean", "description": "Fields only" }
+                            },
+                            "required": ["reference"]
+                        }
+                    }
+                },
+                "required": ["board", "moves"]
+            }),
+            |args, ctx| async move { handle_move_footprint_texts(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+    ]
+}
+
 pub fn tools() -> Vec<ToolDef> {
     let mut tools = vec![
         tool!(
@@ -2686,6 +2768,210 @@ async fn handle_edit_board_footprint_graphic(
         "uuid": uuid,
         "kind": kind,
         "points": points.len(),
+    })))
+}
+
+async fn handle_list_board_footprint_texts(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let references: Vec<String> = match &args["references"] {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(r) => out.push(r.to_string()),
+                    None => {
+                        return Ok(crate::tools::invalid_arg(
+                            "references",
+                            "every entry must be a string",
+                        ))
+                    }
+                }
+            }
+            out
+        }
+        _ => {
+            return Ok(crate::tools::invalid_arg(
+                "references",
+                "must be an array of strings",
+            ))
+        }
+    };
+    let layer_filter = args["layer"].as_str().map(|s| s.to_string());
+    let field_filter = args["field"].as_str().map(|s| s.to_string());
+
+    let texts: Vec<copperpour_ipc::types::IpcFootprintText> =
+        ipc!(ctx, args, |c| c.list_footprint_texts(&references));
+    let texts: Vec<_> = texts
+        .into_iter()
+        .filter(|t| layer_filter.as_deref().is_none_or(|l| t.layer == l))
+        .filter(|t| {
+            field_filter.as_deref().is_none_or(|f| {
+                t.field
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(f))
+            })
+        })
+        .collect();
+
+    Ok(CallToolResult::json(&json!({
+        "count": texts.len(),
+        "texts": texts,
+    })))
+}
+
+/// Parse `move_footprint_texts`'s `moves` into typed edits, refusing a
+/// malformed entry by its index before anything reaches KiCad.
+fn parse_text_moves(
+    value: &serde_json::Value,
+) -> Result<Vec<copperpour_ipc::types::IpcFootprintTextEdit>, CallToolResult> {
+    use copperpour_ipc::types::{IpcFootprintTextEdit, IpcTextTarget};
+    let invalid = |reason: String| crate::tools::invalid_arg("moves", &reason);
+    let Some(items) = value.as_array() else {
+        return Err(invalid("must be an array of moves".to_string()));
+    };
+    if items.is_empty() {
+        return Err(invalid("is empty".to_string()));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let Some(obj) = item.as_object() else {
+            return Err(invalid(format!("entry {i} is not an object")));
+        };
+        let Some(reference) = obj.get("reference").and_then(|v| v.as_str()) else {
+            return Err(invalid(format!("entry {i} has no 'reference' string")));
+        };
+        // A misspelt key (`dX`, `rotation`) would otherwise be ignored and the
+        // entry reported as moved (review 2 of plan step 7).
+        const KEYS: [&str; 12] = [
+            "reference",
+            "field",
+            "uuid",
+            "x",
+            "y",
+            "dx",
+            "dy",
+            "local_x",
+            "local_y",
+            "angle",
+            "layer",
+            "visible",
+        ];
+        if let Some(unknown) = obj.keys().find(|key| !KEYS.contains(&key.as_str())) {
+            return Err(invalid(format!(
+                "entry {i}: unknown key '{unknown}'; the keys are {}",
+                KEYS.join(", ")
+            )));
+        }
+        // Present but not a string is refused, not read as absent: a numeric
+        // `field` fell back to Reference and moved the wrong text.
+        let text = |key: &str| -> Result<Option<&str>, CallToolResult> {
+            match obj.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(v) => v
+                    .as_str()
+                    .map(Some)
+                    .ok_or_else(|| invalid(format!("entry {i}: '{key}' is not a string"))),
+            }
+        };
+        let limit_mm = copperpour_ipc::footprint_text::COORDINATE_LIMIT_NM as f64 / 1e6;
+        let num = |key: &str| -> Result<Option<f64>, CallToolResult> {
+            match obj.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(v) => {
+                    let value = v
+                        .as_f64()
+                        .ok_or_else(|| invalid(format!("entry {i}: '{key}' is not a number")))?;
+                    // Beyond KiCad's coordinate range the nanometre value
+                    // saturates or overflows; an angle that large is a
+                    // mistake as well.
+                    if key != "angle" && value.abs() > limit_mm
+                        || key == "angle" && value.abs() > 36_000.0
+                    {
+                        return Err(invalid(format!(
+                            "entry {i}: '{key}' = {value} is out of range"
+                        )));
+                    }
+                    Ok(Some(value))
+                }
+            }
+        };
+        let pair = |a: &str, b: &str| -> Result<Option<(f64, f64)>, CallToolResult> {
+            match (num(a)?, num(b)?) {
+                (Some(x), Some(y)) => Ok(Some((x, y))),
+                (None, None) => Ok(None),
+                _ => Err(invalid(format!("entry {i}: give both '{a}' and '{b}'"))),
+            }
+        };
+        let target = match (text("field")?, text("uuid")?) {
+            (Some(_), Some(_)) => {
+                return Err(invalid(format!(
+                    "entry {i}: give 'field' or 'uuid', not both"
+                )))
+            }
+            (_, Some(uuid)) => IpcTextTarget::Uuid(uuid.to_string()),
+            (Some(field), None) => IpcTextTarget::Field(field.to_string()),
+            (None, None) => IpcTextTarget::Field("Reference".to_string()),
+        };
+        let visible = match obj.get("visible") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(
+                v.as_bool()
+                    .ok_or_else(|| invalid(format!("entry {i}: 'visible' is not a boolean")))?,
+            ),
+        };
+        let edit = IpcFootprintTextEdit {
+            reference: reference.to_string(),
+            target,
+            position: pair("x", "y")?,
+            offset: pair("dx", "dy")?,
+            local: pair("local_x", "local_y")?,
+            angle: num("angle")?,
+            layer: text("layer")?.map(str::to_string),
+            visible,
+        };
+        if edit.position.is_none()
+            && edit.offset.is_none()
+            && edit.local.is_none()
+            && edit.angle.is_none()
+            && edit.layer.is_none()
+            && edit.visible.is_none()
+        {
+            return Err(invalid(format!(
+                "entry {i}: nothing to change; give a position, angle, layer or visible"
+            )));
+        }
+        let modes = [edit.position, edit.offset, edit.local]
+            .iter()
+            .filter(|m| m.is_some())
+            .count();
+        if modes > 1 {
+            return Err(invalid(format!(
+                "entry {i}: give at most one of x/y, dx/dy or local_x/local_y"
+            )));
+        }
+        out.push(edit);
+    }
+    Ok(out)
+}
+
+async fn handle_move_footprint_texts(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let moves = match parse_text_moves(&args["moves"]) {
+        Ok(m) => m,
+        Err(e) => return Ok(e),
+    };
+    let texts: Vec<copperpour_ipc::types::IpcFootprintText> =
+        ipc!(ctx, args, |c| c.edit_footprint_texts(&moves));
+    Ok(CallToolResult::json(&json!({
+        "moved": texts.len(),
+        "texts": texts,
+        "saved": false,
+        "next": "save_project to write the board file",
     })))
 }
 
@@ -3980,6 +4266,19 @@ async fn handle_place_array(
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
     let fields = extract_field_placement(&source);
+    // The library data place_component gives a part; without it every array
+    // instance had no mounting style, 3D model or net ties (merge of the
+    // `marju212` fork, plan step 7).
+    // A footprint whose library data cannot be read is placed as before,
+    // without it, and the response says so (review 3 of plan step 7: these
+    // tools placed such footprints before the merge).
+    let (library, library_data_not_applied) = match copperpour_sexp::parse_sexp(&source)
+        .context("invalid footprint S-expression")
+        .and_then(|root| LibraryFootprintData::read(&root))
+    {
+        Ok(library) => (Some(library), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
 
     let value = footprint
         .split_once(':')
@@ -4040,6 +4339,10 @@ async fn handle_place_array(
                     0.0,
                     "F.Cu",
                 )
+                .and_then(|item| match &library {
+                    Some(library) => library.apply_to_item(item),
+                    None => Ok(item),
+                })
                 .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -4069,9 +4372,11 @@ async fn handle_place_array(
         Ok(placed) => placed,
         Err(error) => return Ok(CallToolResult::error(format!("IPC array error: {error}"))),
     };
-    Ok(CallToolResult::json(
-        &json!({ "placed_count": placed.len(), "components": placed }),
-    ))
+    let mut body = json!({ "placed_count": placed.len(), "components": placed });
+    if let Some(reason) = library_data_not_applied {
+        body["library_data_not_applied"] = json!(reason);
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_align_components(
@@ -4195,9 +4500,20 @@ async fn handle_duplicate_component(
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
     let fields = extract_field_placement(&prepared);
-    let dup_board = board.clone();
-    let fp = ipc!(ctx, args, |c| c.place_footprint(
-        &dup_board,
+    // The copy gets the library data place_component gives a part (merge of
+    // the `marju212` fork, plan step 7). Back-side sources were refused
+    // above, so the copy is on F.Cu.
+    // A footprint whose library data cannot be read is placed as before,
+    // without it, and the response says so (review 3 of plan step 7: these
+    // tools placed such footprints before the merge).
+    let (library, library_data_not_applied) = match copperpour_sexp::parse_sexp(&source)
+        .context("invalid footprint S-expression")
+        .and_then(|root| LibraryFootprintData::read(&root))
+    {
+        Ok(library) => (Some(library), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    let item = match KiCadIpcClient::build_footprint_item(
         &fp_id,
         &ipc_reference,
         &fp_value,
@@ -4207,13 +4523,30 @@ async fn handle_duplicate_component(
         x,
         y,
         fp_rotation,
-        &fp_layer
+        &fp_layer,
+    )
+    .and_then(|item| match &library {
+        Some(library) => library.apply_to_item(item),
+        None => Ok(item),
+    }) {
+        Ok(item) => item,
+        Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
+    };
+    let dup_board = board.clone();
+    let fp = ipc!(ctx, args, |c| c.place_footprint_item(
+        &dup_board,
+        &ipc_reference,
+        item.clone()
     ));
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "duplicated_from": reference,
         "new_reference": fp.reference,
         "x": fp.position.x, "y": fp.position.y
-    })))
+    });
+    if let Some(reason) = library_data_not_applied {
+        body["library_data_not_applied"] = json!(reason);
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_get_board_2d_view(
@@ -7552,6 +7885,82 @@ mod tests {
         )
     }
 
+    /// A footprint placed from a library with net-tie pad groups and a
+    /// footprint-level zone connection carries both (merge of the `marju212`
+    /// fork): a solder jumper placed without its ties reaches the board as a
+    /// short. `apply_to_item` is what `place_component`, `place_array` and
+    /// `duplicate_component` all use.
+    #[test]
+    fn placed_items_carry_net_ties_and_the_zone_connection() {
+        use copperpour_ipc::gen::kiapi::board::types as board;
+        let source = C_0603.replacen(
+            "\t(layer \"F.Cu\")",
+            "\t(layer \"F.Cu\")\n\t(zone_connect 1)\n\t(net_tie_pad_groups \"1, 2\")",
+            1,
+        );
+        assert_ne!(source, C_0603, "the fixture must gain both clauses");
+        let tmp = tempfile::tempdir().unwrap();
+        capacitor_fixture(tmp.path(), &source);
+        let prepared = PreparedFootprintPlacement::from_library(
+            &source,
+            "Capacitor_SMD:C_0603_1608Metric",
+            "C1",
+            None,
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+            Some(tmp.path()),
+        )
+        .unwrap();
+        let item = prepared
+            .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", 10.0, 20.0)
+            .unwrap();
+        let footprint = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        assert_eq!(
+            footprint.overrides.unwrap().zone_connection,
+            board::ZoneConnectionStyle::ZcsThermal as i32
+        );
+        assert_eq!(
+            footprint.definition.as_ref().unwrap().net_ties[0].pad_number,
+            vec!["1".to_string(), "2".to_string()]
+        );
+
+        let library =
+            LibraryFootprintData::read(&copperpour_sexp::parse_sexp(&source).unwrap()).unwrap();
+        let bare = || {
+            KiCadIpcClient::build_footprint_item(
+                "Capacitor_SMD:C_0603_1608Metric",
+                "C2",
+                "C",
+                &extract_pad_definitions(&source).unwrap(),
+                &[],
+                &extract_field_placement(&source),
+                0.0,
+                0.0,
+                0.0,
+                "F.Cu",
+            )
+            .unwrap()
+        };
+        let model_count = |item: &prost_types::Any| {
+            board::FootprintInstance::decode(item.value.as_slice())
+                .unwrap()
+                .definition
+                .unwrap()
+                .items
+                .iter()
+                .filter(|item| {
+                    copperpour_ipc::builders::any_is(item, "kiapi.board.types.Footprint3DModel")
+                })
+                .count()
+        };
+        let applied = library.apply_to_item(bare()).unwrap();
+        assert_eq!(model_count(&applied), 1);
+        let applied = board::FootprintInstance::decode(applied.value.as_slice()).unwrap();
+        assert_eq!(applied.definition.unwrap().net_ties.len(), 1);
+    }
+
     /// A project registering `Capacitor_SMD` with `footprint` as its
     /// `C_0603_1608Metric`, plus an empty board.
     fn capacitor_fixture(dir: &Path, footprint: &str) -> std::path::PathBuf {
@@ -8066,6 +8475,77 @@ mod board_footprint_graphics_tests {
         );
     }
 
+    #[test]
+    fn text_moves_parse_targets_and_modes() {
+        use copperpour_ipc::types::IpcTextTarget;
+        let moves = parse_text_moves(&json!([
+            { "reference": "R1", "x": 1, "y": 2 },
+            { "reference": "R2", "field": "Value", "dx": 0.5, "dy": 0 },
+            { "reference": "R3", "uuid": "u-1", "local_x": 0, "local_y": -1.5, "angle": 90, "visible": true }
+        ]))
+        .expect("valid");
+        assert_eq!(
+            moves[0].target,
+            IpcTextTarget::Field("Reference".to_string())
+        );
+        assert_eq!(moves[0].position, Some((1.0, 2.0)));
+        assert_eq!(moves[1].target, IpcTextTarget::Field("Value".to_string()));
+        assert_eq!(moves[1].offset, Some((0.5, 0.0)));
+        assert_eq!(moves[2].target, IpcTextTarget::Uuid("u-1".to_string()));
+        assert_eq!(moves[2].local, Some((0.0, -1.5)));
+        assert_eq!(moves[2].angle, Some(90.0));
+        assert_eq!(moves[2].visible, Some(true));
+    }
+
+    #[test]
+    fn malformed_text_moves_are_refused_as_invalid_arguments() {
+        for bad in [
+            json!([]),
+            json!({}),
+            json!([{ "x": 1, "y": 2 }]),
+            json!([{ "reference": "R1", "x": 1 }]),
+            json!([{ "reference": "R1", "x": 1, "y": 2, "dx": 1, "dy": 1 }]),
+            json!([{ "reference": "R1", "field": "Value", "uuid": "u" }]),
+            json!([{ "reference": "R1", "angle": "ninety" }]),
+            json!([{ "reference": "R1", "visible": "no" }]),
+            // Review 2 of plan step 7: a numeric field fell back to Reference,
+            // a misspelt key was ignored, an empty entry was reported moved,
+            // and a huge coordinate overflowed the nanometre value.
+            json!([{ "reference": "R1", "field": 5, "x": 1, "y": 2 }]),
+            json!([{ "reference": "R1", "uuid": true, "x": 1, "y": 2 }]),
+            json!([{ "reference": "R1", "layer": 3, "x": 1, "y": 2 }]),
+            json!([{ "reference": "R1", "dX": 1, "dy": 1 }]),
+            json!([{ "reference": "R1" }]),
+            json!([{ "reference": "R1", "x": 1e300, "y": 0 }]),
+            json!([{ "reference": "R1", "dx": 3000, "dy": 0 }]),
+            json!([{ "reference": "R1", "angle": 1e9 }]),
+        ] {
+            let err = parse_text_moves(&bad).expect_err(&format!("{bad} should be refused"));
+            assert!(err.is_error, "{bad}");
+        }
+    }
+
+    #[test]
+    fn footprint_text_tools_are_registered_with_the_arguments_they_read() {
+        let tools = crate::router::registry::tools_for("pcb_footprint_text").unwrap();
+        for (name, required) in [
+            ("list_board_footprint_texts", vec!["board"]),
+            ("move_footprint_texts", vec!["board", "moves"]),
+        ] {
+            let def = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is not registered"));
+            let got: Vec<&str> = def.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(got, required, "{name} required arguments");
+        }
+    }
+
     /// The two tools are registered, sit in `pcb_components`, and require the
     /// arguments the handlers read. A schema that drifts from its handler is
     /// the defect #217 was about, one layer up.
@@ -8189,5 +8669,171 @@ mod required_count_tests {
         .await
         .expect("no anyhow");
         assert!(result.is_error, "an explicit zero must still be rejected");
+    }
+}
+
+/// `move_footprint_texts` through a mock KiCad that keeps what it is sent
+/// (review 2 of plan step 7): the batch is sent in one commit, a refused
+/// edit sends nothing, and the response is the board read back.
+#[cfg(test)]
+mod footprint_text_served_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{
+        ctx_talking_to, spawn_kicad_holding_items, ItemStore,
+    };
+    use copperpour_ipc::builders::{pack_any, vec2};
+    use copperpour_ipc::gen::kiapi;
+    use std::sync::{Arc, Mutex};
+
+    fn reference_at(x: f64, y: f64) -> kiapi::board::types::Field {
+        kiapi::board::types::Field {
+            name: "Reference".to_string(),
+            text: Some(kiapi::board::types::BoardText {
+                text: Some(kiapi::common::types::Text {
+                    text: "R1".to_string(),
+                    position: Some(vec2(x, y)),
+                    ..Default::default()
+                }),
+                layer: kiapi::board::types::BoardLayer::BlFSilkS as i32,
+                ..Default::default()
+            }),
+            visible: true,
+            ..Default::default()
+        }
+    }
+
+    fn held_r1() -> prost_types::Any {
+        pack_any(
+            &kiapi::board::types::FootprintInstance {
+                id: Some(kiapi::common::types::Kiid {
+                    value: "fp-1".to_string(),
+                }),
+                position: Some(vec2(10.0, 20.0)),
+                layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                reference_field: Some(reference_at(10.0, 18.5)),
+                definition: Some(kiapi::board::types::Footprint::default()),
+                ..Default::default()
+            },
+            "kiapi.board.types.FootprintInstance",
+        )
+    }
+
+    fn held_reference_position(store: &ItemStore) -> (i64, i64) {
+        let fp = kiapi::board::types::FootprintInstance::decode(store.items[0].value.as_slice())
+            .unwrap();
+        let at = fp
+            .reference_field
+            .unwrap()
+            .text
+            .unwrap()
+            .text
+            .unwrap()
+            .position
+            .unwrap();
+        (at.x_nm, at.y_nm)
+    }
+
+    fn board_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        board
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap_or(serde_json::Value::String(text.clone()))
+    }
+
+    #[tokio::test]
+    async fn a_move_is_sent_once_and_reported_as_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![held_r1()],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, |_, _| None);
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        // Two moves of one text: the last is what the board holds, and the
+        // text is counted once.
+        let result = handle_move_footprint_texts(
+            &json!({ "board": board, "moves": [
+                { "reference": "R1", "x": 12.0, "y": 17.0 },
+                { "reference": "R1", "dx": 1.0, "dy": 0.0 }
+            ]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let reply = body(&result);
+        assert_eq!(reply["moved"], 1, "{reply}");
+        assert_eq!(reply["texts"][0]["position"]["x"], 13.0, "{reply}");
+        let held = store.lock().unwrap();
+        assert_eq!(held.updates, 1, "one UpdateItems for the batch");
+        assert_eq!(held_reference_position(&held), (13_000_000, 17_000_000));
+    }
+
+    #[tokio::test]
+    async fn a_refused_edit_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![held_r1()],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, |_, _| None);
+        let result = handle_move_footprint_texts(
+            &json!({ "board": board, "moves": [
+                { "reference": "R1", "x": 12.0, "y": 17.0 },
+                { "reference": "R9", "x": 1.0, "y": 1.0 }
+            ]}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{:?}", result.content);
+        let held = store.lock().unwrap();
+        assert_eq!(held.updates, 0);
+        assert_eq!(held_reference_position(&held), (10_000_000, 18_500_000));
+    }
+
+    /// A board that keeps something other than what was sent (standing in
+    /// for KiCad changing an item on commit) is reported, not described as
+    /// moved.
+    #[tokio::test]
+    async fn a_board_that_kept_something_else_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![held_r1()],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            |item| *item = held_r1(),
+            |_, _| None,
+        );
+        let result = handle_move_footprint_texts(
+            &json!({ "board": board, "moves": [{ "reference": "R1", "x": 12.0, "y": 17.0 }]}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{:?}", result.content);
+        let text = format!("{:?}", result.content);
+        // Reported as an uncertain outcome after a mutation, not a refusal,
+        // with each difference named (review 3 of plan step 7).
+        assert!(text.contains("the edit was sent"), "{text}");
+        assert!(text.contains("Do not repeat the mutation"), "{text}");
+        assert!(
+            text.contains("R1 Reference is at (10, 18.5), not (12, 17)"),
+            "{text}"
+        );
     }
 }

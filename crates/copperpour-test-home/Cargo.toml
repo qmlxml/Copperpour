@@ -1,0 +1,11 @@
+[package]
+name = "copperpour-test-home"
+description = "Test-only: point a test process's per-user directories at a temporary one"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]

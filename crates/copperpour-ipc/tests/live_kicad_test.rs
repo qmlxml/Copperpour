@@ -1239,3 +1239,10 @@ fn the_shared_reference_fixture_still_carries_a_duplicate_board_only_reference()
          found {pathless_by_reference:?}"
     );
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

@@ -9,6 +9,7 @@ mod board_source;
 #[cfg(test)]
 mod board_source_contract_tests;
 mod board_stackup;
+mod board_stackup_set;
 #[cfg(test)]
 mod board_title_block_tests;
 #[cfg(test)]
@@ -25,6 +26,7 @@ mod design_rules_tests;
 pub(crate) mod drc;
 pub mod easyeda;
 pub mod editor_navigation;
+mod erc_severity;
 mod footprint_fields;
 mod footprint_graphics;
 mod footprint_metadata;
@@ -72,6 +74,7 @@ pub mod schematic_builder;
 mod schematic_placement_tests;
 #[cfg(test)]
 mod schematic_title_block_tests;
+pub mod simulation;
 pub mod svg_import;
 mod symbol_fields;
 mod symbol_pins;
@@ -297,6 +300,11 @@ pub struct ToolContext {
     /// Reads installed guidance for drift. Set once by the standalone binary,
     /// which owns the bundle; absent in embedded and test contexts (#728).
     pub(crate) guidance: std::sync::OnceLock<std::sync::Arc<dyn crate::guidance::GuidanceProbe>>,
+    /// How to reach the simulation worker. Set once by the standalone binary,
+    /// which contains it; absent in embedded and test contexts, where
+    /// `current_exe()` is not a Copperpour binary.
+    pub(crate) simulation:
+        std::sync::OnceLock<std::sync::Arc<crate::simulation::SimulationRuntime>>,
 }
 
 impl ToolContext {
@@ -311,6 +319,7 @@ impl ToolContext {
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
+            simulation: std::sync::OnceLock::new(),
         }
     }
 
@@ -329,6 +338,7 @@ impl ToolContext {
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
+            simulation: std::sync::OnceLock::new(),
         }
     }
 
@@ -1098,15 +1108,19 @@ pub(crate) fn replace_outcome(
     let shown = path.display().to_string();
     match written {
         Ok(true) => Ok(None),
-        Ok(false) => Ok(Some(CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::Conflict {
-                paths: vec![shown.clone()],
-            },
-            format!(
-                "The {what} '{shown}' changed after Copperpour read it, so {operation} wrote \
+        // Refused before anything was written: the same outcome as a file
+        // that changed since the read.
+        Ok(false) | Err(copperpour_sexp::SexpError::ChangedBeforeWrite { .. }) => {
+            Ok(Some(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::Conflict {
+                    paths: vec![shown.clone()],
+                },
+                format!(
+                    "The {what} '{shown}' changed after Copperpour read it, so {operation} wrote \
                  nothing. Reload it and retry."
-            ),
-        ))),
+                ),
+            )))
+        }
         Err(copperpour_sexp::SexpError::Conflict { .. }) => {
             let reason =
                 format!("the {what} no longer held the edit when read back after the write");
@@ -1550,6 +1564,16 @@ impl StubDirection {
         use copperpour_sexp::geometry::round6;
         (round6(x + self.dx * length), round6(y + self.dy * length))
     }
+
+    /// Turn the label to run along its stub, 90° up or 270° down, instead of
+    /// the horizontal default. A row of vertical pins a few millimetres apart
+    /// otherwise gets horizontal labels written over one another.
+    pub(crate) fn along_stub(mut self) -> Self {
+        if let Some(row) = STUB_DIRECTIONS.iter().find(|row| row.0 == self.name) {
+            self.label_rotation = row.3;
+        }
+        self
+    }
 }
 
 /// Numbers in `text` with more than the six decimals KiCad writes, such as
@@ -1579,6 +1603,24 @@ pub(crate) fn noisy_numbers(value: &Value) -> Vec<String> {
         Value::Array(items) => items.iter().flat_map(noisy_numbers).collect(),
         Value::Object(fields) => fields.values().flat_map(noisy_numbers).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// `label_orientation` for the stub-and-label tools.
+pub(crate) const LABEL_ORIENTATION_DESC: &str =
+    "'horizontal' (default) keeps label text horizontal, as KiCad's own schematics do for a \
+     label on a pin. 'along_stub' turns a label on an up or down stub to run along it (90° or \
+     270°), for a row of vertical pins too close together for horizontal labels.";
+
+/// Whether `label_orientation` asks for labels along their stubs.
+pub(crate) fn labels_along_stub(args: &serde_json::Value) -> Result<bool, CallToolResult> {
+    match args.get("label_orientation").map(|v| v.as_str()) {
+        None | Some(Some("horizontal")) => Ok(false),
+        Some(Some("along_stub")) => Ok(true),
+        _ => Err(invalid_arg(
+            "label_orientation",
+            "expected 'horizontal' or 'along_stub'",
+        )),
     }
 }
 
@@ -3379,5 +3421,57 @@ mod ipc_failure_evidence_tests {
         });
         assert_eq!(evidence["kind"], "request_failed");
         assert_eq!(evidence["message"], "AS_NOT_READY");
+    }
+}
+
+#[cfg(test)]
+mod replace_outcome_tests {
+    use super::*;
+
+    fn text(result: &CallToolResult) -> String {
+        serde_json::to_string(result).unwrap()
+    }
+
+    /// A write refused before anything was written (the live-editor guard)
+    /// must be reported like a file that changed since the read, not as an
+    /// uncertain outcome that would tell the caller the edit may be applied.
+    #[test]
+    fn a_change_before_the_write_is_reported_as_nothing_written() {
+        let path = std::path::Path::new("/project/amp.kicad_sch");
+        let refused = replace_outcome(
+            path,
+            "schematic",
+            "add_wire",
+            Err(copperpour_sexp::SexpError::ChangedBeforeWrite {
+                path: path.to_path_buf(),
+            }),
+        )
+        .unwrap()
+        .expect("a refusal");
+        let unchanged = replace_outcome(path, "schematic", "add_wire", Ok(false))
+            .unwrap()
+            .expect("a refusal");
+        assert_eq!(text(&refused), text(&unchanged));
+        assert!(
+            text(&refused).contains("wrote nothing"),
+            "{}",
+            text(&refused)
+        );
+
+        let readback = replace_outcome(
+            path,
+            "schematic",
+            "add_wire",
+            Err(copperpour_sexp::SexpError::Conflict {
+                path: path.to_path_buf(),
+            }),
+        )
+        .unwrap()
+        .expect("a refusal");
+        assert_ne!(
+            text(&readback),
+            text(&refused),
+            "a failed read-back stays uncertain"
+        );
     }
 }

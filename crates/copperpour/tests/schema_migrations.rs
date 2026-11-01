@@ -41,3 +41,10 @@ fn narrowed_tools_describe_their_real_scope() {
     assert!(tool("run_drc").description.contains("no per-test selector"));
     assert!(tool("refill_zones").description.contains("complete board"));
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

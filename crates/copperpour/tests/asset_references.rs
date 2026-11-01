@@ -126,7 +126,7 @@ fn agents_preload_existing_skills() {
 /// deliberately instead of leaving agents undiscoverable (#357).
 #[test]
 fn top_level_skill_routes_every_bundled_agent() {
-    let router = std::fs::read_to_string(assets_root().join("skills/konnect/SKILL.md")).unwrap();
+    let router = std::fs::read_to_string(assets_root().join("skills/copperpour/SKILL.md")).unwrap();
     let mut missing = Vec::new();
     for entry in std::fs::read_dir(assets_root().join("agents"))
         .unwrap()
@@ -143,7 +143,7 @@ fn top_level_skill_routes_every_bundled_agent() {
 
     assert!(
         missing.is_empty(),
-        "top-level konnect skill does not route bundled agent(s): {}",
+        "top-level copperpour skill does not route bundled agent(s): {}",
         missing.join(", ")
     );
 }
@@ -657,7 +657,39 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
     // KiCad's own vocabulary, and file/format names.
     const NOT_TOOLS: &[&str] = &[
+        // KiCad DRC violation types named in the kicad-pcb skill's silkscreen
+        // cleanup, and move_footprint_texts arguments (its schema has them).
+        "silk_overlap",
+        "silk_over_copper",
+        // A response field and a warning code of update_pcb_from_schematic,
+        // named in the kicad-pcb skill's sync step (plan step 7b).
+        "zones_to_refill",
+        "zones_need_refill",
+        "local_x",
+        "local_y",
+        // Parameters and a net in the kicad-simulation protection stand-ins, which
+        // `protection_skill.rs` ties to the decks the live tests run.
+        "sh_t0",
+        "sh_tau",
+        "sh_ron",
+        "sh_roff",
+        "sh_s",
+        "fz_a",
+        "fz_ctl",
+        "fz_in",
+        "fz_q",
+        "fz_rated",
+        "ef_ilim",
+        "ef_ron",
+        "uv_on",
+        "uv_off",
+        "rb_ron",
+        "rb_roff",
+        "rb_knee",
+        "rect_out",
         "load_toolset",
+        // Meta-tool offered only with the stdio transport on Unix.
+        "reload_server",
         "unload_toolset",
         "list_toolboxes",
         "get_active_toolsets",
@@ -744,6 +776,74 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "ownership_status",
         "uuid_missing",
         "not_found",
+        // Simulation result fields and failure codes.
+        "at_seconds",
+        // Warning codes added when merged (plan step 4, review 3).
+        "excluded_in_schematic",
+        "not_in_spice_netlist",
+        "sheets_not_read",
+        "excluded_references",
+        "testbench_elements_added",
+        "control_block_dropped",
+        "schematic_open_in_editor",
+        "band_percent",
+        "circuit_not_parsed",
+        "copy_library_sim_fields",
+        "coverage_ratio",
+        "deck_path",
+        "device_currents_not_saved",
+        "engine_crashed",
+        "engine_failed",
+        "engine_messages",
+        "engine_not_found",
+        "exclude_references",
+        "fall_time",
+        "final_value",
+        "final_value_needed",
+        "first_point_seconds",
+        "floating_subcircuit",
+        "from_seconds",
+        "incomplete_coverage",
+        "inrush_i2t",
+        "inrush_peak",
+        "level_not_reached",
+        "max_step_seconds",
+        "net_name_collision",
+        "ngspice_library",
+        "no_convergence",
+        "no_ground_reference",
+        "no_point_at_start",
+        "no_transition",
+        "non_finite_data",
+        "not_settled",
+        "operating_point",
+        "outside_data",
+        "overshoot_percent",
+        "peak_abs",
+        "peak_to_peak",
+        "probe_loses_initial_conditions",
+        "rail_low",
+        "replace_series_part",
+        "rise_time",
+        "settling_time",
+        "signal_not_found",
+        "simulated_circuit",
+        "size_limit",
+        "spice_lines",
+        "spice_name",
+        "start_save_seconds",
+        "start_value",
+        "starts_on_level",
+        "stop_time_seconds",
+        "suggested_fix",
+        "table_path",
+        "timed_out",
+        "to_seconds",
+        "unbalanced_deck_block",
+        "unmodelled_symbols",
+        "use_initial_conditions",
+        "value_at",
+        "window_truncated",
         "unavailable",
         "ambiguous",
         // Power-symbol placement response fields, not callable tools (#856).
@@ -965,4 +1065,11 @@ fn symbol_exists(root: &Path, lib: &str, sym: &str) -> bool {
     std::fs::read_to_string(file)
         .map(|s| s.contains(&format!("(symbol \"{sym}\"")))
         .unwrap_or(false)
+}
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
 }

@@ -29,3 +29,10 @@ fn rendering_twice_is_byte_identical() {
     let diff = diff_pngs(&a.png, &b.png).unwrap();
     assert_eq!(diff.changed_pixels, 0);
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

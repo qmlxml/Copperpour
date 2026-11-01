@@ -74,7 +74,7 @@ Do not claim all-or-nothing behavior when the backend cannot provide it.
 
 The shared `outcome` envelope is implemented for
 `add_schematic_component`, `annotate_schematic`, `batch_place_components`,
-`delete_zone`, and `run_design_review`.
+`delete_zone`, `run_design_review`, and `run_simulation`.
 That pilot is intentionally bounded. The following adjacent paths retain their
 existing response contracts until their focused issues are resolved. The
 machine-checked source of this baseline is
@@ -137,6 +137,6 @@ not model selection.
 - [Branch workflow](BRANCH_AND_PULL_REQUEST_WORKFLOW.md)
 
 The canonical source is `docs/RELIABILITY_CONTRACT.md`. The installer embeds these
-same bytes as the konnect skill's `references/reliability-contract.md`, so
+same bytes as the copperpour skill's `references/reliability-contract.md`, so
 installed guidance can read it offline. Repository links above refer to current
 maintainer policy, which may be newer than an installed release.

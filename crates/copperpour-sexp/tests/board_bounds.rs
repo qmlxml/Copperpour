@@ -295,3 +295,10 @@ fn malformed_optional_geometry_is_skipped_instead_of_defaulted() {
     let boxes: Vec<Bbox> = bounds.items.iter().map(|item| item.bbox).collect();
     assert_eq!(boxes, [(9.75, 19.75, 40.5, 50.5), (4.7, 4.7, 5.3, 5.3)]);
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

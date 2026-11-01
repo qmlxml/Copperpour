@@ -32,6 +32,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check
         run: cargo check --workspace --locked
+      # Tests must not write into the user's home (crates/copperpour-test-home;
+      # scripts/gate.sh runs the same check locally). The test steps below run
+      # with HOME and the XDG directories inside an empty directory, and "Home
+      # untouched" fails, listing them, if anything appears there. The selftest
+      # makes that failure run on every build. Steps that write into HOME by
+      # design (installers, git config) must stay outside the two steps. Not on
+      # Windows: per-user folders come from the profile there, not from HOME.
+      - name: Empty home for the tests
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: scripts/ci_home_untouched.sh selftest && scripts/ci_home_untouched.sh prepare
       # Fast, named contract gate for the adopted outcome catalogue and the
       # reviewed legacy-debt ratchet. The full test step below remains the
       # regression gate; this makes contract drift immediately identifiable.
@@ -44,6 +55,11 @@ jobs:
       # once (PR #49) because they were never run in CI.
       - name: Doctests
         run: cargo test --workspace --locked --doc
+      - name: Home untouched
+        # Also after a failing test step, so its writes are listed too.
+        if: ${{ !cancelled() && env.COPPERPOUR_CI_EMPTY_HOME != '' }}
+        shell: bash
+        run: scripts/ci_home_untouched.sh check
 
   # The KiCAD action plugin is Python, so cargo never sees it. Its only real
   # logic is the server-PID bookkeeping (#103), where an unconditional

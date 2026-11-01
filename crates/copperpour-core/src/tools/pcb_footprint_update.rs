@@ -28,6 +28,10 @@ struct LibraryFootprint {
     pads: Vec<copperpour_ipc::IpcPadDefinition>,
     graphics: Vec<copperpour_ipc::IpcGraphicDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
+    /// `(net_tie_pad_groups …)`: pads copper may join without a short.
+    net_ties: Vec<kiapi::board::types::NetTieDefinition>,
+    /// The footprint-level `(zone_connect …)`, `None` when inherited.
+    zone_connection: Option<kiapi::board::types::ZoneConnectionStyle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -39,6 +43,19 @@ enum ChangedDomain {
     Metadata,
     Models,
     TextEffects,
+    /// The definition's net-tie pad groups (merge of the `marju212` fork).
+    NetTies,
+}
+
+/// A library zone connection the refresh did not apply, because the board
+/// footprint's own design-rule overrides are kept as a group (review 3 of
+/// plan step 7). KiCad's Update Footprint takes zone connection together
+/// with clearance and mask and paste margins, all from the library or all
+/// from the board; Copperpour keeps the board's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct KeptZoneConnection {
+    board: String,
+    library: String,
 }
 
 #[derive(Debug)]
@@ -47,6 +64,7 @@ struct PreparedUpdate {
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
     text_effects: Vec<FieldEffectsChange>,
+    kept_zone_connection: Option<KeptZoneConnection>,
 }
 
 /// A field's text effects, in board millimetres and degrees. A `None`
@@ -229,6 +247,8 @@ struct PlannedUpdate {
     preserved: PreservedState,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     text_effects: Vec<FieldEffectsChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept_zone_connection: Option<KeptZoneConnection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -849,6 +869,7 @@ fn plan_updates(
                 changed_domains: prepared.changed_domains,
                 preserved: prepared.preserved,
                 text_effects: prepared.text_effects,
+                kept_zone_connection: prepared.kept_zone_connection,
             });
             prepared_items.push(prepared.item);
         }
@@ -902,6 +923,8 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
     let models = super::library_footprint::models(&root)?;
     let attributes = super::library_footprint::attributes(&root)?;
+    let net_ties = super::library_footprint::net_ties(&root)?;
+    let zone_connection = super::library_footprint::zone_connection(&root)?;
     let definition = kiapi::board::types::Footprint {
         id: Some(kiapi::common::types::LibraryIdentifier {
             library_nickname: library_nickname.to_string(),
@@ -923,6 +946,8 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         pads,
         graphics,
         models,
+        net_ties,
+        zone_connection,
     })
 }
 
@@ -935,6 +960,10 @@ fn validate_supported_children(root: &copperpour_sexp::SexpNode) -> Result<()> {
             "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
             | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
             | "fp_poly" | "pad" | "model" => {}
+            // Read into typed messages by `library_footprint`: a solder
+            // jumper's net-tie pad groups and the footprint-level zone
+            // connection a jumper or test pad sets (merge of `marju212`).
+            "net_tie_pad_groups" | "zone_connect" => {}
             // KiCad 10 writes these two flags into every footprint it saves
             // (all 15,428 official library files carry them, every one at its
             // default). At the default the typed rebuild loses nothing;
@@ -1411,6 +1440,28 @@ fn build_updated_instance(
         attributes.do_not_populate = current_attributes.do_not_populate;
     }
     updated.attributes = Some(attributes);
+    // The library's net ties replace the board's. Its zone connection does
+    // not: the board footprint's design-rule overrides are kept as a group,
+    // and a library value that differs is reported (review 3 of plan step 7).
+    super::library_footprint::apply_net_ties_and_zone_connection(
+        &mut updated,
+        &library.net_ties,
+        None,
+    )?;
+    let board_zone_connection = current
+        .overrides
+        .as_ref()
+        .map(|overrides| overrides.zone_connection())
+        // The protobuf default, unknown, carries no override: inherited.
+        .filter(|style| *style != kiapi::board::types::ZoneConnectionStyle::ZcsUnknown)
+        .unwrap_or(kiapi::board::types::ZoneConnectionStyle::ZcsInherited);
+    let kept_zone_connection = library
+        .zone_connection
+        .filter(|library| *library != board_zone_connection)
+        .map(|library| KeptZoneConnection {
+            board: board_zone_connection.as_str_name().to_string(),
+            library: library.as_str_name().to_string(),
+        });
 
     let mut text_effects = Vec::new();
     if text_reset.any() {
@@ -1458,6 +1509,7 @@ fn build_updated_instance(
         changed_domains,
         preserved,
         text_effects,
+        kept_zone_connection,
     })
 }
 
@@ -1890,6 +1942,11 @@ fn changed_domains(
         || current.value_field != updated.value_field
     {
         changed.insert(ChangedDomain::TextEffects);
+    }
+    // Without these two, a refresh whose only difference is a solder jumper's
+    // net ties planned a no-op and never sent them.
+    if current_definition.net_ties != updated_definition.net_ties {
+        changed.insert(ChangedDomain::NetTies);
     }
     Ok(changed)
 }
@@ -3498,6 +3555,78 @@ mod tests {
         );
     }
 
+    /// A library that gains a solder jumper's net ties and a footprint-level
+    /// zone connection is a change the refresh must send: before the merge of
+    /// the `marju212` fork both clauses were refused, and comparing neither
+    /// would have planned a no-op that never sent them. Applying the result
+    /// and refreshing again must then be a no-op (`109f890`), or every
+    /// refresh of a jumper would rewrite it.
+    #[test]
+    fn net_ties_and_zone_connection_are_sent_once_then_unchanged() {
+        let base = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let routed = BTreeSet::new();
+        let build = |current: &kiapi::board::types::FootprintInstance,
+                     library: &LibraryFootprint| {
+            build_updated_instance(
+                current,
+                library,
+                two_layers(),
+                &net_codes,
+                &routed,
+                TextReset::default(),
+            )
+            .unwrap()
+        };
+        let decode = |prepared: &PreparedUpdate| {
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap()
+        };
+        let applied = decode(&build(&current, &base));
+
+        let pads: Vec<String> = base.pads.iter().map(|pad| pad.number.clone()).collect();
+        assert!(pads.len() >= 2, "{pads:?}");
+        let jumper_source = LIBRARY_FOOTPRINT.replacen(
+            "(version 20240108)",
+            &format!(
+                "(version 20240108)\n  (zone_connect 2)\n  (net_tie_pad_groups \"{}, {}\")",
+                pads[0], pads[1]
+            ),
+            1,
+        );
+        let jumper = parse_library_footprint("Test:Socket", &jumper_source).unwrap();
+
+        let first = build(&applied, &jumper);
+        assert_eq!(
+            first.changed_domains,
+            BTreeSet::from([ChangedDomain::NetTies])
+        );
+        let sent = decode(&first);
+        assert_eq!(
+            sent.definition.as_ref().unwrap().net_ties[0].pad_number,
+            vec![pads[0].clone(), pads[1].clone()]
+        );
+        // The board's zone connection is kept with its other design-rule
+        // overrides, and the library's differing value reported (review 3 of
+        // plan step 7).
+        assert_eq!(sent.overrides, applied.overrides);
+        assert!(first.preserved.instance_overrides);
+        assert_eq!(
+            first.kept_zone_connection,
+            Some(KeptZoneConnection {
+                board: "ZCS_INHERITED".to_string(),
+                library: "ZCS_FULL".to_string(),
+            })
+        );
+
+        let again = build(&sent, &jumper);
+        assert!(
+            again.changed_domains.is_empty(),
+            "{:?}",
+            again.changed_domains
+        );
+    }
+
     #[test]
     fn plan_revision_tracks_selected_board_library_and_filter_inputs_only() {
         let (_temp, board, mut items) = plan_fixture();
@@ -4278,6 +4407,7 @@ mod tests {
             changed_domains: prepared.changed_domains.clone(),
             preserved: prepared.preserved.clone(),
             text_effects: prepared.text_effects.clone(),
+            kept_zone_connection: prepared.kept_zone_connection.clone(),
         };
         let unchanged = builders::pack_any(&applied, "kiapi.board.types.FootprintInstance");
         assert_eq!(

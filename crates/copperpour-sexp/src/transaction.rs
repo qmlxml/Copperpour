@@ -8,8 +8,8 @@
 
 use crate::writer::{
     ensure_kicad_design_document_is_closed, open_document_lock, read_string_unlocked,
-    sync_parent_directory, write_atomic_unlocked, write_new_atomic_unlocked,
-    write_new_atomic_unlocked_private,
+    sync_parent_directory, write_atomic_unlocked_planned, write_atomic_unlocked_strict,
+    write_new_atomic_unlocked, write_new_atomic_unlocked_private, write_new_atomic_unlocked_strict,
 };
 use crate::SexpError;
 use fs4::FileExt;
@@ -303,7 +303,7 @@ pub fn try_commit_file_transaction(
 
     (|| -> Result<(), SexpError> {
         for entry in &journal.entries {
-            apply_entry(&root, entry)?;
+            apply_entry(&root, entry, Apply::Transaction)?;
         }
         verify_after_images(&root, &journal_path, &journal.entries)?;
         remove_journal(&journal_path)
@@ -471,7 +471,7 @@ fn recover_journal(root: &Path, journal_path: &Path) -> Result<RecoveryOutcome, 
         }
     }
     for entry in &pending {
-        apply_entry(root, entry)?;
+        apply_entry(root, entry, Apply::Recovery)?;
     }
     verify_after_images(root, journal_path, &journal.entries)?;
     remove_journal(journal_path)?;
@@ -707,12 +707,28 @@ fn verify_after_images(
     Ok(())
 }
 
-fn apply_entry(root: &Path, entry: &JournalEntry) -> Result<(), SexpError> {
+/// Whether an entry is applied by a live transaction or by recovery of an
+/// interrupted one. Recovery never consults the live-editor hook.
+#[derive(Clone, Copy, PartialEq)]
+enum Apply {
+    Transaction,
+    Recovery,
+}
+
+/// Write one entry, comparing against its before image (`expected`) rather
+/// than a fresh read, so a change made after the before images were verified
+/// is refused, not overwritten.
+fn apply_entry(root: &Path, entry: &JournalEntry, mode: Apply) -> Result<(), SexpError> {
     let path = root.join(&entry.path);
-    if entry.expected.is_some() {
-        write_atomic_unlocked(&path, &entry.replacement)
-    } else {
-        write_new_atomic_unlocked(&path, &entry.replacement)
+    match (&entry.expected, mode) {
+        (Some(expected), Apply::Transaction) => {
+            write_atomic_unlocked_planned(&path, expected, &entry.replacement)
+        }
+        (Some(expected), Apply::Recovery) => {
+            write_atomic_unlocked_strict(&path, expected, &entry.replacement)
+        }
+        (None, Apply::Transaction) => write_new_atomic_unlocked(&path, &entry.replacement),
+        (None, Apply::Recovery) => write_new_atomic_unlocked_strict(&path, &entry.replacement),
     }
 }
 
@@ -793,6 +809,35 @@ fn transaction_conflict(journal: &Path, path: &Path, reason: &str) -> SexpError 
 mod tests {
     use super::*;
     use crate::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
+
+    /// An entry is written against its before image: a file that changed
+    /// after the before images were verified is refused, not overwritten,
+    /// both in a live transaction and in recovery.
+    #[test]
+    fn an_entry_whose_file_changed_after_verification_is_not_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("a.kicad_sch"),
+            "changed by another program",
+        )
+        .unwrap();
+        let entry = JournalEntry {
+            path: PathBuf::from("a.kicad_sch"),
+            expected: Some("before image".to_owned()),
+            replacement: "replacement".to_owned(),
+        };
+        for mode in [Apply::Transaction, Apply::Recovery] {
+            let error = apply_entry(root.path(), &entry, mode).unwrap_err();
+            assert!(
+                matches!(error, SexpError::ChangedBeforeWrite { .. }),
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.kicad_sch")).unwrap(),
+            "changed by another program"
+        );
+    }
     use crate::{prepare_command, ItemAnchor, SchematicCommand};
 
     #[test]
@@ -940,7 +985,7 @@ mod tests {
         // the same transaction machinery in the same run — the two creation
         // policies have to differ. The journal is deliberately left in place
         // for the parent to inspect.
-        apply_entry(&root, &journal.entries[0]).expect("entry applies");
+        apply_entry(&root, &journal.entries[0], Apply::Transaction).expect("entry applies");
     }
 
     #[cfg(unix)]

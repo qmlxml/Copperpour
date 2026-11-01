@@ -26,6 +26,10 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Polls in a row that may go unanswered before the job is given up. A busy
+/// JVM (garbage collection, a starved CPU) can stop answering for minutes in
+/// the middle of a long route; the overall timeout still bounds the wait.
+const MAX_MISSED_POLLS: u32 = 10;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -60,6 +64,29 @@ pub(crate) struct RouteSettings {
     pub max_passes: Option<u32>,
     pub optimizer_enabled: Option<bool>,
     pub job_timeout_seconds: Option<u64>,
+    /// Once routing is complete and the optimizer has started, how long to let
+    /// it run before taking the best board so far and stopping the job.
+    pub optimize_seconds: Option<u64>,
+    /// Freerouting's `optimizer.max_passes` (its default is 100).
+    pub optimizer_max_passes: Option<u32>,
+    /// Freerouting's `optimizer.improvement_threshold`, in percent: the
+    /// optimizer stops after a pass that improves less (its default is 2.5).
+    pub optimizer_improvement_threshold: Option<f64>,
+    /// Freerouting's `plane_nets`: nets to mark as power-plane nets (plane
+    /// routing mode, cheaper vias to the plane). A `(plane ...)` declared in
+    /// the DSN already sets the same flag on its net.
+    pub plane_nets: Option<Vec<String>>,
+    /// Freerouting's `plane_as_obstacle`: whether copper pours block foreign
+    /// traces (its default is false).
+    pub plane_as_obstacle: Option<bool>,
+    /// Any of Freerouting's router settings, in its JSON shape
+    /// (`get_effective_settings`), passed through as given. The named fields
+    /// above are merged on top and win.
+    pub router_settings: Option<Map<String, Value>>,
+    /// Settings taken from the KiCad project's design rules
+    /// (`project_route_rules`), sent under everything above. A key the JAR
+    /// does not know is reported, not refused: the caller did not ask for it.
+    pub project_rules: Map<String, Value>,
     pub poll_interval: Duration,
     pub overall_timeout: Duration,
 }
@@ -74,6 +101,27 @@ pub(crate) struct RouteEvidence {
     pub ses_bytes: u64,
     pub server_protocol_version: String,
     pub diagnostics_path: Option<String>,
+    /// Last routing activity read from Freerouting's log, e.g.
+    /// "pass 17: 0 unrouted, 218 violations".
+    pub last_activity: Option<String>,
+    /// Connections still unrouted when the job ended, from the last count in
+    /// Freerouting's log; None when the log could not be read.
+    pub unrouted: Option<u64>,
+    /// Clearance violations at the end of the job, from the same log line as
+    /// `unrouted`; None when the log could not be read (merge review, plan
+    /// step 5: a board with violations read as a routed board).
+    pub violations: Option<u64>,
+    /// Whether the job's effective settings could be read back and compared
+    /// with what was sent; false means `settings_not_applied` is not evidence.
+    pub settings_checked: bool,
+    /// Settings sent but not found with the same value among the job's
+    /// effective settings: unknown key, typo, or a value Freerouting replaced.
+    pub settings_not_applied: Vec<String>,
+    /// Project design rules sent but not applied, e.g. a key an older JAR
+    /// does not have (`hole_to_hole_um` before 2.5.1).
+    pub project_rules_not_applied: Vec<String>,
+    /// Freerouting's own `validation_warnings` for the effective settings.
+    pub settings_warnings: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,7 +233,14 @@ pub(crate) async fn route_local(
             if diagnostics.is_empty() {
                 Err(error)
             } else {
-                Err(error).context(format!("Freerouting stderr: {diagnostics}"))
+                let full = diagnostics_path
+                    .as_deref()
+                    .map(|path| format!(", all of it in {path}"))
+                    .unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "{error:#}\nFreerouting stderr, last lines{full}:\n{}",
+                    stderr_tail(&diagnostics)
+                ))
             }
         }
     };
@@ -227,11 +282,15 @@ pub(crate) async fn route_local(
     })
 }
 
+fn diagnostics_path(ses_output: &Path) -> PathBuf {
+    ses_output.with_extension("freerouting.log")
+}
+
 async fn write_diagnostics(output: &Path, diagnostics: &str) -> Result<Option<String>> {
     if diagnostics.is_empty() {
         return Ok(None);
     }
-    let path = output.with_extension("freerouting.log");
+    let path = diagnostics_path(output);
     if path.exists() {
         bail!(
             "Freerouting diagnostics output already exists: {}",
@@ -261,6 +320,15 @@ fn validate_inputs(
     if ses_output.exists() {
         bail!("SES output already exists: {}", ses_output.display());
     }
+    // write_diagnostics refuses to replace this file, but only once routing is
+    // over: refuse now rather than after a run that can take many minutes.
+    let diagnostics = diagnostics_path(ses_output);
+    if diagnostics.exists() {
+        bail!(
+            "Freerouting diagnostics output already exists: {}",
+            diagnostics.display()
+        );
+    }
     if let Some(max_passes) = settings.max_passes {
         if !(1..=100).contains(&max_passes) {
             bail!("max_passes must be between 1 and 100");
@@ -287,7 +355,80 @@ fn validate_inputs(
     {
         bail!("job_timeout_seconds must be between 1 and 86400");
     }
+    if settings
+        .optimize_seconds
+        .is_some_and(|seconds| seconds > 86_400)
+    {
+        bail!("optimize_seconds must be between 0 and 86400");
+    }
+    if let Some(seconds) = settings.optimize_seconds {
+        if settings.overall_timeout <= Duration::from_secs(seconds) {
+            bail!(
+                "overall_timeout_seconds ({}) must exceed optimize_seconds ({seconds}): routing \
+                 comes first, and the optimizer window opens only once it is done",
+                settings.overall_timeout.as_secs()
+            );
+        }
+    }
+    if settings
+        .optimizer_max_passes
+        .is_some_and(|passes| !(1..=100).contains(&passes))
+    {
+        bail!("optimizer_max_passes must be between 1 and 100");
+    }
+    if settings
+        .optimizer_improvement_threshold
+        .is_some_and(|percent| !(0.0..=100.0).contains(&percent))
+    {
+        bail!("optimizer_improvement_threshold must be between 0 and 100 (percent)");
+    }
+    if let Some(router_settings) = &settings.router_settings {
+        let negative = negative_settings(router_settings);
+        if !negative.is_empty() {
+            bail!(
+                "router_settings must not be negative, nothing was routed: {}",
+                negative.join("; ")
+            );
+        }
+    }
     Ok(())
+}
+
+/// Every number below zero in `settings`, as "path: value". Freerouting takes
+/// a negative cost or count without a warning and routes with it, yet none of
+/// its settings has a meaning below zero: costs, penalties, weights, counts,
+/// distances and thresholds.
+fn negative_settings(settings: &Map<String, Value>) -> Vec<String> {
+    fn walk(value: &Value, path: &str, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let here = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(value, &here, out);
+                }
+            }
+            Value::Array(items) => {
+                for (index, value) in items.iter().enumerate() {
+                    walk(value, &format!("{path}[{index}]"), out);
+                }
+            }
+            Value::Number(number) if number.as_f64().is_some_and(|n| n < 0.0) => {
+                out.push(format!("{path}: {number}"))
+            }
+            // A number sent as a string, such as "-5", is refused the same way.
+            Value::String(text) if text.trim().parse::<f64>().is_ok_and(|n| n < 0.0) => {
+                out.push(format!("{path}: {text:?}"))
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(&Value::Object(settings.clone()), "", &mut out);
+    out
 }
 
 async fn run_state_machine(
@@ -327,19 +468,13 @@ async fn run_state_machine(
         )
         .await?;
 
-    let mut job_settings = Map::new();
-    if let Some(max_passes) = settings.max_passes {
-        job_settings.insert("maxPasses".to_string(), json!(max_passes));
-    }
-    if let Some(enabled) = settings.optimizer_enabled {
-        job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
-    }
-    if let Some(seconds) = settings.job_timeout_seconds {
-        job_settings.insert(
-            "jobTimeoutString".to_string(),
-            Value::String(duration_string(seconds)),
-        );
-    }
+    let job_settings = job_settings_body(settings);
+    let requested = requested_settings(settings);
+    let mut settings_not_applied = Vec::new();
+    // No settings sent means nothing to check.
+    let mut settings_checked = job_settings_body(settings).is_empty();
+    let mut project_rules_not_applied = Vec::new();
+    let mut settings_warnings = Vec::new();
     if !job_settings.is_empty() {
         if !tools.contains_key("update_job_settings") {
             bail!("Freerouting MCP does not expose update_job_settings");
@@ -350,33 +485,106 @@ async fn run_state_machine(
                 json!({ "path": { "jobId": job_id }, "body": job_settings }),
             )
             .await?;
+        // Freerouting accepts unknown keys and drops them without a word:
+        // read the settings back so a setting that did not take is reported.
+        if tools.contains_key("get_effective_settings") {
+            let effective = client
+                .call_tool(
+                    "get_effective_settings",
+                    json!({ "path": { "jobId": job_id } }),
+                )
+                .await?;
+            if let Some(effective) = effective_settings(&effective) {
+                settings_checked = true;
+                settings_not_applied = settings_mismatches(&requested, effective);
+                project_rules_not_applied =
+                    settings_mismatches(&project_only_settings(settings, &requested), effective);
+                // Known before start_job: refuse now rather than after a run
+                // that would ignore part of what was asked.
+                if !settings_not_applied.is_empty() {
+                    bail!(
+                        "Freerouting did not apply these settings, nothing was routed: {}",
+                        settings_not_applied.join("; ")
+                    );
+                }
+                settings_warnings = effective
+                    .get("validation_warnings")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
     }
     client
         .call_tool("start_job", json!({ "path": { "jobId": job_id } }))
         .await?;
 
     let mut poll_count = 0u32;
+    let mut progress = JobProgress::new(&job_id);
+    let mut optimizing_since: Option<Instant> = None;
+    let mut output_downloaded = false;
+    let mut missed_polls = 0u32;
     let final_state = loop {
-        let details = client
+        let details = match client
             .call_tool("get_job_details", json!({ "path": { "jobId": job_id } }))
-            .await?;
+            .await
+        {
+            Ok(details) => details,
+            Err(error) if is_request_timeout(&error) && missed_polls < MAX_MISSED_POLLS => {
+                missed_polls += 1;
+                progress.report_missed_poll(missed_polls, started);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        missed_polls = 0;
         poll_count = poll_count.saturating_add(1);
         let state = required_string(&details, &["state", "status"], "job state")?;
+        progress.report(&state, &details, started);
         match state.to_ascii_uppercase().as_str() {
             "COMPLETED" => break "COMPLETED".to_string(),
             "FAILED" | "CANCELLED" | "CANCELED" => {
                 bail!("Freerouting job {job_id} ended in state {state}")
             }
-            _ => tokio::time::sleep(settings.poll_interval).await,
+            // Terminal too, and Freerouting refuses the output of all three:
+            // polling on would only wait for the overall timeout.
+            "TIMED_OUT" | "TERMINATED" | "INVALID" => bail!(
+                "Freerouting job {job_id} ended in state {state}, which has no downloadable \
+                 output; to bound the optimizer, use optimize_seconds rather than \
+                 job_timeout_seconds"
+            ),
+            _ => {}
         }
+
+        if let Some(limit) = settings.optimize_seconds {
+            if optimizing_since.is_none()
+                && (progress.is_optimizing() || stage_is_optimizing(&details))
+            {
+                optimizing_since = Some(Instant::now());
+            }
+            let limit_reached =
+                optimizing_since.is_some_and(|since| since.elapsed() >= Duration::from_secs(limit));
+            if limit_reached && download_running_output(client, &job_id, temporary).await? {
+                // The snapshot is in hand, so stopping the job is a courtesy:
+                // close() reaps the child whatever cancel_job answers.
+                let _ = client
+                    .call_tool("cancel_job", json!({ "path": { "jobId": job_id } }))
+                    .await;
+                output_downloaded = true;
+                break "OPTIMIZATION_STOPPED".to_string();
+            }
+        }
+        tokio::time::sleep(settings.poll_interval).await;
     };
 
-    client
-        .call_tool(
-            "download_job_output_to_local_file",
-            json!({ "jobId": job_id, "filePath": absolute_utf8(temporary)? }),
-        )
-        .await?;
+    if !output_downloaded {
+        client
+            .call_tool(
+                "download_job_output_to_local_file",
+                json!({ "jobId": job_id, "filePath": absolute_utf8(temporary)? }),
+            )
+            .await?;
+    }
     Ok(RouteEvidence {
         session_id,
         job_id,
@@ -386,7 +594,328 @@ async fn run_state_machine(
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
+        unrouted: progress.read_unrouted(),
+        violations: progress.violations,
+        settings_checked,
+        last_activity: progress.activity,
+        settings_not_applied,
+        project_rules_not_applied,
+        settings_warnings,
     })
+}
+
+/// Whether `get_job_details` places the job in its optimization stage.
+fn stage_is_optimizing(details: &Value) -> bool {
+    details
+        .get("stage")
+        .and_then(Value::as_str)
+        .is_some_and(|stage| stage.to_ascii_uppercase().contains("OPTIMI"))
+}
+
+/// Save the output of a job that is still running.
+///
+/// Freerouting publishes the incumbent board, the best one so far, at the
+/// start and end of every optimizer pass; candidates are worked on copies.
+/// Taken during optimization, the snapshot is therefore a complete routing.
+/// Returns false while no output has been published yet.
+async fn download_running_output(
+    client: &mut LocalMcpClient,
+    job_id: &str,
+    temporary: &Path,
+) -> Result<bool> {
+    let _ = tokio::fs::remove_file(temporary).await;
+    client
+        .call_tool(
+            "download_job_output_to_local_file",
+            json!({ "jobId": job_id, "filePath": absolute_utf8(temporary)? }),
+        )
+        .await?;
+    Ok(tokio::fs::metadata(temporary)
+        .await
+        .is_ok_and(|metadata| metadata.len() > 0))
+}
+
+/// How often an unchanged job still sends a progress notification, so the
+/// client's idle timeout keeps being reset during long optimizer stretches.
+const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(60);
+/// Only the end of Freerouting's log is read on each poll; the file grows to
+/// tens of megabytes over a day of routing.
+const LOG_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Turns job polls into `notifications/progress` for the current tool call.
+///
+/// `get_job_details` only says which pass is running. How far the routing
+/// actually got (unrouted connections, violations, optimizer stage) is in
+/// Freerouting's own log, where each line of a job carries the first six hex
+/// digits of its id, upper-cased: `[A3AA32] Auto-routing pass #8 ... (4
+/// unrouted and 218 violations)`.
+///
+/// The log is read incrementally: an optimizer pass writes over a megabyte of
+/// DEBUG lines between two of the lines that matter, so any fixed tail of the
+/// file can hold none of them.
+struct JobProgress {
+    tag: String,
+    log: Option<PathBuf>,
+    /// How far the log has been read; `None` before the first read.
+    offset: Option<u64>,
+    /// The end of the last read when it stopped inside a line.
+    partial: String,
+    activity: Option<String>,
+    unrouted: Option<u64>,
+    violations: Option<u64>,
+    last_message: String,
+    last_sent: Option<Instant>,
+    sent: u32,
+}
+
+impl JobProgress {
+    fn new(job_id: &str) -> Self {
+        Self {
+            tag: format!(
+                "[{}]",
+                job_id.get(..6).unwrap_or(job_id).to_ascii_uppercase()
+            ),
+            log: freerouting_log_path(),
+            offset: None,
+            partial: String::new(),
+            activity: None,
+            unrouted: None,
+            violations: None,
+            last_message: String::new(),
+            last_sent: None,
+            sent: 0,
+        }
+    }
+
+    fn report(&mut self, state: &str, details: &Value, started: Instant) {
+        self.read_log();
+        let mut message = state.to_ascii_lowercase();
+        match &self.activity {
+            Some(activity) => message = format!("{message}, {activity}"),
+            None => {
+                if let Some(pass) = details.get("current_pass").and_then(Value::as_u64) {
+                    message = format!("{message}, pass {pass}");
+                }
+            }
+        }
+        let due = self
+            .last_sent
+            .is_none_or(|sent| sent.elapsed() >= PROGRESS_HEARTBEAT);
+        if message == self.last_message && !due {
+            return;
+        }
+        self.send(message, started);
+    }
+
+    /// A poll Freerouting left unanswered: always said, since the silence is
+    /// what the caller needs to see.
+    fn report_missed_poll(&mut self, missed: u32, started: Instant) {
+        self.send(
+            format!("not answering, {missed}/{MAX_MISSED_POLLS} polls missed in a row"),
+            started,
+        );
+    }
+
+    fn send(&mut self, message: String, started: Instant) {
+        self.sent += 1;
+        self.last_sent = Some(Instant::now());
+        let elapsed = started.elapsed().as_secs();
+        crate::progress::report(
+            f64::from(self.sent),
+            None,
+            &format!(
+                "Freerouting {message} ({}m{:02}s)",
+                elapsed / 60,
+                elapsed % 60
+            ),
+        );
+        self.last_message = message;
+    }
+
+    /// Whether the job's log has reached the optimizer stage.
+    fn is_optimizing(&self) -> bool {
+        self.activity
+            .as_deref()
+            .is_some_and(|activity| activity.starts_with("optimiz"))
+    }
+
+    /// The last unrouted count of the job, after reading what the log gained.
+    fn read_unrouted(&mut self) -> Option<u64> {
+        self.read_log();
+        self.unrouted
+    }
+
+    /// Reads the lines the log gained since the last call and keeps the
+    /// latest activity and unrouted count found in them. The first read
+    /// starts `LOG_TAIL_BYTES` from the end: the job has only just started.
+    fn read_log(&mut self) {
+        use std::io::{Read, Seek, SeekFrom};
+        let Some(path) = self.log.as_deref() else {
+            return;
+        };
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return;
+        };
+        let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
+            return;
+        };
+        let start = match self.offset {
+            // Shorter than what was read: the log was replaced or truncated.
+            Some(offset) if offset <= len => offset,
+            _ => {
+                self.partial.clear();
+                len.saturating_sub(LOG_TAIL_BYTES)
+            }
+        };
+        let mut buffer = Vec::new();
+        if file.seek(SeekFrom::Start(start)).is_err()
+            || file.take(len - start).read_to_end(&mut buffer).is_err()
+        {
+            return;
+        }
+        self.offset = Some(len);
+        let mut text = std::mem::take(&mut self.partial);
+        text.push_str(&String::from_utf8_lossy(&buffer));
+        let complete = match text.rfind('\n') {
+            Some(end) => {
+                self.partial = text[end + 1..].to_string();
+                &text[..end]
+            }
+            None => {
+                self.partial = text;
+                return;
+            }
+        };
+        if let Some(activity) = latest_activity(complete, &self.tag) {
+            self.activity = Some(activity);
+        }
+        if let Some(unrouted) = latest_unrouted(complete, &self.tag) {
+            self.unrouted = Some(unrouted);
+        }
+        if let Some(violations) = latest_violations(complete, &self.tag) {
+            self.violations = Some(violations);
+        }
+    }
+}
+
+/// Freerouting's log file: `FREEROUTING_LOG`, else its default under the XDG
+/// state directory (Linux).
+fn freerouting_log_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FREEROUTING_LOG") {
+        return Some(PathBuf::from(path));
+    }
+    Some(freerouting_state_dir()?.join("logs/freerouting.log"))
+}
+
+/// `$XDG_STATE_HOME/freerouting`, else `~/.local/state/freerouting`: where
+/// Freerouting already keeps its logs.
+fn freerouting_state_dir() -> Option<PathBuf> {
+    // A relative XDG_STATE_HOME is ignored, as the XDG specification says, and
+    // HOME comes through Copperpour's helper, which refuses a relative HOME
+    // (#171): either would put crash reports under the working directory,
+    // which is the project (merge review, plan step 5).
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| crate::app_dirs::home_dir().map(|home| home.join(".local/state")))?;
+    Some(state.join("freerouting"))
+}
+
+/// HotSpot writes a crash report (`hs_err_pid*.log`) and possibly a core dump
+/// into its working directory, which is the KiCad project Copperpour serves: a
+/// G1 crash once left its report at the root of a project repository. Send
+/// the report next to Freerouting's logs (the temporary directory when there
+/// is no state directory) and never dump core.
+fn jvm_crash_arguments(state_dir: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let directory = state_dir
+        .filter(|directory| std::fs::create_dir_all(directory).is_ok())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let mut error_file = std::ffi::OsString::from("-XX:ErrorFile=");
+    error_file.push(directory.join("hs_err_pid%p.log"));
+    vec![error_file, "-XX:-CreateCoredumpOnCrash".into()]
+}
+
+/// The last unrouted-connection count logged for the job tagged `tag`: a pass
+/// line's "(N unrouted and ...)" or an optimizer line's "incomplete
+/// connections: N".
+fn latest_unrouted(log: &str, tag: &str) -> Option<u64> {
+    log.lines()
+        .rev()
+        .filter(|line| line.contains(tag))
+        .find_map(|line| {
+            let count = |marker: &str, before: bool| -> Option<u64> {
+                if before {
+                    let head = line.split_once(marker)?.0;
+                    head.rsplit(['(', ' ']).next()?.parse().ok()
+                } else {
+                    let tail = line.split_once(marker)?.1;
+                    tail.split([',', '.', ' ']).next()?.parse().ok()
+                }
+            };
+            count(" unrouted and ", true).or_else(|| count("incomplete connections: ", false))
+        })
+}
+
+/// The last clearance-violation count logged for the job tagged `tag`: a
+/// pass line's "(N unrouted and M violations)" or an optimizer line's
+/// "clearance violations: M".
+fn latest_violations(log: &str, tag: &str) -> Option<u64> {
+    log.lines()
+        .rev()
+        .filter(|line| line.contains(tag))
+        .find_map(|line| {
+            if let Some((_, rest)) = line.split_once(" unrouted and ") {
+                return rest.split_once(" violations")?.0.trim().parse().ok();
+            }
+            let (_, tail) = line.split_once("clearance violations: ")?;
+            tail.split([',', '.', ' ']).next()?.parse().ok()
+        })
+}
+
+/// The most recent routing-pass or optimizer line of the job tagged `tag`.
+fn latest_activity(log: &str, tag: &str) -> Option<String> {
+    log.lines()
+        .rev()
+        .filter(|line| line.contains(tag))
+        .find_map(|line| {
+            let text = &line[line.find(tag)? + tag.len()..];
+            if let Some(rest) = text.trim_start().strip_prefix("Auto-routing pass #") {
+                let pass = rest.split_whitespace().next()?;
+                let counts = rest.rsplit_once(" (")?.1;
+                let (unrouted, rest) = counts.split_once(" unrouted and ")?;
+                let violations = rest.split_once(" violations")?.0;
+                Some(format!(
+                    "pass {pass}: {unrouted} unrouted, {violations} violations"
+                ))
+            } else if let Some(rest) = text.trim_start().strip_prefix("Optimizer pass #") {
+                // "Optimizer pass #2: optimizer score 73.70 -> 84.26 (IMPROVED, 14.3%), ..."
+                // The other "Optimizer pass #2 on board ..." line carries no score delta.
+                let (pass, rest) = rest.split_once(": optimizer score ")?;
+                let (scores, rest) = rest.split_once(" (")?;
+                let verdict = rest.split([',', ')']).next()?.to_ascii_lowercase();
+                Some(format!("optimizer pass {pass}: score {scores} ({verdict})"))
+            } else if text.contains("Optimization stage started") {
+                let field = |name: &str| {
+                    text.split_once(name)
+                        .and_then(|(_, rest)| rest.split([',', '.']).next())
+                };
+                Some(
+                    match (
+                        field("incomplete connections: "),
+                        field("clearance violations: "),
+                    ) {
+                        (Some(unrouted), Some(violations)) => {
+                            format!("optimizing, {unrouted} unrouted, {violations} violations")
+                        }
+                        (None, Some(violations)) => format!("optimizing, {violations} violations"),
+                        _ => "optimizing".to_string(),
+                    },
+                )
+            } else {
+                None
+            }
+        })
 }
 
 fn validate_tool_contracts(tools: &BTreeMap<String, Value>) -> Result<()> {
@@ -467,16 +996,20 @@ impl LocalMcpClient {
             return if diagnostics.is_empty() {
                 Err(error)
             } else {
-                Err(error).context(format!("Freerouting stderr: {diagnostics}"))
+                Err(anyhow::anyhow!(
+                    "{error:#}\nFreerouting stderr, last lines:\n{}",
+                    stderr_tail(&diagnostics)
+                ))
             };
         }
         Ok(client)
     }
 
     fn server_command(jar: &Path) -> Command {
-        let mut command = Command::new("java");
+        let mut command = Command::new(crate::java_runtime::java_executable());
         command
             .arg(JAVA_HEADLESS_ARG)
+            .args(jvm_crash_arguments(freerouting_state_dir().as_deref()))
             .arg("-jar")
             .arg(jar)
             .args(server_arguments())
@@ -505,13 +1038,22 @@ impl LocalMcpClient {
             .stderr
             .take()
             .context("Freerouting MCP has no stderr")?;
+        // Keep the last MAX_STDERR_BYTES, read to the end so the pipe never
+        // fills: Freerouting logs to stderr, and the cause of a failure is at
+        // the end (merge review, plan step 5; it kept the first 64 KiB).
         let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut bytes = Vec::new();
-            let _ = reader
-                .take(MAX_STDERR_BYTES as u64)
-                .read_to_end(&mut bytes)
-                .await;
+            let mut reader = BufReader::new(stderr);
+            let mut kept = std::collections::VecDeque::with_capacity(MAX_STDERR_BYTES);
+            let mut chunk = [0u8; 8192];
+            while let Ok(read) = reader.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                kept.extend(&chunk[..read]);
+                let excess = kept.len().saturating_sub(MAX_STDERR_BYTES);
+                kept.drain(..excess);
+            }
+            let bytes: Vec<u8> = kept.into_iter().collect();
             String::from_utf8_lossy(&bytes).trim().to_string()
         });
         Ok(Self {
@@ -599,22 +1141,25 @@ impl LocalMcpClient {
         }))
         .await?;
         let deadline = Instant::now() + limit;
+        let timed_out = || RequestTimedOut {
+            method: method.to_string(),
+        };
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("Freerouting MCP request '{method}' timed out");
+                return Err(timed_out().into());
             }
             let line = timeout(remaining, self.stdout.next_line())
                 .await
-                .map_err(|_| anyhow::anyhow!("Freerouting MCP request '{method}' timed out"))??
+                .map_err(|_| timed_out())??
                 .context("Freerouting MCP closed stdout before responding")?;
-            if line.trim().is_empty() {
+            let Some(response) = json_rpc_message(&line) else {
                 continue;
-            }
-            let response: Value = serde_json::from_str(&line)
-                .with_context(|| format!("Freerouting MCP emitted non-JSON stdout: {line}"))?;
+            };
             if response.get("id") != Some(&json!(id)) {
-                if response.get("method").is_some() {
+                // A notification, or the late answer to a request that timed
+                // out and was given up.
+                if response.get("method").is_some() || is_stale_response(&response, id) {
                     continue;
                 }
                 bail!("Freerouting MCP returned an unexpected response id");
@@ -681,6 +1226,23 @@ impl Drop for LocalMcpClient {
     }
 }
 
+/// A stdout line that is a JSON-RPC message, or `None` for anything else.
+///
+/// Freerouting 2.5 prints its routing progress bar (`#`, one line per tick)
+/// on the same stdout as the MCP stdio transport. Failing on such a line used
+/// to abort every routing job long enough to show progress, so non-message
+/// lines are skipped; a server that never answers still hits the request
+/// timeout.
+fn json_rpc_message(line: &str) -> Option<Value> {
+    let line = line.trim();
+    if !line.starts_with('{') {
+        return None;
+    }
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .filter(Value::is_object)
+}
+
 fn expand_text_content(mut result: Value) -> Value {
     let parsed = result
         .get("content")
@@ -744,6 +1306,252 @@ fn temporary_output_path(output: &Path) -> Result<PathBuf> {
         .and_then(|name| name.to_str())
         .context("SES output has no UTF-8 filename")?;
     Ok(parent.join(format!(".{name}.konnect-{}.tmp.ses", uuid::Uuid::new_v4())))
+}
+
+/// The `update_job_settings` body, in the keys Freerouting 2.5 deserializes
+/// (its `RouterSettings` JSON names, read back through
+/// `get_effective_settings`). The camelCase `maxPasses` and `jobTimeoutString`
+/// sent before were accepted and silently ignored: routing passes stayed
+/// unlimited and the job limit at 12 hours.
+fn job_settings_body(settings: &RouteSettings) -> Map<String, Value> {
+    let mut body = settings.project_rules.clone();
+    merge_into(&mut body, requested_settings(settings));
+    body
+}
+
+/// What the caller asked for: `router_settings` with the named arguments on top.
+fn requested_settings(settings: &RouteSettings) -> Map<String, Value> {
+    let mut body = settings.router_settings.clone().unwrap_or_default();
+    merge_into(&mut body, named_settings(settings));
+    body
+}
+
+/// The project rules the caller did not override.
+fn project_only_settings(
+    settings: &RouteSettings,
+    requested: &Map<String, Value>,
+) -> Map<String, Value> {
+    settings
+        .project_rules
+        .iter()
+        .filter(|(key, _)| !requested.contains_key(*key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Freerouting settings from a KiCad project's design rules
+/// (`board.design_settings.rules`, in mm). Freerouting does not get these
+/// from the DSN: KiCad leaves the board edge clearance out of it, and the
+/// hole rules have no Specctra form. Rules left at 0 or absent are not sent,
+/// so Freerouting keeps its own defaults for them.
+pub(crate) fn project_route_rules(project: &Value) -> Map<String, Value> {
+    const RULES: [(&str, &str); 3] = [
+        ("min_copper_edge_clearance", "copper_to_edge_clearance_um"),
+        ("min_hole_to_hole", "hole_to_hole_um"),
+        ("min_hole_clearance", "hole_clearance_um"),
+    ];
+    let rules = &project["board"]["design_settings"]["rules"];
+    RULES
+        .iter()
+        .filter_map(|(kicad, freerouting)| {
+            let mm = rules[*kicad].as_f64().filter(|mm| *mm > 0.0)?;
+            Some((freerouting.to_string(), json!((mm * 1000.0).round())))
+        })
+        .collect()
+}
+
+/// The settings that have their own route_specctra_dsn argument.
+fn named_settings(settings: &RouteSettings) -> Map<String, Value> {
+    let mut body = Map::new();
+    if let Some(max_passes) = settings.max_passes {
+        body.insert(
+            "autorouter".to_string(),
+            json!({ "max_passes": max_passes }),
+        );
+    }
+    let mut optimizer = Map::new();
+    if let Some(enabled) = settings.optimizer_enabled {
+        optimizer.insert("enabled".to_string(), json!(enabled));
+    }
+    if let Some(passes) = settings.optimizer_max_passes {
+        optimizer.insert("max_passes".to_string(), json!(passes));
+    }
+    if let Some(percent) = settings.optimizer_improvement_threshold {
+        optimizer.insert("improvement_threshold".to_string(), json!(percent));
+    }
+    if !optimizer.is_empty() {
+        body.insert("optimizer".to_string(), Value::Object(optimizer));
+    }
+    if let Some(nets) = &settings.plane_nets {
+        body.insert("plane_nets".to_string(), json!(nets));
+    }
+    if let Some(obstacle) = settings.plane_as_obstacle {
+        body.insert("plane_as_obstacle".to_string(), json!(obstacle));
+    }
+    if let Some(seconds) = settings.job_timeout_seconds {
+        body.insert(
+            "job_timeout".to_string(),
+            Value::String(duration_string(seconds)),
+        );
+    }
+    body
+}
+
+/// The end of Freerouting's stderr for an error message: its banner and
+/// warnings run to thousands of characters, and the cause is at the end.
+fn stderr_tail(diagnostics: &str) -> String {
+    const LINES: usize = 12;
+    const CHARS: usize = 2000;
+    let lines: Vec<&str> = diagnostics.lines().collect();
+    let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
+    match tail.char_indices().rev().nth(CHARS - 1) {
+        Some((start, _)) => format!("...{}", &tail[start..]),
+        None => tail,
+    }
+}
+
+/// Deep-merge `overlay` into `base`: objects merge key by key, anything else
+/// in `overlay` replaces what `base` had.
+fn merge_into(base: &mut Map<String, Value>, overlay: Map<String, Value>) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(Value::Object(existing)), Value::Object(incoming)) => {
+                merge_into(existing, incoming)
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+/// The settings object inside a `get_effective_settings` result, which wraps
+/// it as `{status, contentType, body}` in its text content.
+fn effective_settings(result: &Value) -> Option<&Map<String, Value>> {
+    let parsed = result.get("parsedTextContent")?.as_array()?.first()?;
+    parsed.get("body").unwrap_or(parsed).as_object()
+}
+
+/// Every leaf of `sent` whose value is not found at the same path in
+/// `effective`, as "path: sent X, effective Y" (or "not a setting").
+fn settings_mismatches(sent: &Map<String, Value>, effective: &Map<String, Value>) -> Vec<String> {
+    fn walk(
+        sent: &Map<String, Value>,
+        effective: &Map<String, Value>,
+        path: &str,
+        out: &mut Vec<String>,
+    ) {
+        for (key, value) in sent {
+            let here = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            match (value, effective.get(key)) {
+                (_, None) => out.push(format!("{here}: not a Freerouting setting")),
+                (Value::Object(sent), Some(Value::Object(effective))) => {
+                    walk(sent, effective, &here, out)
+                }
+                (sent, Some(effective)) if !same_value(sent, effective) => {
+                    out.push(format!("{here}: sent {sent}, effective {effective}"))
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(sent, effective, "", &mut out);
+    out
+}
+
+/// Equality that lets 3 match 3.0: Freerouting echoes some integers as floats.
+fn same_value(a: &Value, b: &Value) -> bool {
+    // Arrays element by element; a list of names (plane_nets, layers) as a
+    // set, in case Freerouting echoes it in another order (merge review, plan
+    // step 5: arrays were compared by plain equality).
+    if let (Value::Array(left), Value::Array(right)) = (a, b) {
+        let names = |items: &Vec<Value>| -> Option<Vec<String>> {
+            let mut names: Vec<String> = items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect::<Option<_>>()?;
+            names.sort();
+            Some(names)
+        };
+        if let (Some(left), Some(right)) = (names(left), names(right)) {
+            return left == right;
+        }
+        return left.len() == right.len() && left.iter().zip(right).all(|(x, y)| same_value(x, y));
+    }
+    match (a.as_f64(), b.as_f64()) {
+        // Freerouting holds some settings as Java `float` (for example
+        // optimizer.improvement_threshold), which keeps about 7 significant
+        // digits, so a tolerance of 1e-9 refused valid values (merge review,
+        // plan step 5).
+        (Some(x), Some(y)) => (x - y).abs() <= 1e-6 * x.abs().max(1.0),
+        _ => a == b,
+    }
+}
+
+/// Settings in `requested` that relax the project's rules (a value below the
+/// project's for one of its keys) or turn off checks. The project's rules are
+/// a lower limit unless the caller passes `allow_below_project_rules` (merge
+/// review, plan step 5).
+pub(crate) fn relaxations(
+    requested: &Map<String, Value>,
+    project: &Map<String, Value>,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    for (key, rule) in project {
+        if let (Some(asked), Some(rule)) =
+            (requested.get(key).and_then(Value::as_f64), rule.as_f64())
+        {
+            if asked < rule {
+                found.push(format!("{key}: {asked} is below the project's {rule}"));
+            }
+        }
+    }
+    if requested.get("strict_drc").and_then(Value::as_bool) == Some(false) {
+        found.push("strict_drc: false".to_string());
+    }
+    if requested
+        .get("autorouter")
+        .and_then(|autorouter| autorouter.get("ignore_net_classes"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        found.push("autorouter.ignore_net_classes: true".to_string());
+    }
+    found
+}
+
+/// A request Freerouting did not answer in time, told apart from other errors
+/// so a missed poll can be retried.
+#[derive(Debug)]
+struct RequestTimedOut {
+    method: String,
+}
+
+impl std::fmt::Display for RequestTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Freerouting MCP request '{}' timed out", self.method)
+    }
+}
+
+impl std::error::Error for RequestTimedOut {}
+
+fn is_request_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RequestTimedOut>().is_some())
+}
+
+/// Whether `response` answers a request sent before the one awaited as `id`.
+fn is_stale_response(response: &Value, id: u64) -> bool {
+    response
+        .get("id")
+        .and_then(Value::as_u64)
+        .is_some_and(|earlier| earlier < id)
 }
 
 fn duration_string(seconds: u64) -> String {
@@ -822,6 +1630,211 @@ mod tests {
     }
 
     #[test]
+    fn progress_output_on_stdout_is_not_a_message() {
+        for line in [
+            "#",
+            "####",
+            "",
+            "   ",
+            "Routing pass 3...",
+            "{not json",
+            "[1,2]",
+        ] {
+            assert!(json_rpc_message(line).is_none(), "{line:?}");
+        }
+        let message = json_rpc_message(r#" {"jsonrpc":"2.0","id":7,"result":{}} "#).unwrap();
+        assert_eq!(message["id"], 7);
+    }
+
+    #[test]
+    fn the_log_is_read_incrementally_through_a_flood_of_debug_lines() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("freerouting.log");
+        let append = |text: &str| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap()
+        };
+        let mut progress = JobProgress::new("933480eb");
+        progress.log = Some(path.clone());
+
+        append("2026-10-30 00:56:24.082 INFO   [933480] Optimizer pass #3: optimizer score 119.14 -> 116.76 (REGRESSED, -1.9974%), router score: 979.51, incomplete connections: 0, clearance violations: 220.\n");
+        progress.read_log();
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 3: score 119.14 -> 116.76 (regressed)")
+        );
+
+        // An optimizer pass: 1.2 MB of DEBUG lines of the same job, more than
+        // any fixed tail, and nothing that says where the job stands.
+        let debug = "2026-10-30 00:58:00.000 DEBUG  [933480]   Net 'SCK2' has 4 incomplete(s)\n";
+        append(&debug.repeat(LOG_TAIL_BYTES as usize / debug.len() * 5));
+        progress.read_log();
+        assert_eq!(progress.unrouted, Some(0));
+
+        // A line cut in two by a read is only taken once complete.
+        append("2026-10-30 01:01:05.787 INFO   [933480] Optimizer pass #4: optimizer score 119.14 -> 119.14 (UNCHANGED, 0.0000%), router score: 979.51, incomplete ");
+        progress.read_log();
+        assert!(progress
+            .activity
+            .as_deref()
+            .unwrap()
+            .starts_with("optimizer pass 3"));
+        append("connections: 0, clearance violations: 220.\n");
+        assert_eq!(progress.read_unrouted(), Some(0));
+        assert_eq!(
+            progress.activity.as_deref(),
+            Some("optimizer pass 4: score 119.14 -> 119.14 (unchanged)")
+        );
+    }
+
+    #[test]
+    fn routing_activity_is_read_from_the_jobs_own_log_lines() {
+        // Lines as Freerouting 2.5.0 writes them; [B00000] is another job.
+        let log = "\
+2026-10-29 17:52:37.907 INFO   [A3AA32] Auto-routing pass #7 on board '7c06' was completed in 17.53 seconds with score 944.89 (9 unrouted and 218 violations), using 194.58 CPU seconds and the job allocated 188.63 GB of memory so far.
+2026-10-29 17:52:38.001 DEBUG  [A3AA32]   Net 'SCK2' has 4 incomplete(s)
+2026-10-29 17:52:39.000 INFO   [B00000] Auto-routing pass #2 on board 'ffff' was completed in 1.00 seconds with score 1.00 (50 unrouted and 3 violations), using 1.00 CPU seconds.
+";
+        assert_eq!(
+            latest_activity(log, "[A3AA32]").as_deref(),
+            Some("pass 7: 9 unrouted, 218 violations")
+        );
+        let optimizing = format!(
+            "{log}2026-10-29 17:54:26.961 INFO   [A3AA32] Optimization stage started on board 'ce32'. Baseline router score: 980.71, optimizer score: 71.70, incomplete connections: 0, clearance violations: 218.\n"
+        );
+        assert_eq!(
+            latest_activity(&optimizing, "[A3AA32]").as_deref(),
+            Some("optimizing, 0 unrouted, 218 violations")
+        );
+        let optimizer_pass = format!(
+            "{optimizing}2026-10-29 17:58:00.204 INFO   [A3AA32] Optimizer pass #2 on board '008e' was completed in 152.08 seconds with the score of 84.26 (0 unrouted and 218 violations).
+2026-10-29 17:58:00.204 INFO   [A3AA32] Optimizer pass #2: optimizer score 73.70 -> 84.26 (IMPROVED, 14.3278%), router score: 980.71, incomplete connections: 0, clearance violations: 218.\n"
+        );
+        assert_eq!(
+            latest_activity(&optimizer_pass, "[A3AA32]").as_deref(),
+            Some("optimizer pass 2: score 73.70 -> 84.26 (improved)")
+        );
+        assert_eq!(latest_activity(log, "[C11111]"), None);
+    }
+
+    #[test]
+    fn optimizer_stage_is_seen_in_the_log_or_the_job_stage() {
+        let mut progress = JobProgress::new("a3aa32eb");
+        assert!(!progress.is_optimizing());
+        progress.activity = Some("pass 18: 0 unrouted, 218 violations".into());
+        assert!(!progress.is_optimizing());
+        progress.activity = Some("optimizing, 218 violations".into());
+        assert!(progress.is_optimizing());
+        progress.activity = Some("optimizer pass 2: score 73.70 -> 84.26 (improved)".into());
+        assert!(progress.is_optimizing());
+
+        assert!(stage_is_optimizing(&json!({ "stage": "OPTIMIZATION" })));
+        assert!(!stage_is_optimizing(&json!({ "stage": "ROUTING" })));
+        assert!(!stage_is_optimizing(&json!({})));
+    }
+
+    #[test]
+    fn the_last_unrouted_count_of_the_job_is_found() {
+        let routing = "\
+2026-10-29 17:52:54.000 INFO   [A3AA32] Auto-routing pass #8 on board 'a' was completed in 16.00 seconds with score 964.79 (4 unrouted and 218 violations), using 1.00 CPU seconds.
+2026-10-29 17:52:55.000 DEBUG  [A3AA32]   Net 'SCK2' has 4 incomplete(s)
+2026-10-29 17:52:56.000 INFO   [B00000] Auto-routing pass #2 on board 'b' was completed in 1.00 seconds with score 1.00 (50 unrouted and 3 violations), using 1.00 CPU seconds.
+";
+        assert_eq!(latest_unrouted(routing, "[A3AA32]"), Some(4));
+        let optimizing = format!(
+            "{routing}2026-10-29 17:54:26.961 INFO   [A3AA32] Optimization stage started on board 'c'. Baseline router score: 980.71, optimizer score: 71.70, incomplete connections: 0, clearance violations: 218.\n"
+        );
+        assert_eq!(latest_unrouted(&optimizing, "[A3AA32]"), Some(0));
+        assert_eq!(latest_unrouted(routing, "[C11111]"), None);
+    }
+
+    #[test]
+    fn job_tag_is_the_upper_cased_id_prefix() {
+        assert_eq!(
+            JobProgress::new("a3aa32eb-5b14-4a2b-8742-6b44c34d63bb").tag,
+            "[A3AA32]"
+        );
+    }
+
+    #[test]
+    fn existing_diagnostics_are_refused_before_routing() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&jar, "").unwrap();
+        std::fs::write(&dsn, "").unwrap();
+        let settings = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            project_rules: Map::new(),
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        validate_inputs(&jar, &dsn, &ses, &settings).unwrap();
+
+        std::fs::write(diagnostics_path(&ses), "previous run").unwrap();
+        let error = validate_inputs(&jar, &dsn, &ses, &settings)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("diagnostics output already exists"),
+            "{error}"
+        );
+
+        std::fs::remove_file(diagnostics_path(&ses)).unwrap();
+        // The 900 s overall default with optimize_seconds 1100 killed a run
+        // whose optimizer was still within its window.
+        let optimizer_outlives_the_call = RouteSettings {
+            optimize_seconds: Some(1100),
+            plane_nets: None,
+            router_settings: None,
+            project_rules: Map::new(),
+            ..settings
+        };
+        let error = validate_inputs(&jar, &dsn, &ses, &optimizer_outlives_the_call)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("overall_timeout_seconds (900) must exceed optimize_seconds (1100)"),
+            "{error}"
+        );
+        let room_for_both = RouteSettings {
+            optimize_seconds: Some(1100),
+            overall_timeout: Duration::from_secs(2000),
+            plane_nets: None,
+            router_settings: None,
+            project_rules: Map::new(),
+            ..settings
+        };
+        validate_inputs(&jar, &dsn, &ses, &room_for_both).unwrap();
+
+        let too_long = RouteSettings {
+            optimize_seconds: Some(86_401),
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            ..settings
+        };
+        assert!(validate_inputs(&jar, &dsn, &ses, &too_long)
+            .unwrap_err()
+            .to_string()
+            .contains("optimize_seconds"));
+    }
+
+    #[test]
     fn nested_and_text_wrapped_identifiers_are_found() {
         let value = expand_text_content(json!({
             "content": [{ "type": "text", "text": "{\"data\":{\"sessionId\":\"abc\"}}" }]
@@ -833,6 +1846,226 @@ mod tests {
     fn duration_settings_use_documented_shape() {
         assert_eq!(duration_string(5 * 60), "00:05:00");
         assert_eq!(duration_string(25 * 60 * 60), "25:00:00");
+    }
+
+    #[test]
+    fn router_settings_pass_through_and_named_arguments_win() {
+        let settings = RouteSettings {
+            max_passes: Some(7),
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: Some(
+                json!({
+                    "autorouter": { "max_passes": 99, "max_threads": 4 },
+                    "scoring": { "via_costs": 80 },
+                    "hole_clearance_um": 200.0
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            project_rules: Map::new(),
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        assert_eq!(
+            Value::Object(job_settings_body(&settings)),
+            json!({
+                "autorouter": { "max_passes": 7, "max_threads": 4 },
+                "scoring": { "via_costs": 80 },
+                "hole_clearance_um": 200.0
+            })
+        );
+    }
+
+    #[test]
+    fn project_design_rules_become_freerouting_settings_in_um() {
+        let project = json!({ "board": { "design_settings": { "rules": {
+            "min_copper_edge_clearance": 0.5,
+            "min_hole_to_hole": 0.25,
+            "min_hole_clearance": 0.0,
+            "min_clearance": 0.2
+        } } } });
+        assert_eq!(
+            Value::Object(project_route_rules(&project)),
+            json!({ "copper_to_edge_clearance_um": 500.0, "hole_to_hole_um": 250.0 })
+        );
+        assert!(project_route_rules(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn project_rules_go_under_what_the_caller_asked_for() {
+        let settings = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimize_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: Some(
+                json!({ "copper_to_edge_clearance_um": 300.0 })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            project_rules: json!({
+                "copper_to_edge_clearance_um": 500.0,
+                "hole_to_hole_um": 500.0
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        assert_eq!(
+            Value::Object(job_settings_body(&settings)),
+            json!({ "copper_to_edge_clearance_um": 300.0, "hole_to_hole_um": 500.0 })
+        );
+        let requested = requested_settings(&settings);
+        assert_eq!(
+            Value::Object(requested.clone()),
+            json!({ "copper_to_edge_clearance_um": 300.0 })
+        );
+        // Only the rule the caller left alone is checked leniently.
+        assert_eq!(
+            Value::Object(project_only_settings(&settings, &requested)),
+            json!({ "hole_to_hole_um": 500.0 })
+        );
+    }
+
+    #[test]
+    fn stderr_in_errors_is_cut_to_its_last_lines() {
+        let long: String = (1..=40)
+            .map(|n| format!("2026-10-29 INFO line {n}\n"))
+            .collect();
+        let tail = stderr_tail(&long);
+        assert!(tail.starts_with("2026-10-29 INFO line 29"), "{tail}");
+        assert!(tail.ends_with("line 40"));
+        let wide = "x".repeat(5000);
+        let cut = stderr_tail(&wide);
+        assert_eq!(cut.chars().count(), 2003);
+        assert!(cut.starts_with("..."));
+        assert_eq!(stderr_tail("short"), "short");
+    }
+
+    #[test]
+    fn settings_that_did_not_take_are_reported() {
+        let sent = json!({
+            "autorouter": { "max_passes": 7, "max_pases": 3 },
+            "optimizer": { "improvement_threshold": 1 },
+            "hole_clearance_um": 200.0,
+            "plane_nets": ["GND"],
+            "no_such_setting": true
+        });
+        // Freerouting 2.5.0 wraps the effective settings like this.
+        let result = json!({
+            "parsedTextContent": [{
+                "status": 200,
+                "contentType": "application/json",
+                "body": {
+                    "autorouter": { "max_passes": 7, "max_threads": 15 },
+                    "optimizer": { "improvement_threshold": 1.0 },
+                    "hole_clearance_um": 0.0,
+                    "plane_nets": ["GND"]
+                }
+            }]
+        });
+        let effective = effective_settings(&result).unwrap();
+        assert_eq!(
+            settings_mismatches(sent.as_object().unwrap(), effective),
+            [
+                "autorouter.max_pases: not a Freerouting setting",
+                "hole_clearance_um: sent 200.0, effective 0.0",
+                "no_such_setting: not a Freerouting setting",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_timed_out_poll_is_told_apart_from_other_errors() {
+        let timed_out = anyhow::Error::from(RequestTimedOut {
+            method: "tools/call".into(),
+        })
+        .context("call Freerouting MCP tool 'get_job_details'");
+        assert!(is_request_timeout(&timed_out));
+        assert_eq!(
+            format!("{timed_out:#}"),
+            "call Freerouting MCP tool 'get_job_details': \
+             Freerouting MCP request 'tools/call' timed out"
+        );
+        assert!(!is_request_timeout(&anyhow::anyhow!(
+            "Freerouting MCP closed stdout before responding"
+        )));
+    }
+
+    #[test]
+    fn only_answers_to_earlier_requests_are_stale() {
+        assert!(is_stale_response(&json!({ "id": 4, "result": {} }), 5));
+        assert!(!is_stale_response(&json!({ "id": 6, "result": {} }), 5));
+        assert!(!is_stale_response(&json!({ "id": "4", "result": {} }), 5));
+    }
+
+    #[test]
+    fn negative_router_settings_are_named_by_path() {
+        let settings = json!({
+            "scoring": { "via_costs": -5, "plane_via_costs": 5 },
+            "layers": [{ "bend_cost": 0.0 }, { "bend_cost": -0.5 }],
+            "plane_nets": ["GND"],
+            "fanout": { "min_escape_length_mm": 2.5 }
+        });
+        assert_eq!(
+            negative_settings(settings.as_object().unwrap()),
+            ["layers[1].bend_cost: -0.5", "scoring.via_costs: -5"]
+        );
+    }
+
+    #[test]
+    fn job_settings_use_the_keys_freerouting_reads() {
+        let settings = RouteSettings {
+            max_passes: Some(7),
+            optimizer_enabled: Some(true),
+            job_timeout_seconds: Some(300),
+            optimize_seconds: None,
+            optimizer_max_passes: Some(3),
+            optimizer_improvement_threshold: Some(0.5),
+            plane_nets: Some(vec!["GND".into(), "+3V3".into()]),
+            plane_as_obstacle: Some(false),
+            router_settings: None,
+            project_rules: Map::new(),
+            poll_interval: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(900),
+        };
+        // The shape get_effective_settings echoed back from Freerouting 2.5.0.
+        assert_eq!(
+            Value::Object(job_settings_body(&settings)),
+            json!({
+                "autorouter": { "max_passes": 7 },
+                "optimizer": { "enabled": true, "max_passes": 3, "improvement_threshold": 0.5 },
+                "plane_nets": ["GND", "+3V3"],
+                "plane_as_obstacle": false,
+                "job_timeout": "00:05:00"
+            })
+        );
+        let nothing = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            optimizer_max_passes: None,
+            optimizer_improvement_threshold: None,
+            plane_nets: None,
+            plane_as_obstacle: None,
+            router_settings: None,
+            ..settings
+        };
+        assert!(job_settings_body(&nothing).is_empty());
     }
 
     #[test]
@@ -849,9 +2082,35 @@ mod tests {
     fn server_command_passes_headless_as_a_jvm_option_before_jar() {
         let command = LocalMcpClient::server_command(Path::new("freerouting.jar"));
         let arguments: Vec<_> = command.as_std().get_args().collect();
+        // JVM options (headless, then the crash-report options added in plan
+        // step 5) all come before -jar.
         assert_eq!(arguments[0], "-Djava.awt.headless=true");
-        assert_eq!(arguments[1], "-jar");
-        assert_eq!(arguments[2], "freerouting.jar");
+        let jar = arguments
+            .iter()
+            .position(|argument| *argument == "-jar")
+            .unwrap();
+        assert_eq!(arguments[jar + 1], "freerouting.jar");
+        assert!(arguments[..jar]
+            .iter()
+            .any(|argument| argument.to_string_lossy().starts_with("-XX:ErrorFile=")));
+    }
+
+    #[test]
+    fn jvm_crash_reports_stay_out_of_the_project_directory() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("freerouting");
+        let arguments = jvm_crash_arguments(Some(&directory));
+        let mut expected = std::ffi::OsString::from("-XX:ErrorFile=");
+        expected.push(directory.join("hs_err_pid%p.log"));
+        assert_eq!(arguments, [expected, "-XX:-CreateCoredumpOnCrash".into()]);
+        assert!(directory.is_dir());
+
+        let blocked = state.path().join("file");
+        std::fs::write(&blocked, "").unwrap();
+        let fallback = jvm_crash_arguments(Some(&blocked.join("freerouting")));
+        let mut expected = std::ffi::OsString::from("-XX:ErrorFile=");
+        expected.push(std::env::temp_dir().join("hs_err_pid%p.log"));
+        assert_eq!(fallback[0], expected);
     }
 
     #[test]
@@ -937,6 +2196,13 @@ mod tests {
                 max_passes: Some(2),
                 optimizer_enabled: Some(false),
                 job_timeout_seconds: Some(300),
+                optimize_seconds: None,
+                optimizer_max_passes: None,
+                optimizer_improvement_threshold: None,
+                plane_nets: None,
+                plane_as_obstacle: None,
+                router_settings: None,
+                project_rules: Map::new(),
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
             },
@@ -971,6 +2237,13 @@ mod tests {
                     max_passes: Some(100),
                     optimizer_enabled: Some(true),
                     job_timeout_seconds: Some(300),
+                    optimize_seconds: None,
+                    optimizer_max_passes: None,
+                    optimizer_improvement_threshold: None,
+                    plane_nets: None,
+                    plane_as_obstacle: None,
+                    router_settings: None,
+                    project_rules: Map::new(),
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
                 },
@@ -1018,6 +2291,13 @@ mod tests {
                     max_passes: Some(100),
                     optimizer_enabled: Some(true),
                     job_timeout_seconds: Some(300),
+                    optimize_seconds: None,
+                    optimizer_max_passes: None,
+                    optimizer_improvement_threshold: None,
+                    plane_nets: None,
+                    plane_as_obstacle: None,
+                    router_settings: None,
+                    project_rules: Map::new(),
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
                 },
@@ -1037,5 +2317,54 @@ mod tests {
             wait_for_process_exit(pid).await,
             "Freerouting child {pid} survived cancellation"
         );
+    }
+}
+
+#[cfg(test)]
+mod settings_check_tests {
+    use super::*;
+
+    #[test]
+    fn arrays_compare_by_element_and_name_lists_as_sets() {
+        use serde_json::json;
+        assert!(same_value(&json!(["GND", "VCC"]), &json!(["VCC", "GND"])));
+        assert!(same_value(&json!([3, 2.5]), &json!([3.0, 2.5])));
+        assert!(!same_value(&json!([3, 2]), &json!([2, 3])));
+    }
+
+    #[test]
+    fn settings_that_relax_the_project_rules_are_found() {
+        use serde_json::json;
+        let project = json!({"copper_to_edge_clearance_um": 500});
+        let tighter = json!({"copper_to_edge_clearance_um": 600});
+        assert!(relaxations(tighter.as_object().unwrap(), project.as_object().unwrap()).is_empty());
+        let looser = json!({
+            "copper_to_edge_clearance_um": 300,
+            "strict_drc": false,
+            "autorouter": {"ignore_net_classes": true}
+        });
+        let found = relaxations(looser.as_object().unwrap(), project.as_object().unwrap());
+        assert_eq!(found.len(), 3, "{found:?}");
+    }
+
+    #[test]
+    fn a_float_setting_echoed_with_float_precision_is_the_same_value() {
+        // 2.555555555 sent, 2.5555556 echoed by a Java float.
+        assert!(same_value(
+            &serde_json::json!(2.555555555),
+            &serde_json::json!(2.5555556)
+        ));
+        assert!(!same_value(
+            &serde_json::json!(2.5),
+            &serde_json::json!(2.6)
+        ));
+    }
+
+    #[test]
+    fn a_negative_number_sent_as_a_string_is_refused() {
+        let settings = serde_json::json!({"autorouter": {"max_passes": "-5", "ok": "5"}});
+        let found = negative_settings(settings.as_object().unwrap());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("autorouter.max_passes"), "{found:?}");
     }
 }

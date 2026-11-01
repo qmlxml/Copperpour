@@ -38,6 +38,8 @@ tempfile = "3"
 winreg.workspace = true
 
 [dev-dependencies]
+copperpour-test-home.workspace = true
+ctor.workspace = true
 # The pcb_components fallback tests spawn a mock KiCAD NNG endpoint to prove
 # a reachable-but-rejecting KiCAD never triggers the file-editing fallback.
 nng.workspace = true

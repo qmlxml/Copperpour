@@ -57,7 +57,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_export",
-        description: "Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB",
+        description: "Export schematic to SVG/PDF/PNG/netlist, run ERC and set its checks' severities, and synchronize a live PCB",
         category: "schematic",
     },
     ToolsetMeta {
@@ -68,6 +68,11 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     ToolsetMeta {
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, board text, SVG logo import, custom fields on placed footprints",
+        category: "pcb",
+    },
+    ToolsetMeta {
+        name: "pcb_footprint_text",
+        description: "List, move, rotate, re-layer and hide the texts of placed footprints: reference designators, values, custom fields, plain texts",
         category: "pcb",
     },
     ToolsetMeta {
@@ -125,6 +130,11 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         description: "Design-to-fab pipeline: export Gerber+BOM+positions package, validate for fab house, estimate cost",
         category: "manufacturing",
     },
+    ToolsetMeta {
+        name: "simulation",
+        description: "Simulate a schematic with KiCad's SPICE engine and check whether it is ready to run",
+        category: "simulation",
+    },
 ];
 
 static TOOL_CATALOGUE: OnceLock<HashMap<&'static str, Vec<ToolDef>>> = OnceLock::new();
@@ -166,6 +176,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "sch_export" => Some(sch_export::tools()),
         "sch_hierarchy" => Some(sch_hierarchy::tools()),
         "pcb_board" => Some(pcb_board::tools()),
+        "pcb_footprint_text" => Some(pcb_components::footprint_text_tools()),
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
         "placement" => Some(placement::tools()),
@@ -177,6 +188,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "design_review" => Some(design_review::tools()),
         "templates" => Some(templates::tools()),
         "manufacturing" => Some(manufacturing::tools()),
+        "simulation" => Some(simulation::tools()),
         _ => None,
     }
 }

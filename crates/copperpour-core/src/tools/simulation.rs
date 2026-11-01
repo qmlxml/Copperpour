@@ -1,0 +1,3888 @@
+//! SPICE simulation tools.
+
+use super::{cli, get_path, sch_export, ToolContext, ToolDef};
+use crate::mcp::error::ToolErrorKind;
+use crate::mcp::protocol::CallToolResult;
+use crate::outcome::{self, OutcomeStatus};
+use crate::simulation::flatten::{self, Compatibility, DeckInputs, FlatDeck, Refusal};
+use crate::simulation::kicad_netlist::{self, ElementEntry, KiCadNetlist, NetEntry, SpiceNetlist};
+use crate::simulation::measure::{self, Measurement};
+use crate::simulation::preflight::{self, Preflight};
+use crate::simulation::protocol::{
+    RunRequest, RunStatus, DECK_FILE, LOG_FILE, PROTOCOL_VERSION, RAW_FILE, REQUEST_FILE,
+};
+use crate::simulation::raw::Plot;
+use crate::simulation::signals::{self, Names, NotFound, Signal};
+use crate::simulation::worker_client::{
+    classify, probe_engine, read_results, run_worker, EngineStatus, SimulationRuntime, Verdict,
+    WorkerEnd, MAX_RAW_LIMIT, PROBE_TIMEOUT,
+};
+use crate::simulation::{runs, snapshot};
+use crate::tool;
+use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_LIMIT: u64 = 25;
+const MAX_LIMIT: u64 = 200;
+const DETAIL_LIMIT: usize = 800;
+const MAX_SPICE_LINES: usize = 200;
+const DEFAULT_TIMEOUT_SECONDS: u64 = 40;
+const MAX_TIMEOUT_SECONDS: u64 = 600;
+const DEFAULT_ROW_LIMIT: u64 = 40;
+const DEFAULT_RAW_BYTES: u64 = 256 * 1024 * 1024;
+const MIN_RAW_BYTES: u64 = 1024 * 1024;
+const MAX_SIGNALS: usize = 16;
+const MAX_MEASUREMENTS: usize = 32;
+const MAX_ENVELOPE_POINTS: u64 = 64;
+/// The print step as a share of the stop time. Too small a share kills the engine
+/// outright, as `.tran 1n 10` does, because it sizes memory from this ratio.
+const PRINT_STEPS: f64 = 2000.0;
+/// The stop times that run on the engine. Far longer ones stop for no reason in
+/// the circuit: ngspice's smallest step is a fixed share of its largest.
+const STOP_TIME_RANGE: std::ops::RangeInclusive<f64> = 1e-15..=1e6;
+/// How close to the stop time a run must end to count as covering it.
+const COVERAGE_TOLERANCE: f64 = 1e-6;
+const SOURCE: &str = "saved_schematic_snapshot";
+/// "Engine ran" and "requested range covered", so a run with no measurements can
+/// still read as partial.
+const FIXED_OUTCOME_UNITS: usize = 2;
+const MAX_ERROR_ITEMS: usize = 20;
+const MAX_LOG_ITEMS: usize = 12;
+const MAX_LOG_ITEM_CHARS: usize = 300;
+/// The worker runs with no init file on purpose, so this says nothing.
+const SPINIT_NOTICE: &str = "Warning: can't find the initialization file";
+const MODEL_LINES_NOTE: &str = "lines quoting a model file are in the log.";
+const MIN_PRIVATE_WORD: usize = 4;
+/// Progress such as gmin stepping, which says nothing about the circuit.
+const ENGINE_NOTE: &str = "Note:";
+/// The engine answering Copperpour's own halt, which `stopped` already reports.
+const HALT_NOTICES: [&str; 2] = ["doAnalyses: pause requested", "run simulation interrupted"];
+/// The engine's status variable, which ends the part of a log worth reading.
+const STATUS_NAME: &str = "sim_status";
+const OPERATING_POINT_FILE: &str = "operating_point.json";
+/// KiCad's own defaults for what to save. `.probe alli` stops the engine on any
+/// event-driven node, so it is left out of those circuits.
+const SAVE_ALL_VOLTAGES: &str = ".save all";
+const SAVE_ALL_CURRENTS: &str = ".probe alli";
+const OPERATING_POINT: &str = ".op";
+/// Warnings that mean the result rests on an assumption about a part.
+const APPROXIMATIONS: [&str; 2] = ["inferred_from_value", "generic_default_model"];
+
+fn testbench_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Changes to the deck for simulation only. The schematic is not touched",
+        "properties": {
+            "exclude_references": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "References to leave out, or prefix wildcards such as J*"
+            },
+            "spice_lines": {
+                "type": "array",
+                "maxItems": MAX_SPICE_LINES,
+                "items": { "type": "string" },
+                "description": "Elements, models and includes to add. Use spice_name values from check_simulation_readiness"
+            }
+        }
+    })
+}
+
+fn analysis_schema() -> Value {
+    json!({
+        "oneOf": [{
+            "type": "object",
+            "properties": {
+                "kind": { "const": "transient" },
+                "stop_time_seconds": { "type": "number", "exclusiveMinimum": 0 },
+                "max_step_seconds": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Largest internal step. Default is stop_time_seconds / 2000"
+                },
+                "start_save_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Save no data before this time"
+                },
+                "use_initial_conditions": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Start from .ic values and skip the operating point"
+                }
+            },
+            "required": ["kind", "stop_time_seconds"]
+        }, {
+            "type": "object",
+            "properties": { "kind": { "const": "operating_point" } },
+            "required": ["kind"]
+        }]
+    })
+}
+
+fn measurement_schema() -> Value {
+    let kinds: Vec<&str> = measure::KINDS.iter().map(|(name, _)| *name).collect();
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "Label to repeat in the result" },
+            "kind": { "enum": kinds },
+            "signal": {
+                "type": "string",
+                "description": "v(NET), v(NET1,NET2), i(REF), i(REF:PIN) or p(REF)"
+            },
+            "from_seconds": { "type": "number", "description": "Window start. Default is the first point" },
+            "to_seconds": { "type": "number", "description": "Window end. Default is the last point" },
+            "at_seconds": { "type": "number", "description": "For value_at" },
+            "level": { "type": "number", "description": "For crossing" },
+            "direction": {
+                "enum": ["rising", "falling", "either"],
+                "default": "either",
+                "description": "For crossing"
+            },
+            "final_value": {
+                "type": "number",
+                "description": "For rise_time, fall_time, overshoot_percent and settling_time. Default is the value at the end of the window"
+            },
+            "band_percent": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "default": 2,
+                "description": "For settling_time: a share of the final value or the step, whichever is larger"
+            }
+        },
+        "required": ["kind", "signal"]
+    })
+}
+
+pub fn tools() -> Vec<ToolDef> {
+    vec![tool!(
+        "check_simulation_readiness",
+        "Report whether a schematic can be simulated, and why not, without running a simulation. Works from the saved files on a private copy, so the project is not touched and unsaved editor changes are not seen.",
+        json!({
+            "type": "object",
+            "properties": {
+                "schematic": { "type": "string", "description": "Root .kicad_sch path" },
+                "testbench": testbench_schema(),
+                "net_filter": { "type": "string", "description": "Only list nets whose name contains this text" },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_LIMIT,
+                    "default": DEFAULT_LIMIT,
+                    "description": "Most nets and elements to list; totals are always complete"
+                }
+            },
+            "required": ["schematic"]
+        }),
+        |args, ctx| async move { handle_check_simulation_readiness(args, ctx).await }
+    ), tool!(
+        "run_simulation",
+        "Run one analysis on a schematic in an isolated simulator process and return compact results, with the full data on disk. Works from the saved files on a private copy. Read simulated_circuit: a result from a modified circuit does not describe the schematic as drawn. Runs an operating point or a transient. A transient can summarise signals and take time-weighted measurements such as inrush peak, I²t and settling time.",
+        json!({
+            "type": "object",
+            "properties": {
+                "schematic": { "type": "string", "description": "Root .kicad_sch path" },
+                "analysis": analysis_schema(),
+                "testbench": testbench_schema(),
+                "signals": {
+                    "type": "array",
+                    "maxItems": MAX_SIGNALS,
+                    "items": { "type": "string" },
+                    "description": "Signals to summarise: v(NET), v(NET1,NET2), i(REF), i(REF:PIN) or p(REF). Transient only. Net names as KiCad shows them"
+                },
+                "measurements": {
+                    "type": "array",
+                    "maxItems": MAX_MEASUREMENTS,
+                    "items": measurement_schema(),
+                    "description": "Values to work out from the run, with time weighting. Transient only"
+                },
+                "envelope_points": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_ENVELOPE_POINTS,
+                    "default": 0,
+                    "description": "Buckets of min and max to add to each summary"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_LIMIT,
+                    "default": DEFAULT_ROW_LIMIT,
+                    "description": "Most result rows to return; totals are always complete"
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_TIMEOUT_SECONDS,
+                    "default": DEFAULT_TIMEOUT_SECONDS,
+                    "description": "Budget for the whole call, export included"
+                },
+                "max_raw_bytes": {
+                    "type": "integer",
+                    "minimum": MIN_RAW_BYTES,
+                    "maximum": MAX_RAW_LIMIT,
+                    "default": DEFAULT_RAW_BYTES,
+                    "description": "Stop the run softly when its data reaches this size, keeping what it has"
+                }
+            },
+            "required": ["schematic", "analysis"]
+        }),
+        |args, ctx| async move { handle_run_simulation(args, ctx).await }
+    )]
+}
+
+/// Refuse a path that is missing, or a sheet inside another project.
+fn check_root_schematic(schematic: &Path) -> Result<(), CallToolResult> {
+    if !schematic.is_file() {
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::FileNotFound {
+                path: schematic.display().to_string(),
+            },
+            format!("Schematic not found: {}", schematic.display()),
+        ));
+    }
+    match sch_export::owning_project_root(schematic) {
+        Ok(None) => Ok(()),
+        Ok(Some(root)) => {
+            let reason = format!(
+                "{} is a sheet inside the project rooted at {}. KiCad would treat it as the \
+                 root and simulate only part of the design: use {}.",
+                schematic.display(),
+                root.display(),
+                root.display()
+            );
+            Err(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "schematic".to_string(),
+                    reason: reason.clone(),
+                },
+                reason,
+            ))
+        }
+        Err(error) => Err(error.into_tool_result()),
+    }
+}
+
+async fn handle_check_simulation_readiness(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let schematic = get_path(args, "schematic")?;
+    let net_filter = args["net_filter"].as_str().unwrap_or("");
+    let limit = args["limit"]
+        .as_u64()
+        .unwrap_or(DEFAULT_LIMIT)
+        .min(MAX_LIMIT) as usize;
+
+    if let Err(refusal) = check_root_schematic(&schematic) {
+        return Ok(refusal);
+    }
+
+    let engine = probe_engine(
+        ctx.simulation.get().map(|r| r.as_ref()),
+        &ctx.config.kicad_cli,
+        PROBE_TIMEOUT,
+    )
+    .await;
+    let model_dirs = ctx
+        .simulation
+        .get()
+        .map(|runtime| runtime.model_dirs().to_vec())
+        .unwrap_or_default();
+    let testbench = Testbench::from_args(&args["testbench"]);
+    let allow_digital_models = ctx
+        .simulation
+        .get()
+        .is_none_or(|runtime| runtime.allows_digital_models());
+    let inputs = DesignInputs {
+        model_dirs: &model_dirs,
+        testbench: &testbench,
+        allow_digital_models,
+        code_model_count: engine.code_model_count,
+        export_timeout: EXPORT_TIMEOUT,
+    };
+    let design = inspect_design(&ctx.config.kicad_cli, &schematic, &inputs).await;
+    Ok(CallToolResult::json(&readiness_report(
+        &engine, &design, net_filter, limit,
+    )))
+}
+
+fn simulation_failure(
+    stage: &'static str,
+    reason: &'static str,
+    log_path: Option<String>,
+    items: Vec<String>,
+    message: impl Into<String>,
+) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::SimulationFailed {
+            stage,
+            reason,
+            log_path,
+            items,
+        },
+        message,
+    )
+}
+
+fn failed_outcome(result: CallToolResult, target: &str) -> CallToolResult {
+    let outcome = outcome::summary(
+        OutcomeStatus::Failed,
+        target,
+        SOURCE,
+        FIXED_OUTCOME_UNITS,
+        0,
+        FIXED_OUTCOME_UNITS,
+        Some(outcome::retry_whole_request()),
+    );
+    outcome::attach(result, outcome)
+}
+
+async fn handle_run_simulation(args: &Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let schematic = get_path(args, "schematic")?;
+    let target = schematic.display().to_string();
+    let limit = args["limit"]
+        .as_u64()
+        .unwrap_or(DEFAULT_ROW_LIMIT)
+        .clamp(1, MAX_LIMIT) as usize;
+    let timeout = args["timeout_seconds"]
+        .as_u64()
+        .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+        .clamp(1, MAX_TIMEOUT_SECONDS);
+    let max_raw_bytes = args["max_raw_bytes"]
+        .as_u64()
+        .unwrap_or(DEFAULT_RAW_BYTES)
+        .clamp(MIN_RAW_BYTES, MAX_RAW_LIMIT);
+    let envelope_points = args["envelope_points"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(MAX_ENVELOPE_POINTS) as usize;
+    let testbench = Testbench::from_args(&args["testbench"]);
+    let wanted = Wanted::from_args(
+        &args["analysis"],
+        &args["signals"],
+        &args["measurements"],
+        envelope_points,
+    );
+    let (analysis, wanted) = match wanted {
+        Ok(wanted) => wanted,
+        Err(refusal) => return Ok(failed_outcome(refusal, &target)),
+    };
+    let request = RunArguments {
+        schematic: &schematic,
+        analysis,
+        wanted,
+        testbench: &testbench,
+        limit,
+        budget: Duration::from_secs(timeout),
+        max_raw_bytes,
+    };
+    Ok(match run_analysis(&request, ctx).await {
+        Ok(result) => result,
+        Err(refusal) => failed_outcome(refusal, &target),
+    })
+}
+
+struct RunArguments<'a> {
+    schematic: &'a Path,
+    analysis: Analysis,
+    wanted: Wanted,
+    testbench: &'a Testbench,
+    limit: usize,
+    budget: Duration,
+    max_raw_bytes: u64,
+}
+
+fn invalid(field: impl Into<String>, reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: field.into(),
+            reason: reason.clone(),
+        },
+        reason,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Transient {
+    stop: f64,
+    max_step: Option<f64>,
+    start_save: Option<f64>,
+    use_initial_conditions: bool,
+}
+
+impl Transient {
+    /// Every value here reaches the deck, so each must be a number the engine can
+    /// take. Serde leaves only finite numbers, and a nonsense one fails loudly.
+    fn from_args(analysis: &Value) -> Result<Self, CallToolResult> {
+        let number = |field: &str| -> Result<Option<f64>, CallToolResult> {
+            let value = &analysis[field];
+            if value.is_null() {
+                return Ok(None);
+            }
+            match value.as_f64() {
+                Some(number) if number.is_finite() => Ok(Some(number)),
+                _ => Err(invalid(
+                    format!("analysis.{field}"),
+                    format!("{field} must be a finite number"),
+                )),
+            }
+        };
+        let Some(stop) = number("stop_time_seconds")? else {
+            return Err(invalid(
+                "analysis.stop_time_seconds",
+                "A transient needs stop_time_seconds",
+            ));
+        };
+        if !STOP_TIME_RANGE.contains(&stop) {
+            return Err(invalid(
+                "analysis.stop_time_seconds",
+                format!(
+                    "stop_time_seconds must be from {:e} to {:e}",
+                    STOP_TIME_RANGE.start(),
+                    STOP_TIME_RANGE.end()
+                ),
+            ));
+        }
+        let max_step = number("max_step_seconds")?;
+        if max_step.is_some_and(|step| step < stop * f64::EPSILON || step > stop) {
+            return Err(invalid(
+                "analysis.max_step_seconds",
+                "max_step_seconds must be above 0, within reach of the stop time, and no \
+                 larger than it",
+            ));
+        }
+        let start_save = number("start_save_seconds")?;
+        if start_save.is_some_and(|start| start < 0.0 || start >= stop) {
+            return Err(invalid(
+                "analysis.start_save_seconds",
+                "start_save_seconds must fall before the stop time",
+            ));
+        }
+        Ok(Self {
+            stop,
+            max_step,
+            start_save,
+            use_initial_conditions: analysis["use_initial_conditions"]
+                .as_bool()
+                .unwrap_or(false),
+        })
+    }
+
+    /// Only numbers formatted here, never text from a caller.
+    fn line(&self) -> String {
+        let mut line = format!(".tran {:e} {:e}", self.stop / PRINT_STEPS, self.stop);
+        // Left to itself, ngspice sizes the largest step from the saved stretch
+        // alone, so a late `start_save_seconds` would crawl through the whole run.
+        if self.start_save.is_some() || self.max_step.is_some() {
+            let step = self.max_step.unwrap_or(self.stop / PRINT_STEPS);
+            let start = self.start_save.unwrap_or(0.0);
+            line.push_str(&format!(" {start:e} {step:e}"));
+        }
+        if self.use_initial_conditions {
+            line.push_str(" uic");
+        }
+        line
+    }
+
+    fn reached(plot: &Plot) -> Option<f64> {
+        plot.real(plot.variable("time")?).last()
+    }
+
+    fn first_point(plot: &Plot) -> Option<f64> {
+        plot.real(plot.variable("time")?).next()
+    }
+
+    fn covered(&self, plot: &Plot) -> bool {
+        !plot.is_truncated()
+            && Self::reached(plot)
+                .is_some_and(|last| last >= self.stop * (1.0 - COVERAGE_TOLERANCE))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Analysis {
+    OperatingPoint,
+    Transient(Transient),
+}
+
+impl Analysis {
+    fn from_args(analysis: &Value) -> Result<Self, CallToolResult> {
+        match analysis["kind"].as_str().unwrap_or_default() {
+            "operating_point" => Ok(Self::OperatingPoint),
+            "transient" => Transient::from_args(analysis).map(Self::Transient),
+            other => Err(invalid(
+                "analysis.kind",
+                format!("Unknown analysis kind: {other}"),
+            )),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::OperatingPoint => "operating_point",
+            Self::Transient(_) => "transient",
+        }
+    }
+
+    fn line(&self) -> String {
+        match self {
+            Self::OperatingPoint => OPERATING_POINT.to_string(),
+            Self::Transient(transient) => transient.line(),
+        }
+    }
+
+    fn covered(&self, plot: &Plot) -> bool {
+        match self {
+            Self::OperatingPoint => operating_point_covered(plot),
+            Self::Transient(transient) => transient.covered(plot),
+        }
+    }
+
+    fn uses_initial_conditions(&self) -> bool {
+        matches!(self, Self::Transient(run) if run.use_initial_conditions)
+    }
+}
+
+/// What the caller wants back from a run, checked before anything starts.
+#[derive(Debug, Clone, Default)]
+struct Wanted {
+    /// As written, to repeat in the result.
+    signals: Vec<(String, Signal)>,
+    measurements: Vec<Measurement>,
+    envelope_points: usize,
+}
+
+impl Wanted {
+    fn from_args(
+        analysis: &Value,
+        signals: &Value,
+        measurements: &Value,
+        envelope_points: usize,
+    ) -> Result<(Analysis, Self), CallToolResult> {
+        let analysis = Analysis::from_args(analysis)?;
+        let no_items = Vec::new();
+        let signals = signals.as_array().unwrap_or(&no_items);
+        let measurements = measurements.as_array().unwrap_or(&no_items);
+        if signals.len() > MAX_SIGNALS {
+            return Err(invalid("signals", format!("At most {MAX_SIGNALS} signals")));
+        }
+        if measurements.len() > MAX_MEASUREMENTS {
+            return Err(invalid(
+                "measurements",
+                format!("At most {MAX_MEASUREMENTS} measurements"),
+            ));
+        }
+        let Analysis::Transient(transient) = analysis else {
+            let fits = signals.is_empty() && measurements.is_empty() && envelope_points == 0;
+            return match fits {
+                true => Ok((analysis, Self::default())),
+                false => Err(invalid(
+                    "measurements",
+                    "signals, measurements and envelope_points need a transient",
+                )),
+            };
+        };
+        if envelope_points > 0 && signals.is_empty() {
+            return Err(invalid("envelope_points", "envelope_points needs signals"));
+        }
+        let signals = signals
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let text = entry.as_str().unwrap_or_default();
+                match Signal::parse(text) {
+                    Ok(signal) => Ok((text.to_string(), signal)),
+                    Err(reason) => Err(invalid(format!("signals[{index}]"), reason)),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let measurements = measurements
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                measure::parse(
+                    entry,
+                    index,
+                    transient.stop,
+                    transient.start_save.unwrap_or(0.0),
+                )
+                .map_err(|bad| invalid(bad.field, bad.reason))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            analysis,
+            Self {
+                signals,
+                measurements,
+                envelope_points,
+            },
+        ))
+    }
+
+    fn all_signals(&self) -> impl Iterator<Item = &Signal> {
+        let summaries = self.signals.iter().map(|(_, signal)| signal);
+        summaries.chain(self.measurements.iter().map(|wanted| &wanted.signal))
+    }
+}
+
+async fn usable_engine(
+    runtime: &SimulationRuntime,
+    kicad_cli: &str,
+    limit: Duration,
+) -> Result<EngineStatus, CallToolResult> {
+    let engine = probe_engine(Some(runtime), kicad_cli, limit).await;
+    if engine.available {
+        return Ok(engine);
+    }
+    let reason = match engine.probe_status {
+        "not_found" => "engine_not_found",
+        "timed_out" => "timed_out",
+        _ => "engine_load_failed",
+    };
+    let detail = engine.detail.clone().unwrap_or_default();
+    Err(simulation_failure(
+        "engine",
+        reason,
+        None,
+        engine.searched_locations,
+        format!(
+            "The simulator is not usable: {} {detail}. To point Copperpour at libngspice, set \
+             ngspice_library (and ngspice_code_models_dir if needed) in Copperpour's \
+             configuration file, then restart the server (with the stdio transport on Unix, \
+             reload_server also works): the setting is read only at startup.",
+            engine.probe_status
+        ),
+    ))
+}
+
+fn export_failure(error: &anyhow::Error) -> CallToolResult {
+    let message = export_detail(&format!("{error:#}"));
+    let reason = if error
+        .downcast_ref::<snapshot::SheetOutsideProject>()
+        .is_some()
+    {
+        "sheet_outside_project"
+    } else if message.contains("kicad-cli timed out") {
+        "netlist_export_timed_out"
+    } else {
+        "netlist_export_failed"
+    };
+    simulation_failure("export", reason, None, Vec::new(), message)
+}
+
+fn out_of_budget() -> CallToolResult {
+    simulation_failure(
+        "export",
+        "netlist_export_timed_out",
+        None,
+        Vec::new(),
+        "The time budget ran out before the simulator could start.",
+    )
+}
+
+fn deck_refusal(refusal: &Refusal) -> CallToolResult {
+    let place = match refusal.line {
+        Some(line) => format!("{} line {line}", refusal.origin),
+        None => refusal.origin.clone(),
+    };
+    simulation_failure(
+        "preflight",
+        refusal.code.as_str(),
+        None,
+        vec![format!("{place}: {}", refusal.detail)],
+        "The deck was refused before reaching the simulator.",
+    )
+}
+
+/// A floating group is only wrong for an operating point, where its voltages are
+/// arbitrary, so this is the one warning that refuses here.
+fn preflight_refusal(preflight: &Preflight, kind: &str) -> Option<CallToolResult> {
+    let failed = preflight
+        .checks
+        .iter()
+        .find(|check| check.passed == Some(false));
+    if let Some(check) = failed {
+        let code = check.code.unwrap_or(check.name);
+        let mut items: Vec<String> = check.items.clone();
+        items.truncate(MAX_ERROR_ITEMS);
+        let message = check.reason.clone().unwrap_or_else(|| {
+            format!("Preflight refused this circuit: {code}. See check_simulation_readiness.")
+        });
+        return Some(simulation_failure("preflight", code, None, items, message));
+    }
+    let floating = preflight
+        .warnings
+        .iter()
+        .find(|warning| warning.code == "floating_subcircuit" && kind == "operating_point")?;
+    Some(simulation_failure(
+        "preflight",
+        floating.code,
+        None,
+        floating
+            .items
+            .iter()
+            .take(MAX_ERROR_ITEMS)
+            .cloned()
+            .collect(),
+        floating.detail,
+    ))
+}
+
+/// The names of the elements at the deck's top level, as the deck spells them.
+fn top_level_elements(deck: &FlatDeck) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut depth = 0usize;
+    for (text, _, _) in deck.lines() {
+        let Some(first) = text.split_whitespace().next() else {
+            continue;
+        };
+        let lower = first.to_ascii_lowercase();
+        if lower.starts_with(".subckt") {
+            depth += 1;
+        } else if lower.starts_with(".ends") {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 && !first.starts_with(['.', '+']) {
+            names.push(first);
+        }
+    }
+    names
+}
+
+/// The text of every card that starts with `prefix`, in any case.
+fn cards_starting<'a>(deck: &'a FlatDeck, prefix: &'a str) -> impl Iterator<Item = &'a str> {
+    deck.lines().filter_map(move |(text, _, _)| {
+        let first = text.split_whitespace().next()?;
+        first
+            .to_ascii_lowercase()
+            .starts_with(prefix)
+            .then_some(text)
+    })
+}
+
+/// Whether the deck seeds node voltages. Under `uic` both cards do, through the
+/// same vector.
+fn sets_node_conditions(deck: &FlatDeck) -> bool {
+    [".ic", ".nodeset"]
+        .iter()
+        .any(|prefix| cards_starting(deck, prefix).next().is_some())
+}
+
+/// A caller's own `.probe` would lose the voltages that Copperpour's are held back to
+/// keep, and it cannot be taken out of a deck that names it on purpose.
+fn probe_conflict(deck: &FlatDeck) -> Option<CallToolResult> {
+    let items: Vec<String> = cards_starting(deck, ".probe")
+        .take(MAX_ERROR_ITEMS)
+        .map(str::to_owned)
+        .collect();
+    (!items.is_empty()).then(|| {
+        simulation_failure(
+            "preflight",
+            "probe_loses_initial_conditions",
+            None,
+            items,
+            "A .probe card moves a device's pin onto a hidden node, so under \
+             use_initial_conditions a .ic or .nodeset voltage on that net would be lost. \
+             Remove the card, or use IC= on the device.",
+        )
+    })
+}
+
+/// Copperpour's own lines after the vetted deck. They hold nothing from a caller:
+/// the analysis is numbers formatted here, and a probe names a deck element.
+fn own_lines(analysis: &Analysis, save_currents: bool, probes: &[String]) -> Vec<String> {
+    let mut lines = vec![SAVE_ALL_VOLTAGES.to_string()];
+    if save_currents {
+        lines.push(SAVE_ALL_CURRENTS.to_string());
+    }
+    lines.extend_from_slice(probes);
+    lines.push(analysis.line());
+    lines
+}
+
+fn prepare_run(
+    run: &runs::RunFolder,
+    deck: &FlatDeck,
+    own_lines: &[String],
+    request: &RunRequest,
+) -> anyhow::Result<()> {
+    let own_lines: Vec<&str> = own_lines.iter().map(String::as_str).collect();
+    std::fs::write(run.dir.join(DECK_FILE), deck.render_with(&own_lines))?;
+    std::fs::write(run.dir.join(REQUEST_FILE), serde_json::to_vec(request)?)?;
+    Ok(())
+}
+
+async fn run_analysis(
+    request: &RunArguments<'_>,
+    ctx: &ToolContext,
+) -> Result<CallToolResult, CallToolResult> {
+    let started = Instant::now();
+    check_root_schematic(request.schematic)?;
+    let Some(runtime) = ctx.simulation.get() else {
+        return Err(simulation_failure(
+            "engine",
+            "engine_load_failed",
+            None,
+            Vec::new(),
+            "This process does not carry the simulation worker (embedded or library use).",
+        ));
+    };
+    let probe_limit = request.budget.min(PROBE_TIMEOUT);
+    let engine = usable_engine(runtime, &ctx.config.kicad_cli, probe_limit).await?;
+    let export_budget = request.budget.saturating_sub(started.elapsed());
+    let inputs = DesignInputs {
+        model_dirs: runtime.model_dirs(),
+        testbench: request.testbench,
+        allow_digital_models: runtime.allows_digital_models(),
+        code_model_count: engine.code_model_count,
+        export_timeout: export_budget.min(EXPORT_TIMEOUT),
+    };
+    let inspected = tokio::time::timeout(
+        export_budget,
+        inspect_design(&ctx.config.kicad_cli, request.schematic, &inputs),
+    )
+    .await;
+    let design = match inspected {
+        Ok(design) => design.map_err(|error| export_failure(&error))?,
+        Err(_) => return Err(out_of_budget()),
+    };
+    let deck = design.deck.as_ref().map_err(deck_refusal)?;
+    if let Some(refusal) = design
+        .preflight
+        .as_ref()
+        .and_then(|preflight| preflight_refusal(preflight, request.analysis.kind()))
+    {
+        return Err(refusal);
+    }
+    // A probe moves a device's pin onto a hidden node, and under `uic` a device
+    // takes its start from its own pins: a voltage set on the net would be lost.
+    let keep_conditions = request.analysis.uses_initial_conditions() && sets_node_conditions(deck);
+    if keep_conditions {
+        if let Some(refusal) = probe_conflict(deck) {
+            return Err(refusal);
+        }
+    }
+    let Some(budget) = request
+        .budget
+        .checked_sub(started.elapsed())
+        .filter(|budget| !budget.is_zero())
+    else {
+        return Err(out_of_budget());
+    };
+
+    let store_failure =
+        |error: String| simulation_failure("run", "run_store_failed", None, Vec::new(), error);
+    let library = PathBuf::from(engine.library_path.clone().unwrap_or_default());
+    let run = runtime
+        .state_root()
+        .map_err(|error| error.to_string())
+        .and_then(|root| runs::create(&root, request.schematic).map_err(|error| error.to_string()))
+        .map_err(|error| store_failure(format!("Failed to create a run folder: {error}")))?;
+    let worker_request = RunRequest {
+        protocol: PROTOCOL_VERSION,
+        library: library.clone(),
+        code_models: engine.code_models_dir.as_ref().map(PathBuf::from),
+        load_digital: runtime.allows_digital_models(),
+        compatibility: design.compatibility.ngbehavior.map(str::to_owned),
+        input_path: Some(design.project_dir.clone()),
+        budget_ms: budget.as_millis() as u64,
+        max_raw_bytes: request.max_raw_bytes,
+    };
+    let event_nodes = design
+        .preflight
+        .as_ref()
+        .is_some_and(|preflight| preflight.event_nodes);
+    let probes = match keep_conditions {
+        true => Vec::new(),
+        false => signals::power_probes(
+            request.wanted.all_signals(),
+            Names {
+                nets: &design.nets,
+                elements: &design.elements,
+            },
+            &top_level_elements(deck),
+        ),
+    };
+    let own_lines = own_lines(&request.analysis, !event_nodes && !keep_conditions, &probes);
+    prepare_run(&run, deck, &own_lines, &worker_request)
+        .map_err(|error| store_failure(format!("Failed to prepare the run: {error:#}")))?;
+    let end = run_worker(runtime, &run.dir, &library, budget)
+        .await
+        .map_err(|error| {
+            simulation_failure(
+                "engine",
+                "engine_load_failed",
+                None,
+                Vec::new(),
+                format!("{error:#}"),
+            )
+        })?;
+
+    let finish = RunEnd {
+        keep_conditions,
+        request,
+        run: &run,
+        design: &design,
+        deck,
+        engine: &engine,
+        end: &end,
+    };
+    finish.report()
+}
+
+/// Everything known once the worker has gone.
+struct RunEnd<'a> {
+    /// Probes were left out so `.ic` voltages hold.
+    keep_conditions: bool,
+    request: &'a RunArguments<'a>,
+    run: &'a runs::RunFolder,
+    design: &'a Design,
+    deck: &'a FlatDeck,
+    engine: &'a EngineStatus,
+    end: &'a WorkerEnd,
+}
+
+/// One operating-point value. `net` is the name KiCad shows, where exactly one
+/// net maps to this node.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct OperatingPointRow {
+    signal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net: Option<String>,
+    value: f64,
+    unit: &'static str,
+}
+
+/// Units come from the signal, because ngspice calls `v(r1:r)` a voltage whatever
+/// it holds.
+fn signal_unit(signal: &str) -> &'static str {
+    if signal.ends_with(":power") {
+        "W"
+    } else if signal.starts_with("i(") || signal.ends_with("#branch") {
+        "A"
+    } else if signal.starts_with("v(") {
+        "V"
+    } else {
+        ""
+    }
+}
+
+fn kicad_net(signal: &str, nets: &[NetEntry]) -> Option<String> {
+    let node = signal.strip_prefix("v(")?.strip_suffix(')')?;
+    let mut names = nets
+        .iter()
+        .filter(|net| preflight::engine_node(&net.spice_name) == node)
+        .map(|net| net.kicad_name.clone());
+    let first = names.next();
+    first.filter(|_| names.next().is_none())
+}
+
+/// Top-level signals first, so the cut never hides them behind subcircuit nodes.
+fn operating_point_rows(plot: &Plot, nets: &[NetEntry]) -> Vec<OperatingPointRow> {
+    let mut rows: Vec<OperatingPointRow> = plot
+        .variables
+        .iter()
+        .enumerate()
+        .filter_map(|(index, variable)| {
+            Some(OperatingPointRow {
+                signal: variable.name.clone(),
+                net: kicad_net(&variable.name, nets),
+                value: plot.real(index).next()?,
+                unit: signal_unit(&variable.name),
+            })
+        })
+        .collect();
+    rows.sort_by_key(|row| row.signal.contains('.'));
+    rows
+}
+
+fn operating_point_covered(plot: &Plot) -> bool {
+    plot.points == 1 && !plot.is_truncated() && !plot.variables.is_empty()
+}
+
+/// Split as the engine would rewrite them: it turns a non-ASCII byte into `_`.
+fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+/// What the engine said went wrong, and how many lines were held back. It rewrites
+/// deck lines, quotes pieces of them and cuts long words, and text from a model
+/// file is not ours to repeat. So a line stays in the log if any of its words
+/// starts a word found only in model files. Short words are not evidence: `is`
+/// comes from every diode model and from most of the engine's sentences. A value
+/// computed from a model parameter cannot be recognised, and may still show.
+fn engine_complaints(log: &str, deck: &FlatDeck) -> (Vec<String>, usize) {
+    let mut model_words = BTreeSet::new();
+    let mut own_words = HashSet::new();
+    for (text, _, included) in deck.lines() {
+        if included {
+            model_words.extend(words(text));
+        } else {
+            own_words.extend(words(text));
+        }
+    }
+    model_words.retain(|word| !own_words.contains(word));
+    let quotes_model = |line: &str| {
+        words(line)
+            .filter(|word| word.len() >= MIN_PRIVATE_WORD)
+            .any(|word| {
+                let next = model_words.range(word.clone()..).next();
+                next.is_some_and(|model_word: &String| model_word.starts_with(&word))
+            })
+    };
+    let ours = log.lines().take_while(|line| !line.contains(STATUS_NAME));
+    let lines = ours
+        .filter_map(|line| line.strip_prefix("stderr "))
+        .filter(|line| !line.starts_with(SPINIT_NOTICE) && !line.starts_with(ENGINE_NOTE))
+        .filter(|line| !HALT_NOTICES.iter().any(|notice| line.starts_with(notice)));
+    let (hidden, shown): (Vec<&str>, Vec<&str>) = lines.partition(|line| quotes_model(line));
+    let shown = shown
+        .iter()
+        .take(MAX_LOG_ITEMS)
+        .map(|line| line.chars().take(MAX_LOG_ITEM_CHARS).collect())
+        .collect();
+    (shown, hidden.len())
+}
+
+/// The complaints as items, naming any lines left in the log.
+fn complaint_items(log: &str, deck: &FlatDeck) -> Vec<String> {
+    let (mut items, hidden) = engine_complaints(log, deck);
+    if hidden > 0 {
+        items.push(format!("{hidden} {MODEL_LINES_NOTE}"));
+    }
+    items
+}
+
+fn failure_message(reason: &str) -> &'static str {
+    match reason {
+        "engine_crashed" => "The simulator process died. The server is unaffected.",
+        "engine_failed" => "The simulator stopped on a fatal error. The server is unaffected.",
+        "engine_load_failed" => "The simulator could not start this run.",
+        "circuit_not_parsed" => "The simulator could not parse the circuit.",
+        "no_convergence" => "The analysis did not converge and left no data.",
+        "timed_out" => "The time budget ran out before the simulator left any data.",
+        "size_limit" => "The size limit stopped the run before it left data that could be read.",
+        "results_unreadable" => "The simulator finished but its results could not be read.",
+        _ => "The simulation failed.",
+    }
+}
+
+impl RunEnd<'_> {
+    fn path(&self, file: &str) -> String {
+        self.run.dir.join(file).display().to_string()
+    }
+
+    fn status(&self) -> Option<&RunStatus> {
+        match self.end {
+            WorkerEnd::Reported(status) => Some(status),
+            _ => None,
+        }
+    }
+
+    fn engine_log(&self) -> String {
+        std::fs::read_to_string(self.run.dir.join(LOG_FILE)).unwrap_or_default()
+    }
+
+    fn failure(&self, reason: &'static str) -> CallToolResult {
+        let stage = match reason {
+            "engine_load_failed" => "engine",
+            "results_unreadable" => "results",
+            _ => "run",
+        };
+        let mut items = complaint_items(&self.engine_log(), self.deck);
+        if let WorkerEnd::Died(how) = self.end {
+            items.insert(0, how.clone());
+        }
+        if let Some(error) = self.status().and_then(|status| status.load_error.as_ref()) {
+            items.insert(0, error.chars().take(MAX_LOG_ITEM_CHARS).collect());
+        }
+        simulation_failure(
+            stage,
+            reason,
+            Some(self.path(LOG_FILE)),
+            items,
+            format!("{} Run {}.", failure_message(reason), self.run.id),
+        )
+    }
+
+    fn report(&self) -> Result<CallToolResult, CallToolResult> {
+        let results = self
+            .status()
+            .map(|status| read_results(&self.run.dir, status));
+        let verdict = classify(self.end, results.as_ref(), |plot| {
+            self.request.analysis.covered(plot)
+        });
+        let stopped = match verdict {
+            Verdict::Failed(reason) => return Err(self.failure(reason)),
+            Verdict::Partial(reason) => Some(reason),
+            Verdict::Complete => None,
+        };
+        let Some(Ok(plot)) = &results else {
+            return Err(self.failure("results_unreadable"));
+        };
+        let (body, failed) = match &self.request.analysis {
+            Analysis::OperatingPoint => (
+                self.operating_point_body(plot, stopped),
+                usize::from(stopped.is_some()),
+            ),
+            Analysis::Transient(transient) => self.transient_body(transient, plot, stopped),
+        };
+        let requested = FIXED_OUTCOME_UNITS + self.request.wanted.measurements.len();
+        let status = match failed {
+            0 => OutcomeStatus::Complete,
+            _ => OutcomeStatus::Partial,
+        };
+        let outcome = outcome::summary(
+            status,
+            self.request.schematic.display().to_string(),
+            SOURCE,
+            requested,
+            requested - failed,
+            failed,
+            None,
+        );
+        Ok(outcome::attach(CallToolResult::json(&body), outcome))
+    }
+
+    fn names(&self) -> Names<'_> {
+        Names {
+            nets: &self.design.nets,
+            elements: &self.design.elements,
+        }
+    }
+
+    /// The body and how many outcome units failed. The "range covered" unit also
+    /// stands for the signals asked for: `signals` has no units of its own.
+    fn transient_body(
+        &self,
+        transient: &Transient,
+        plot: &Plot,
+        stopped: Option<&'static str>,
+    ) -> (Value, usize) {
+        let wanted = &self.request.wanted;
+        let partial = stopped.is_some();
+        let time: Vec<f64> = plot
+            .variable("time")
+            .map(|index| plot.real(index).collect())
+            .unwrap_or_default();
+        let mut shared_nets = BTreeSet::new();
+        let mut signal_missing = false;
+        let mut summaries = Vec::new();
+        for (text, signal) in &wanted.signals {
+            match signals::resolve(plot, signal, self.names()) {
+                Ok(found) => {
+                    shared_nets.extend(found.shared_nets);
+                    summaries.push(measure::summary(
+                        &time,
+                        &found.values,
+                        text,
+                        signal.unit(),
+                        wanted.envelope_points,
+                        partial,
+                    ));
+                }
+                Err(not_found) => {
+                    signal_missing = true;
+                    let report = json!({ "signal": text, "finding": "signal_not_found" });
+                    summaries.push(with_pins(report, &not_found));
+                }
+            }
+        }
+        let mut failed_measurements = 0;
+        let mut measurements = Vec::new();
+        for request in &wanted.measurements {
+            match signals::resolve(plot, &request.signal, self.names()) {
+                Ok(found) => {
+                    failed_measurements += usize::from(partial);
+                    shared_nets.extend(found.shared_nets);
+                    let reading = measure::measure(&time, &found.values, request);
+                    measurements.push(reading.report(request, partial));
+                }
+                Err(not_found) => {
+                    failed_measurements += 1;
+                    let report = measure::missing_report(request, partial);
+                    measurements.push(with_pins(report, &not_found));
+                }
+            }
+        }
+        let reached = Transient::reached(plot).unwrap_or(0.0);
+        let first_point = Transient::first_point(plot).unwrap_or(0.0);
+        let analysis = json!({
+            "kind": self.request.analysis.kind(),
+            "stop_time_seconds": transient.stop,
+            "first_point_seconds": first_point,
+            "simulated_to_seconds": reached,
+            "coverage_ratio": (reached / transient.stop).min(1.0),
+            "points": plot.points,
+        });
+        let mut body = self.result_body(plot, analysis, stopped);
+        if !wanted.measurements.is_empty() {
+            body["measurements"] = json!(measurements);
+        }
+        if !wanted.signals.is_empty() {
+            body["signal_summaries"] = json!(summaries);
+        }
+        if let Some(warnings) = body["warnings"].as_array_mut() {
+            if !shared_nets.is_empty() {
+                warnings.push(json!({
+                    "code": "nets_share_engine_node",
+                    "detail": "ngspice reads these nets as one node, so their signals are the same.",
+                    "items": shared_nets,
+                }));
+            }
+            let saves_from_start =
+                transient.start_save.unwrap_or(0.0) < transient.stop / PRINT_STEPS;
+            if first_point > 0.0 && saves_from_start {
+                warnings.push(json!({
+                    "code": "no_point_at_start",
+                    "detail": "This run has no point at time zero, which is how ngspice saves \
+                               under use_initial_conditions, so an event at that instant is cut \
+                               short: a peak reads low, and an integral misses the first step. \
+                               See first_point_seconds.",
+                }));
+            }
+        }
+        let failed = usize::from(partial || signal_missing) + failed_measurements;
+        (body, failed)
+    }
+
+    fn operating_point_body(&self, plot: &Plot, stopped: Option<&'static str>) -> Value {
+        let rows = operating_point_rows(plot, &self.design.nets);
+        std::fs::write(
+            self.run.dir.join(OPERATING_POINT_FILE),
+            serde_json::to_vec_pretty(&rows).unwrap_or_default(),
+        )
+        .ok();
+        let coverage = if operating_point_covered(plot) {
+            1.0
+        } else {
+            0.0
+        };
+        let analysis = json!({
+            "kind": self.request.analysis.kind(),
+            "coverage_ratio": coverage,
+            "points": plot.points,
+        });
+        let mut body = self.result_body(plot, analysis, stopped);
+        body["operating_point"] = json!({
+            "total": rows.len(),
+            "shown": rows.len().min(self.request.limit),
+            "truncated": self.request.limit < rows.len(),
+            "rows": rows.iter().take(self.request.limit).collect::<Vec<_>>(),
+        });
+        body["artifacts"]["table_path"] = json!(self.path(OPERATING_POINT_FILE));
+        body
+    }
+
+    fn warnings(&self) -> Vec<Value> {
+        let mut warnings = Vec::new();
+        if let Some(preflight) = &self.design.preflight {
+            let not_run = preflight.checks.iter().filter(|check| !check.ran);
+            warnings.extend(not_run.map(
+                |check| json!({ "code": check.code.unwrap_or(check.name), "detail": check.reason }),
+            ));
+            let limit = self.request.limit;
+            warnings.extend(preflight.warnings.iter().map(|w| warning_report(w, limit)));
+            if preflight.event_nodes {
+                warnings.push(json!({
+                    "code": "device_currents_not_saved",
+                    "detail": "ngspice cannot probe device currents next to digital nodes, so \
+                               only analog node voltages and voltage source currents are saved.",
+                }));
+            }
+        }
+        if self.keep_conditions {
+            warnings.push(json!({
+                "code": "device_currents_not_saved",
+                "detail": "Device probes would lose .ic and .nodeset voltages under \
+                           use_initial_conditions, so only node voltages and voltage source \
+                           currents are saved.",
+            }));
+        }
+        if !self.engine.code_models_failed.is_empty() {
+            warnings.push(json!({
+                "code": "code_models_failed",
+                "items": self.engine.code_models_failed,
+            }));
+        }
+        // A run can finish after the engine ignored a parameter or changed a value.
+        let messages = complaint_items(&self.engine_log(), self.deck);
+        if !messages.is_empty() {
+            warnings.push(json!({
+                "code": "engine_messages",
+                "detail": "The engine reported these and carried on. They can change the circuit.",
+                "items": messages,
+            }));
+        }
+        // Added when merged (plan step 4, review 3): differences between the
+        // schematic and what ran, reported where callers read.
+        if !self.design.excluded_in_schematic.is_empty() {
+            warnings.push(json!({
+                "code": "excluded_in_schematic",
+                "detail": "The schematic marks these parts \"exclude from simulation\", so they \
+                           were not simulated. The result is not evidence about them.",
+                "items": self.design.excluded_in_schematic,
+            }));
+        }
+        if !self.design.not_in_spice_netlist.is_empty() {
+            warnings.push(json!({
+                "code": "not_in_spice_netlist",
+                "detail": NOT_IN_SPICE_DETAIL,
+                "items": self.design.not_in_spice_netlist,
+            }));
+        }
+        if !self.design.sheets_not_read.is_empty() {
+            warnings.push(json!({
+                "code": "sheets_not_read",
+                "detail": SHEETS_NOT_READ_DETAIL,
+                "items": self.design.sheets_not_read,
+            }));
+        }
+        if !self.request.testbench.spice_lines.is_empty() {
+            warnings.push(json!({
+                "code": "testbench_elements_added",
+                "detail": "Lines the caller added were simulated with the circuit. Results that \
+                           depend on them describe those lines, not any real part, and are not \
+                           evidence that a protection part meets its rating.",
+            }));
+        }
+        // The schematic's own analysis line (.tran, .ac, ...) is always replaced
+        // by the requested one, so only a dropped .control block is reported.
+        if self
+            .deck
+            .dropped_directives
+            .iter()
+            .any(|directive| directive == ".control block")
+        {
+            warnings.push(json!({
+                "code": "control_block_dropped",
+                "detail": "The schematic's .control block was not run. It can hold commands \
+                           (alter, option, set) that change the circuit the schematic describes.",
+            }));
+        }
+        if !self.design.locks_present.is_empty() {
+            warnings.push(json!({
+                "code": "schematic_open_in_editor",
+                "detail": "KiCad has the schematic open. The simulation used the saved files, so \
+                           unsaved edits in the editor are not in this result.",
+                "items": self.design.locks_present,
+            }));
+        }
+        if self.run.old_runs_kept > 0 {
+            warnings.push(json!({
+                "code": "old_runs_kept",
+                "detail": "Old runs could not be removed, so they still use disk.",
+                "total": self.run.old_runs_kept,
+            }));
+        }
+        warnings
+    }
+
+    fn circuit(&self) -> (&'static str, Value) {
+        let design = self.design;
+        let testbench = self.request.testbench;
+        let approximations: Vec<Value> = design
+            .preflight
+            .iter()
+            .flat_map(|preflight| &preflight.warnings)
+            .filter(|warning| APPROXIMATIONS.contains(&warning.code))
+            .map(|warning| json!({ "code": warning.code, "items": warning.items }))
+            .collect();
+        let modified = !design.excluded_references.is_empty()
+            || !design.excluded_in_schematic.is_empty()
+            || !design.not_in_spice_netlist.is_empty()
+            || !testbench.spice_lines.is_empty();
+        let circuit = json!({
+            "excluded_references": design.excluded_references,
+            "excluded_in_schematic": design.excluded_in_schematic,
+            "not_in_spice_netlist": design.not_in_spice_netlist,
+            "added_line_count": testbench.spice_lines.len(),
+            "dropped_directives": self.deck.dropped_directives,
+            "approximations": approximations,
+        });
+        (if modified { "modified" } else { "as_drawn" }, circuit)
+    }
+
+    /// The node a stopped analysis names, if the engine's message is one that may
+    /// be repeated.
+    fn trouble_node(&self) -> Option<String> {
+        let (lines, _) = engine_complaints(&self.engine_log(), self.deck);
+        lines.iter().find_map(|line| trouble_node_in(line))
+    }
+
+    /// The device instance a stopped analysis names. ngspice 47 reports
+    /// `trouble with B-instance b1` where 44.2 reported
+    /// `trouble with node "b1#branch"` (measured on this machine's ngspice 47
+    /// during plan step 4).
+    fn trouble_instance(&self) -> Option<String> {
+        let (lines, _) = engine_complaints(&self.engine_log(), self.deck);
+        lines.iter().find_map(|line| trouble_instance_in(line))
+    }
+
+    fn result_body(&self, plot: &Plot, analysis: Value, stopped: Option<&str>) -> Value {
+        let (simulated_circuit, circuit) = self.circuit();
+        let status = self.status();
+        let raw_bytes = std::fs::metadata(self.run.dir.join(RAW_FILE)).map_or(0, |file| file.len());
+        let mut body = json!({
+            "run_id": self.run.id,
+            "simulated_circuit": simulated_circuit,
+            "circuit": circuit,
+            "analysis": analysis,
+            "engine": {
+                "name": "ngspice",
+                "version": status.and_then(|status| status.engine_version.as_ref()),
+                "compatibility": self.design.compatibility.ngbehavior,
+                "code_models_loaded": status.map_or(0, |status| status.code_models_loaded.len()),
+            },
+            "sources": [SOURCE],
+            "source_evidence": {
+                "excludes_unsaved_editor_state": true,
+                "locks_present": self.design.locks_present,
+                "inputs_hash": self.design.inputs_hash,
+            },
+            "warnings": self.warnings(),
+            "artifacts": {
+                "dir": self.run.dir.display().to_string(),
+                "deck_path": self.path(DECK_FILE),
+                "raw_path": self.path(RAW_FILE),
+                "log_path": self.path(LOG_FILE),
+                "raw_bytes": raw_bytes,
+            },
+        });
+        if let Some(reason) = stopped {
+            body["stopped"] = json!({ "reason": reason, "at_point": plot.points });
+            if let Some(node) = self.trouble_node() {
+                body["stopped"]["node"] = json!(node);
+            }
+            if let Some(instance) = self.trouble_instance() {
+                body["stopped"]["instance"] = json!(instance);
+            }
+        }
+        body
+    }
+}
+
+/// `trouble with node "x"` → `x` (ngspice 44.2).
+fn trouble_node_in(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("node \"")?;
+    rest.split('"').next().map(str::to_owned)
+}
+
+/// `trouble with B-instance b1` → `b1` (ngspice 47). Measured only for a `B`
+/// source; other device letters are accepted on the assumption that ngspice
+/// words them the same way.
+fn trouble_instance_in(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("trouble with ")?;
+    let (kind, rest) = rest.split_once("-instance ")?;
+    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    rest.split_whitespace().next().map(str::to_owned)
+}
+
+#[cfg(test)]
+mod trouble_message_tests {
+    use super::*;
+
+    #[test]
+    fn both_engine_versions_name_what_the_run_stalled_on() {
+        let old = "doAnalyses: TRAN:  Timestep too small: trouble with node \"b1#branch\"";
+        let new = "doAnalyses: TRAN:  Timestep too small; time = 0.00215598, timestep = \
+                   1.875e-18: trouble with B-instance b1";
+        assert_eq!(trouble_node_in(old).as_deref(), Some("b1#branch"));
+        assert_eq!(trouble_instance_in(old), None);
+        assert_eq!(trouble_instance_in(new).as_deref(), Some("b1"));
+        assert_eq!(trouble_node_in(new), None);
+    }
+}
+
+/// Name the pins a part really has, so `i(M1)` shows the way to `i(M1:d)`.
+fn with_pins(mut report: Value, not_found: &NotFound) -> Value {
+    if !not_found.pins.is_empty() {
+        report["pins"] = json!(not_found.pins);
+    }
+    report
+}
+
+#[derive(Default)]
+struct Testbench {
+    exclude_references: Vec<String>,
+    spice_lines: Vec<String>,
+}
+
+impl Testbench {
+    fn from_args(value: &Value) -> Self {
+        let strings = |field: &str| -> Vec<String> {
+            value[field]
+                .as_array()
+                .map(|items| {
+                    let text = items.iter().filter_map(Value::as_str);
+                    text.map(str::to_owned).collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            exclude_references: strings("exclude_references"),
+            spice_lines: strings("spice_lines"),
+        }
+    }
+}
+
+struct DesignInputs<'a> {
+    model_dirs: &'a [PathBuf],
+    testbench: &'a Testbench,
+    allow_digital_models: bool,
+    code_model_count: usize,
+    export_timeout: Duration,
+}
+
+/// References each pattern selects, and the patterns that select nothing. A
+/// trailing `*` matches a prefix.
+fn excluded_references(kicad: &KiCadNetlist, patterns: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut references = Vec::new();
+    let mut unmatched = Vec::new();
+    for pattern in patterns {
+        let matches = |reference: &str| match pattern.strip_suffix('*') {
+            Some(prefix) => reference.starts_with(prefix),
+            None => reference == pattern,
+        };
+        let selected: Vec<String> = kicad
+            .components
+            .iter()
+            .filter(|component| matches(&component.reference))
+            .map(|component| component.reference.clone())
+            .collect();
+        if selected.is_empty() {
+            unmatched.push(pattern.clone());
+        }
+        references.extend(selected);
+    }
+    references.sort();
+    references.dedup();
+    (references, unmatched)
+}
+
+/// The design as `kicad-cli` sees it, from a private copy of the saved files.
+struct Design {
+    nets: Vec<NetEntry>,
+    elements: Vec<ElementEntry>,
+    locks_present: Vec<String>,
+    compatibility: Compatibility,
+    deck: Result<FlatDeck, Refusal>,
+    ignored_model_dirs: Vec<String>,
+    excluded_references: Vec<String>,
+    /// Components the schematic itself keeps out of the simulation (KiCad's
+    /// "exclude from simulation"): in the KiCad netlist, but with no element in
+    /// the SPICE netlist. Power symbols (`#...`) are not listed. Added when
+    /// merged (plan step 4, review 3): such parts used to vanish while the
+    /// result still read `as_drawn`.
+    excluded_in_schematic: Vec<String>,
+    /// Parts in KiCad's netlist with no line in its SPICE netlist for which
+    /// Copperpour found no flag on their symbol or on a sheet on their path,
+    /// so the cause is not known (owner review of overnight
+    /// decision 1; step 4b).
+    not_in_spice_netlist: Vec<String>,
+    /// Sheet files whose flags could not be read (see `SimExclusions`).
+    sheets_not_read: Vec<String>,
+    preflight: Option<Preflight>,
+    project_dir: PathBuf,
+    inputs_hash: String,
+}
+
+/// The copied sheets and project file, in a stable order. Taken before the
+/// export, which works inside the same folder.
+fn hash_sources(source_dir: &Path) -> std::io::Result<Sha256> {
+    fn files_under(dir: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                files_under(&entry.path(), found)?;
+            } else {
+                found.push(entry.path());
+            }
+        }
+        Ok(())
+    }
+    let mut sources = Vec::new();
+    files_under(source_dir, &mut sources)?;
+    sources.sort();
+    let mut hasher = Sha256::new();
+    for path in &sources {
+        let name = path.strip_prefix(source_dir).unwrap_or(path);
+        hasher.update(name.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher.update(std::fs::read(path)?);
+    }
+    Ok(hasher)
+}
+
+/// Everything a result rests on: the sources, then each model file the deck
+/// inlined, so a changed model reads as a changed input.
+fn inputs_hash(mut hasher: Sha256, inlined_files: &[PathBuf]) -> std::io::Result<String> {
+    for path in inlined_files {
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher.update(std::fs::read(path)?);
+    }
+    Ok(crate::hex::encode_hex(&hasher.finalize()))
+}
+
+/// KiCad wipes its per-user IBIS cache on every SPICE export, from any project,
+/// so an export and the read of its includes must not interleave with another.
+static EXPORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Folders an include may read from, canonical to compare with resolved paths,
+/// and any configured folder that was left out. A root that holds the user's
+/// home folder would stop the check meaning anything, so it is never used.
+fn allowed_roots(project_dir: &Path, model_dirs: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
+    // Copperpour's helper refuses a relative HOME (#171), which would make this
+    // check compare against a folder under the working directory.
+    let home = crate::app_dirs::home_dir().and_then(|home| home.canonicalize().ok());
+    let usable = |path: &Path| {
+        path.parent().is_some() && !home.as_ref().is_some_and(|home| home.starts_with(path))
+    };
+    let cache = dirs::cache_dir()
+        .into_iter()
+        .chain(std::env::var_os("KICAD_CACHE_HOME").map(PathBuf::from))
+        .flat_map(|dir| [dir.join("KiCad"), dir.join("kicad")]);
+    let mut roots: Vec<PathBuf> = std::iter::once(project_dir.to_path_buf())
+        .chain(crate::kicad_install::share_roots())
+        .chain(cache)
+        .filter_map(|path| path.canonicalize().ok())
+        .filter(|path| usable(path))
+        .collect();
+    let mut ignored = Vec::new();
+    for dir in model_dirs {
+        match dir.canonicalize() {
+            Ok(path) if dir.is_absolute() && usable(&path) => roots.push(path),
+            _ => ignored.push(dir.display().to_string()),
+        }
+    }
+    (roots, ignored)
+}
+
+/// What the sheet files under the snapshot's copy flag as excluded from
+/// simulation (see `excluded_by_flag`): placed symbols and sheet instances,
+/// by UUID. A file that cannot be read or parsed is named in `unread`; its
+/// parts are then reported as `not_in_spice_netlist`, which still marks the
+/// result `modified`.
+#[derive(Debug, Default, PartialEq)]
+struct SimExclusions {
+    symbols: std::collections::HashSet<String>,
+    sheets: std::collections::HashSet<String>,
+    /// Sheet files that could not be read or parsed, relative to the
+    /// snapshot: their flags are unknown, so parts on them may be reported as
+    /// `not_in_spice_netlist` although the schematic excludes them (step 4b
+    /// review 3).
+    unread: Vec<String>,
+}
+
+impl SimExclusions {
+    /// Whether the schematic itself excludes `component`: its symbol is
+    /// flagged, or a sheet instance on its path is.
+    fn excludes(&self, component: &crate::simulation::kicad_netlist::Component) -> bool {
+        component
+            .symbol_uuids
+            .iter()
+            .any(|uuid| self.symbols.contains(uuid))
+            || component
+                .sheet_path_uuids
+                .iter()
+                .any(|uuid| self.sheets.contains(uuid))
+    }
+}
+
+fn sim_exclusions(root: &Path) -> SimExclusions {
+    let mut found = SimExclusions::default();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "kicad_sch") {
+                continue;
+            }
+            let Some(tree) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| copperpour_sexp::parse_sexp(&text).ok())
+            else {
+                found.unread.push(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+                continue;
+            };
+            // Placed symbols and sheets are direct children of the sheet;
+            // library symbols sit under `lib_symbols` and are not visited.
+            for (tag, into) in [("symbol", &mut found.symbols), ("sheet", &mut found.sheets)] {
+                for node in tree.find_all(tag) {
+                    if excluded_by_flag(node) {
+                        if let Some(uuid) = node.find_str("uuid") {
+                            into.insert(uuid.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+const NOT_IN_SPICE_DETAIL: &str = "These parts have no line in KiCad's SPICE netlist, and \
+    Copperpour found no exclude-from-simulation flag for them (on the symbol, a sheet on their \
+    path, or the older Sim.Enable and Spice_Netlist_Enabled fields), so why they were left out is \
+    not known. They were not simulated, and the result is not evidence about them. Check them in \
+    the schematic.";
+
+const SHEETS_NOT_READ_DETAIL: &str = "These sheet files could not be read for their \
+    exclude-from-simulation flags, so parts on them may be listed as not_in_spice_netlist \
+    although the schematic excludes them.";
+
+/// Whether a placed symbol or sheet is excluded from simulation by the
+/// schematic: `(exclude_from_sim yes)`, or one of the older per-symbol fields
+/// KiCad 10 still honours, `Sim.Enable` "0" and `Spice_Netlist_Enabled` "N"
+/// (step 4b review 2, measured on the rectifier demo with kicad-cli 10.0.7:
+/// either drops the part from the SPICE netlist with `exclude_from_sim no`).
+fn excluded_by_flag(node: &copperpour_sexp::SexpNode) -> bool {
+    if node.find_str("exclude_from_sim") == Some("yes") {
+        return true;
+    }
+    node.find_all("property").into_iter().any(|property| {
+        let field = |index| {
+            property
+                .get(index)
+                .and_then(copperpour_sexp::SexpNode::as_str)
+        };
+        matches!(
+            (field(1), field(2)),
+            (Some("Sim.Enable"), Some("0")) | (Some("Spice_Netlist_Enabled"), Some("N" | "n"))
+        )
+    })
+}
+
+/// Split the parts KiCad's SPICE netlist has no line for: those the
+/// schematic excludes (symbol or sheet flag) and the rest. Pure, so it is
+/// tested without kicad-cli.
+fn split_missing_parts(
+    kicad: &crate::simulation::kicad_netlist::KiCadNetlist,
+    elements: &[crate::simulation::kicad_netlist::ElementEntry],
+    exclusions: &SimExclusions,
+) -> (Vec<String>, Vec<String>) {
+    // Keyed by reference, so a reference two parts share (duplicate or
+    // missing annotation) counts as excluded only if every part carrying it
+    // is: one part's flag must not explain the other (step 4b review 2).
+    let mut by_reference: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+    for component in &kicad.components {
+        let excluded = exclusions.excludes(component);
+        by_reference
+            .entry(component.reference.as_str())
+            .and_modify(|all| *all &= excluded)
+            .or_insert(excluded);
+    }
+    let flagged: std::collections::HashSet<&str> = by_reference
+        .into_iter()
+        .filter(|(_, excluded)| *excluded)
+        .map(|(reference, _)| reference)
+        .collect();
+    elements
+        .iter()
+        .filter(|element| element.element_name.is_none())
+        .map(|element| element.reference.clone())
+        .partition(|reference| flagged.contains(reference.as_str()))
+}
+
+async fn inspect_design(
+    kicad_cli: &str,
+    schematic: &Path,
+    inputs: &DesignInputs<'_>,
+) -> anyhow::Result<Design> {
+    let scratch = tempfile::Builder::new()
+        .prefix("copperpour-sim-export-")
+        .tempdir()?;
+    let source = scratch.path().join("src");
+    std::fs::create_dir(&source)?;
+    let snapshot = snapshot::take_snapshot(schematic, &source)?;
+    let project_dir = schematic
+        .canonicalize()?
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let compatibility = Compatibility::from_project_file(&schematic.with_extension("kicad_pro"));
+    let sources_hash = hash_sources(&source)?;
+    // Read before taking the export lock: the flags come from the snapshot's
+    // own sheet files, so other sessions need not wait for this parse (step
+    // 4b review 2). The lock covers the export and the read of its includes.
+    let exclusions = sim_exclusions(&source);
+    let _export_guard = EXPORT_LOCK.lock().await;
+    let netlists = cli::export_simulation_netlists(
+        kicad_cli,
+        &snapshot.root_sheet,
+        scratch.path(),
+        inputs.export_timeout,
+    )
+    .await?;
+    let kicad = kicad_netlist::parse(&netlists.kicad)?;
+    let spice = SpiceNetlist::parse(&netlists.spice);
+    let (allowed_roots, ignored_model_dirs) = allowed_roots(&project_dir, inputs.model_dirs);
+    let (excluded_references, unmatched_exclusions) =
+        excluded_references(&kicad, &inputs.testbench.exclude_references);
+    let nets = kicad_netlist::net_entries(&kicad, &spice);
+    let elements = kicad_netlist::element_entries(&kicad, &spice, &excluded_references);
+    let excluded_elements: Vec<String> = elements
+        .iter()
+        .filter(|element| element.excluded)
+        .filter_map(|element| element.element_name.as_deref())
+        .map(str::to_lowercase)
+        .collect();
+    let deck = flatten::flatten(&DeckInputs {
+        netlist: &netlists.spice,
+        testbench: &inputs.testbench.spice_lines,
+        project_dir: &project_dir,
+        allowed_roots: &allowed_roots,
+        compatibility,
+        excluded_elements: &excluded_elements,
+    });
+    let preflight = deck.as_ref().ok().map(|deck| {
+        preflight::run(&preflight::Inputs {
+            deck,
+            compatibility,
+            kicad: &kicad,
+            nets: &nets,
+            elements: &elements,
+            allow_digital_models: inputs.allow_digital_models,
+            code_model_count: inputs.code_model_count,
+            unmatched_exclusions: &unmatched_exclusions,
+            has_testbench_lines: !inputs.testbench.spice_lines.is_empty(),
+        })
+    });
+    // Parts missing from what ran, split by whether the schematic itself
+    // excludes them: KiCad's netlist does not carry the flag, so it is read
+    // from the snapshot's sheet files and matched by symbol and sheet UUID.
+    let (excluded_in_schematic, not_in_spice_netlist) =
+        split_missing_parts(&kicad, &elements, &exclusions);
+    let mut sheets_not_read = exclusions.unread;
+    sheets_not_read.sort();
+    let inlined = deck.as_ref().map_or(&[][..], |deck| &deck.inlined_files);
+    let inputs_hash = inputs_hash(sources_hash, inlined)?;
+    Ok(Design {
+        excluded_in_schematic,
+        not_in_spice_netlist,
+        sheets_not_read,
+        compatibility,
+        inputs_hash,
+        project_dir,
+        deck,
+        ignored_model_dirs,
+        excluded_references,
+        preflight,
+        nets,
+        elements,
+        locks_present: snapshot
+            .locks_present
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+    })
+}
+
+#[derive(Serialize)]
+struct Listing<'a, T> {
+    total: usize,
+    shown: usize,
+    truncated: bool,
+    items: Vec<&'a T>,
+}
+
+/// Counted before the cut, as `run_drc` does, so a short list never reads as a
+/// small design.
+fn listing<'a, T>(items: impl Iterator<Item = &'a T>, limit: usize) -> Listing<'a, T> {
+    let items: Vec<&T> = items.collect();
+    let total = items.len();
+    let items: Vec<&T> = items.into_iter().take(limit).collect();
+    Listing {
+        total,
+        shown: items.len(),
+        truncated: items.len() < total,
+        items,
+    }
+}
+
+/// `ready` is true only when every check ran and passed, false when one failed,
+/// and null when one could not run. A check that did not run is never a pass.
+fn readiness_report(
+    engine: &EngineStatus,
+    design: &anyhow::Result<Design>,
+    net_filter: &str,
+    limit: usize,
+) -> Value {
+    let engine_ran = engine.probe_status != "not_available";
+    let engine_check = if engine_ran {
+        json!({ "name": "engine", "ran": true, "passed": engine.available })
+    } else {
+        json!({ "name": "engine", "ran": false, "reason": engine.detail })
+    };
+    let export_check = match design {
+        Ok(_) => json!({ "name": "netlist_export", "ran": true, "passed": true }),
+        Err(error) => json!({
+            "name": "netlist_export",
+            "ran": true,
+            "passed": false,
+            "detail": export_detail(&format!("{error:#}")),
+        }),
+    };
+    let deck_check = match design.as_ref().map(|design| &design.deck) {
+        Ok(Ok(_)) => json!({ "name": "deck_vetting", "ran": true, "passed": true }),
+        Ok(Err(refusal)) => json!({
+            "name": "deck_vetting",
+            "ran": true,
+            "passed": false,
+            "refusal": refusal,
+        }),
+        Err(_) => json!({
+            "name": "deck_vetting",
+            "ran": false,
+            "reason": "The netlist could not be exported.",
+        }),
+    };
+    let preflight = design
+        .as_ref()
+        .ok()
+        .and_then(|design| design.preflight.as_ref());
+    let mut checks = vec![engine_check, export_check, deck_check];
+    match preflight {
+        Some(preflight) => checks.extend(
+            preflight
+                .checks
+                .iter()
+                .map(|check| check_report(check, limit)),
+        ),
+        None => checks.push(json!({
+            "name": "preflight",
+            "ran": false,
+            "reason": "Preflight runs on a deck that passed vetting."
+        })),
+    }
+    let ready = if checks.iter().any(|check| check["passed"] == false) {
+        json!(false)
+    } else if checks.iter().any(|check| check["ran"] == false) {
+        Value::Null
+    } else {
+        json!(true)
+    };
+
+    let mut report = json!({
+        "ready": ready,
+        "checks": checks,
+        "engine": engine,
+        "sources": ["saved_schematic_snapshot"],
+    });
+    if let Ok(design) = design {
+        let filter = net_filter.to_lowercase();
+        let nets = design.nets.iter().filter(|net| {
+            net.kicad_name.to_lowercase().contains(&filter)
+                || net.spice_name.to_lowercase().contains(&filter)
+        });
+        report["nets"] = json!(listing(nets, limit));
+        report["elements"] = json!(listing(design.elements.iter(), limit));
+        report["engine"]["compatibility"] = json!(design.compatibility.ngbehavior);
+        if !design.ignored_model_dirs.is_empty() {
+            report["ignored_model_dirs"] = json!(design.ignored_model_dirs);
+        }
+        if let Ok(deck) = &design.deck {
+            report["deck"] = json!({
+                "line_count": deck.line_count(),
+                "inlined_file_count": deck.inlined_files.len(),
+                "dropped_directives": deck.dropped_directives,
+            });
+        }
+        if let Some(preflight) = &design.preflight {
+            report["unmodelled_symbols"] = unmodelled_report(&preflight.unmodelled_symbols, limit);
+            let warnings = preflight.warnings.iter();
+            report["warnings"] = json!(warnings
+                .map(|warning| warning_report(warning, limit))
+                .collect::<Vec<_>>());
+        }
+        if !design.excluded_references.is_empty() {
+            report["excluded_references"] =
+                json!(listing(design.excluded_references.iter(), limit));
+        }
+        if !design.excluded_in_schematic.is_empty() {
+            report["excluded_in_schematic"] =
+                json!(listing(design.excluded_in_schematic.iter(), limit));
+        }
+        if !design.not_in_spice_netlist.is_empty() {
+            report["not_in_spice_netlist"] =
+                json!(listing(design.not_in_spice_netlist.iter(), limit));
+        }
+        // Not a reason to refuse (the run tools do not), but a warning the
+        // caller reads before running, as the run tools give (step 4b review 3).
+        let mut extra = Vec::new();
+        if !design.not_in_spice_netlist.is_empty() {
+            extra.push(json!({
+                "code": "not_in_spice_netlist",
+                "detail": NOT_IN_SPICE_DETAIL,
+                "items": listing(design.not_in_spice_netlist.iter(), limit),
+            }));
+        }
+        if !design.sheets_not_read.is_empty() {
+            extra.push(json!({
+                "code": "sheets_not_read",
+                "detail": SHEETS_NOT_READ_DETAIL,
+                "items": listing(design.sheets_not_read.iter(), limit),
+            }));
+        }
+        if !extra.is_empty() {
+            match report["warnings"].as_array_mut() {
+                Some(warnings) => warnings.extend(extra),
+                None => report["warnings"] = json!(extra),
+            }
+        }
+        report["source_evidence"] = json!({
+            "excludes_unsaved_editor_state": true,
+            "locks_present": design.locks_present,
+        });
+    }
+    report
+}
+
+/// A check with its items cut to the limit and counted before the cut.
+fn check_report(check: &preflight::Check, limit: usize) -> Value {
+    let mut report = json!(check);
+    add_items(&mut report, &check.items, limit);
+    report
+}
+
+fn add_items(report: &mut Value, items: &[String], limit: usize) {
+    let shown: Vec<&String> = items.iter().take(limit).collect();
+    report["total"] = json!(items.len());
+    report["shown"] = json!(shown.len());
+    report["truncated"] = json!(shown.len() < items.len());
+    report["items"] = json!(shown);
+}
+
+fn warning_report(warning: &preflight::Warning, limit: usize) -> Value {
+    let mut report = json!(warning);
+    add_items(&mut report, &warning.items, limit);
+    report
+}
+
+/// Listed like the other lists, with each symbol's pins cut to the same limit.
+fn unmodelled_report(symbols: &[preflight::UnmodelledSymbol], limit: usize) -> Value {
+    let mut report = json!(listing(symbols.iter(), limit));
+    if let Some(items) = report["items"].as_array_mut() {
+        for (item, symbol) in items.iter_mut().zip(symbols) {
+            item["pin_total"] = json!(symbol.pins.len());
+            item["pins"] = json!(symbol.pins.iter().take(limit).collect::<Vec<_>>());
+        }
+    }
+    report
+}
+
+/// Keep KiCad's own words and drop library noise that says nothing about the
+/// design. Exported text is data from the project, so it stays bounded.
+fn export_detail(message: &str) -> String {
+    let lines: Vec<&str> = message
+        .lines()
+        .filter(|line| !line.contains("Fontconfig"))
+        .collect();
+    lines.join("\n").chars().take(DETAIL_LIMIT).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const NET: &str = include_str!("../../tests/fixtures/simulation/rectifier_unmodelled.net");
+    const CIR: &str = include_str!("../../tests/fixtures/simulation/rectifier_unmodelled.cir");
+
+    fn engine(probe_status: &'static str, available: bool) -> EngineStatus {
+        EngineStatus {
+            probe_status,
+            available,
+            version: available.then(|| "44.2".to_string()),
+            library_path: None,
+            code_models_dir: None,
+            code_model_count: 0,
+            code_models_failed: Vec::new(),
+            searched_locations: Vec::new(),
+            detail: None,
+        }
+    }
+
+    static NO_TESTBENCH: Testbench = Testbench {
+        exclude_references: Vec::new(),
+        spice_lines: Vec::new(),
+    };
+
+    fn no_inputs() -> DesignInputs<'static> {
+        DesignInputs {
+            model_dirs: &[],
+            testbench: &NO_TESTBENCH,
+            allow_digital_models: true,
+            code_model_count: 1,
+            export_timeout: EXPORT_TIMEOUT,
+        }
+    }
+
+    /// The flags are read from the sheet files: placed symbols and sheet
+    /// instances marked `(exclude_from_sim yes)`, in any sheet of the
+    /// snapshot; a library symbol's own flag does not count (owner review of
+    /// overnight decision 1; step 4b review 1 for the sheet flag).
+    #[test]
+    fn sim_exclusions_reads_symbols_and_sheets_in_every_sheet_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("top.kicad_sch"),
+            "(kicad_sch (lib_symbols (symbol \"Device:R\" (exclude_from_sim yes))) \
+             (symbol (lib_id \"Device:R\") (exclude_from_sim yes) (uuid \"u-flagged\")) \
+             (symbol (lib_id \"Device:R\") (exclude_from_sim no) (uuid \"u-kept\")) \
+             (symbol (exclude_from_sim no) (property \"Sim.Enable\" \"0\") (uuid \"u-sim-off\")) \
+             (symbol (exclude_from_sim no) (property \"Sim.Enable\" \"1\") (uuid \"u-sim-on\")) \
+             (symbol (exclude_from_sim no) (property \"Spice_Netlist_Enabled\" \"N\") (uuid \"u-legacy\")) \
+             (symbol (exclude_from_sim no) (property \"Spice_Netlist_Enabled\" \"Y\") (uuid \"u-legacy-on\")) \
+             (sheet (exclude_from_sim yes) (uuid \"s-off\")) \
+             (sheet (exclude_from_sim no) (uuid \"s-on\")))",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(
+            dir.path().join("sub").join("child.kicad_sch"),
+            "(kicad_sch (symbol (lib_id \"Connector:J\") (exclude_from_sim yes) (uuid \"u-child\")))",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("broken.kicad_sch"), "(kicad_sch (").unwrap();
+        let found = sim_exclusions(dir.path());
+        let set = |items: &[&str]| items.iter().map(|item| item.to_string()).collect();
+        // The older fields KiCad 10 still honours (step 4b review 2).
+        assert_eq!(
+            found.symbols,
+            set(&["u-flagged", "u-child", "u-sim-off", "u-legacy"])
+        );
+        assert_eq!(found.sheets, set(&["s-off"]));
+        // A sheet whose flags could not be read is named (step 4b review 3).
+        assert_eq!(found.unread, ["broken.kicad_sch"]);
+    }
+
+    /// The split, without kicad-cli (step 4b review 1), on the shapes
+    /// measured in KiCad 10.0.7's complex_hierarchy demo: a symbol shared by
+    /// two instances of one sheet, a multi-unit part with one unit flagged,
+    /// and one instance of a sheet used twice flagged as a whole.
+    #[test]
+    fn missing_parts_are_split_by_symbol_and_sheet_flags() {
+        use crate::simulation::kicad_netlist::{Component, ElementEntry, KiCadNetlist};
+        let part = |reference: &str, symbols: &[&str], path: &[&str]| Component {
+            reference: reference.to_string(),
+            value: String::new(),
+            lib_id: None,
+            has_sim_fields: false,
+            sim_params: None,
+            symbol_uuids: symbols.iter().map(|uuid| uuid.to_string()).collect(),
+            sheet_path_uuids: path.iter().map(|uuid| uuid.to_string()).collect(),
+        };
+        let kicad = KiCadNetlist {
+            components: vec![
+                part("C201", &["u-shared"], &["s-h"]),
+                part("C301", &["u-shared"], &["s-v"]),
+                part("U201", &["u-a", "u-b"], &["s-h"]),
+                part("R401", &["u-r"], &["s-v"]),
+                part("R1", &["u-plain"], &[]),
+                part("R2", &["u-ran"], &[]),
+                // Two parts share a reference; only one is flagged, so the
+                // reference is not explained by the flag (step 4b review 2).
+                part("R5", &["u-shared"], &[]),
+                part("R5", &["u-other"], &[]),
+            ],
+            nets: Vec::new(),
+            library_parts: Vec::new(),
+        };
+        let missing = |reference: &str| ElementEntry {
+            reference: reference.to_string(),
+            element_name: None,
+            modelled: false,
+            excluded: false,
+        };
+        let mut elements: Vec<ElementEntry> = ["C201", "C301", "U201", "R401", "R1", "R5"]
+            .into_iter()
+            .map(missing)
+            .collect();
+        elements.push(ElementEntry {
+            element_name: Some("R2".to_string()),
+            ..missing("R2")
+        });
+        let exclusions = SimExclusions {
+            symbols: ["u-shared", "u-b"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            sheets: ["s-v"].into_iter().map(str::to_string).collect(),
+            unread: Vec::new(),
+        };
+        let (excluded, unexplained) = split_missing_parts(&kicad, &elements, &exclusions);
+        assert_eq!(excluded, ["C201", "C301", "U201", "R401"]);
+        assert_eq!(unexplained, ["R1", "R5"]);
+    }
+
+    #[test]
+    fn exclusions_take_exact_references_and_prefix_wildcards() {
+        let kicad = kicad_netlist::parse(NET).unwrap();
+        let (references, unmatched) = excluded_references(
+            &kicad,
+            &["D1".to_string(), "R*".to_string(), "J*".to_string()],
+        );
+        assert_eq!(references, ["D1", "R1", "R2"]);
+        assert_eq!(unmatched, ["J*"]);
+    }
+
+    #[test]
+    fn a_symbol_with_many_pins_is_cut_to_the_limit() {
+        let pin = |number: usize| preflight::SymbolPin {
+            pin: number.to_string(),
+            pin_name: None,
+            pin_type: None,
+            net: "/a".to_string(),
+            spice_net: None,
+        };
+        let symbol = preflight::UnmodelledSymbol {
+            reference: "U1".to_string(),
+            value: String::new(),
+            lib_id: None,
+            pins: (0..5).map(pin).collect(),
+            suggested_fix: "exclude",
+        };
+        let report = unmodelled_report(&[symbol], 2);
+        assert_eq!(report["items"][0]["pin_total"], 5);
+        assert_eq!(report["items"][0]["pins"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_passing_design_is_ready_only_when_every_check_ran() {
+        let mut passing = design().unwrap();
+        passing.preflight = Some(Preflight {
+            checks: Vec::new(),
+            warnings: Vec::new(),
+            unmodelled_symbols: Vec::new(),
+            event_nodes: false,
+        });
+        let report = readiness_report(&engine("ok", true), &Ok(passing), "", 25);
+        assert_eq!(report["ready"], true, "{report}");
+        let report = readiness_report(&engine("not_available", false), &design(), "", 25);
+        assert_eq!(report["ready"], Value::Null, "{report}");
+    }
+
+    #[test]
+    fn check_items_are_cut_to_the_limit_and_counted_first() {
+        let kicad = kicad_netlist::parse(NET).unwrap();
+        let mut design = design().unwrap();
+        design.preflight = Some(preflight::run(&preflight::Inputs {
+            deck: &flatten::flatten(&DeckInputs {
+                netlist: CIR,
+                testbench: &[],
+                project_dir: Path::new("/"),
+                allowed_roots: &[],
+                compatibility: Compatibility::DEFAULT,
+                excluded_elements: &[],
+            })
+            .unwrap(),
+            compatibility: Compatibility::DEFAULT,
+            kicad: &kicad,
+            nets: &design.nets,
+            elements: &design.elements,
+            allow_digital_models: true,
+            code_model_count: 1,
+            unmatched_exclusions: &[],
+            has_testbench_lines: false,
+        }));
+        let report = readiness_report(&engine("ok", true), &Ok(design), "", 1);
+        assert_eq!(report["ready"], false);
+        let coverage = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "model_coverage")
+            .unwrap();
+        assert_eq!(coverage["total"], 2, "{report}");
+        assert_eq!(coverage["items"].as_array().unwrap().len(), 1);
+        assert_eq!(report["unmodelled_symbols"]["total"], 2);
+        assert_eq!(report["unmodelled_symbols"]["truncated"], true);
+    }
+
+    fn design() -> anyhow::Result<Design> {
+        let kicad = kicad_netlist::parse(NET)?;
+        let spice = SpiceNetlist::parse(CIR);
+        Ok(Design {
+            nets: kicad_netlist::net_entries(&kicad, &spice),
+            elements: kicad_netlist::element_entries(&kicad, &spice, &[]),
+            locks_present: vec!["/p/~top.kicad_sch.lck".to_string()],
+            compatibility: Compatibility::DEFAULT,
+            deck: Ok(FlatDeck::default()),
+            ignored_model_dirs: Vec::new(),
+            excluded_references: Vec::new(),
+            excluded_in_schematic: Vec::new(),
+            not_in_spice_netlist: Vec::new(),
+            sheets_not_read: Vec::new(),
+            preflight: None,
+            project_dir: PathBuf::new(),
+            inputs_hash: String::new(),
+        })
+    }
+
+    fn context(kicad_cli: &str) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: kicad_cli.to_string(),
+                ..Default::default()
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn sheet() -> &'static str {
+        "(kicad_sch (version 20250114) (generator \"eeschema\") \
+         (uuid \"00000000-0000-0000-0000-000000000001\") (paper \"A4\"))"
+    }
+
+    #[test]
+    fn a_working_engine_and_export_are_not_ready_while_preflight_has_not_run() {
+        let report = readiness_report(&engine("ok", true), &design(), "", 25);
+        assert!(report["ready"].is_null());
+        assert_eq!(report["checks"][0]["passed"], true);
+        assert_eq!(report["checks"][1]["passed"], true);
+        assert_eq!(report["checks"][2]["passed"], true);
+        assert_eq!(report["checks"][3]["ran"], false);
+    }
+
+    #[test]
+    fn a_refused_deck_is_not_ready_and_says_where() {
+        let mut refused = design().unwrap();
+        refused.deck = Err(Refusal {
+            code: flatten::RefusalCode::EncryptedModel,
+            origin: "/p/tps.lib".to_string(),
+            line: Some(2),
+            detail: "encrypted".to_string(),
+        });
+        let report = readiness_report(&engine("ok", true), &Ok(refused), "", 25);
+        assert_eq!(report["ready"], false);
+        assert_eq!(report["checks"][2]["passed"], false);
+        assert_eq!(report["checks"][2]["refusal"]["code"], "encrypted_model");
+        assert_eq!(report["checks"][2]["refusal"]["line"], 2);
+        assert!(report.get("deck").is_none());
+    }
+
+    #[test]
+    fn a_model_folder_that_cannot_be_used_is_reported_rather_than_lost() {
+        let project = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let dirs = [
+            extra.path().to_path_buf(),
+            PathBuf::from("/"),
+            home.clone(),
+            PathBuf::from("~/spice"),
+            PathBuf::from("relative"),
+            PathBuf::from("."),
+            extra.path().join("absent"),
+        ];
+        let (roots, ignored) = allowed_roots(project.path(), &dirs);
+        assert!(roots.contains(&project.path().canonicalize().unwrap()));
+        assert!(roots.contains(&extra.path().canonicalize().unwrap()));
+        assert!(!roots.iter().any(|root| root.parent().is_none()));
+        assert_eq!(ignored.len(), 6, "{ignored:?}");
+    }
+
+    #[test]
+    fn a_project_that_holds_the_home_folder_is_not_a_root() {
+        let home = dirs::home_dir().unwrap().canonicalize().unwrap();
+        let (roots, _) = allowed_roots(&home, &[]);
+        assert!(!roots.contains(&home));
+    }
+
+    #[test]
+    fn a_failed_export_cannot_claim_the_deck_was_vetted() {
+        let report = readiness_report(&engine("ok", true), &Err(anyhow::anyhow!("failed")), "", 25);
+        assert_eq!(report["checks"][2]["ran"], false);
+    }
+
+    #[test]
+    fn a_missing_engine_is_not_ready() {
+        let report = readiness_report(&engine("not_found", false), &design(), "", 25);
+        assert_eq!(report["ready"], false);
+        assert_eq!(report["checks"][0]["passed"], false);
+    }
+
+    #[test]
+    fn an_engine_check_that_could_not_run_is_unknown_not_a_failure() {
+        let report = readiness_report(&engine("not_available", false), &design(), "", 25);
+        assert!(report["ready"].is_null());
+        assert_eq!(report["checks"][0]["ran"], false);
+    }
+
+    #[test]
+    fn a_failed_export_is_not_ready_and_lists_no_nets() {
+        let report = readiness_report(
+            &engine("ok", true),
+            &Err(anyhow::anyhow!("kicad-cli exited with 2")),
+            "",
+            25,
+        );
+        assert_eq!(report["ready"], false);
+        assert_eq!(report["checks"][1]["passed"], false);
+        assert!(report["checks"][1]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("exited with 2"));
+        assert!(report.get("nets").is_none());
+        assert!(report.get("source_evidence").is_none());
+    }
+
+    #[test]
+    fn totals_are_counted_before_the_cut() {
+        let report = readiness_report(&engine("ok", true), &design(), "", 2);
+        assert_eq!(report["elements"]["total"], 5);
+        assert_eq!(report["elements"]["shown"], 2);
+        assert_eq!(report["elements"]["truncated"], true);
+        assert_eq!(report["elements"]["items"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn nets_can_be_filtered_by_name() {
+        let report = readiness_report(&engine("ok", true), &design(), "RECT_", 25);
+        assert_eq!(report["nets"]["total"], 1);
+        assert_eq!(report["nets"]["items"][0]["kicad_name"], "/rect_out");
+    }
+
+    #[test]
+    fn results_state_they_come_from_saved_files_and_name_any_locks() {
+        let report = readiness_report(&engine("ok", true), &design(), "", 25);
+        assert_eq!(report["sources"][0], "saved_schematic_snapshot");
+        assert_eq!(
+            report["source_evidence"]["excludes_unsaved_editor_state"],
+            true
+        );
+        assert_eq!(
+            report["source_evidence"]["locks_present"][0],
+            "/p/~top.kicad_sch.lck"
+        );
+    }
+
+    #[test]
+    fn export_details_drop_font_noise_and_stay_bounded() {
+        let noisy = format!(
+            "Fontconfig warning: x\nSimulation model library not found\n{}",
+            "y".repeat(5000)
+        );
+        let detail = export_detail(&noisy);
+        assert!(!detail.contains("Fontconfig"));
+        assert!(detail.contains("library not found"));
+        assert!(detail.chars().count() <= DETAIL_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn a_missing_schematic_is_a_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = json!({ "schematic": dir.path().join("absent.kicad_sch") });
+        let result = handle_check_simulation_readiness(&args, &context(""))
+            .await
+            .unwrap();
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn a_child_sheet_is_refused_with_the_root_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_sheet = "(kicad_sch (version 20250114) (generator \"eeschema\") \
+             (uuid \"00000000-0000-0000-0000-000000000001\") (paper \"A4\") \
+             (sheet (at 0 0) (size 10 10) (uuid \"00000000-0000-0000-0000-000000000002\") \
+             (property \"Sheetname\" \"C\" (at 0 0 0)) \
+             (property \"Sheetfile\" \"child.kicad_sch\" (at 0 0 0))))";
+        std::fs::write(dir.path().join("top.kicad_sch"), root_sheet).unwrap();
+        std::fs::write(dir.path().join("top.kicad_pro"), "{}").unwrap();
+        let child = dir.path().join("child.kicad_sch");
+        std::fs::write(&child, sheet()).unwrap();
+        let result =
+            handle_check_simulation_readiness(&json!({ "schematic": child }), &context(""))
+                .await
+                .unwrap();
+        assert!(result.is_error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn units_come_from_the_signal() {
+        assert_eq!(signal_unit("v(/out)"), "V");
+        assert_eq!(signal_unit("i(r1)"), "A");
+        assert_eq!(signal_unit("i(m1:d)"), "A");
+        assert_eq!(signal_unit("v1#branch"), "A");
+        assert_eq!(signal_unit("m1:power"), "W");
+        assert_eq!(signal_unit("temperature"), "");
+    }
+
+    fn net(kicad_name: &str, spice_name: &str) -> NetEntry {
+        NetEntry {
+            kicad_name: kicad_name.to_string(),
+            spice_name: spice_name.to_string(),
+            pin_count: 1,
+            in_deck: true,
+        }
+    }
+
+    #[test]
+    fn a_node_maps_back_to_the_one_net_that_makes_it() {
+        let nets = [
+            net("/OUT", "/OUT"),
+            net("/\u{5e9}", "/\u{5e9}"),
+            net("GND", "GND"),
+        ];
+        assert_eq!(kicad_net("v(/out)", &nets).as_deref(), Some("/OUT"));
+        assert_eq!(kicad_net("v(/__)", &nets).as_deref(), Some("/\u{5e9}"));
+        assert_eq!(kicad_net("i(r1)", &nets), None);
+        assert_eq!(kicad_net("v(/missing)", &nets), None);
+        let merged = [net("/\u{5e9}", "/\u{5e9}"), net("/\u{5ea}", "/\u{5ea}")];
+        assert_eq!(kicad_net("v(/__)", &merged), None);
+    }
+
+    const OP_RAW: &[u8] = include_bytes!("../../tests/fixtures/simulation/raw/op.ascii.raw");
+
+    fn op_plot() -> Plot {
+        crate::simulation::raw::parse(OP_RAW).unwrap().remove(0)
+    }
+
+    #[test]
+    fn rows_carry_the_values_with_top_level_signals_first() {
+        let mut plot = op_plot();
+        let rows = operating_point_rows(&plot, &[net("/OUT", "/OUT")]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].signal, "v(/out)");
+        assert_eq!(rows[1].net.as_deref(), Some("/OUT"));
+        assert_eq!(rows[1].value, 2.0);
+        assert_eq!(rows[1].unit, "V");
+
+        plot.variables[0].name = "v(x1.inner)".to_string();
+        let rows = operating_point_rows(&plot, &[]);
+        assert_eq!(rows[2].signal, "v(x1.inner)");
+    }
+
+    #[test]
+    fn an_operating_point_is_covered_by_one_whole_point_of_data() {
+        assert!(operating_point_covered(&op_plot()));
+        let mut cut = op_plot();
+        cut.points = 0;
+        assert!(!operating_point_covered(&cut));
+        let mut empty = op_plot();
+        empty.variables.clear();
+        assert!(!operating_point_covered(&empty));
+    }
+
+    fn flat(netlist: &str, include: &Path, roots: &[PathBuf]) -> FlatDeck {
+        let netlist = netlist.replace("INCLUDE", &include.display().to_string());
+        flatten::flatten(&DeckInputs {
+            netlist: &netlist,
+            testbench: &[],
+            project_dir: include.parent().unwrap(),
+            allowed_roots: roots,
+            compatibility: Compatibility::DEFAULT,
+            excluded_elements: &[],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_log_never_repeats_text_from_a_model_file() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let model = root.join("private.lib");
+        std::fs::write(&model, "R77 b 0 1k SECRETTOKEN=3\n.param secretparam=2\n").unwrap();
+        let deck = flat(
+            ".title t\n.include \"INCLUDE\"\nR1 own 0 1k\n",
+            &model,
+            std::slice::from_ref(&root),
+        );
+        let log = "stdout noise\n\
+                   stderr Warning: can't find the initialization file spinit.\n\
+                   stderr Note: Starting dynamic gmin stepping\n\
+                   stderr r77 b probe_int_0_r77 1k secrettoken=3\n\
+                   stderr unknown parameter (secrettoken)\n\
+                   stderr Expression err: secretparam*2}\n\
+                   stderr unknown parameter (secret__word)\n\
+                   stderr .model ddd d(secrettok ...\n\
+                   stderr r1 own 0 1k\n\
+                   stderr could not find a valid modelname\n\
+                   stderr Error: sim_status: no such variable.\n\
+                   stderr after the marker\n";
+        assert_eq!(
+            complaint_items(log, &deck),
+            [
+                "r1 own 0 1k",
+                "could not find a valid modelname",
+                "5 lines quoting a model file are in the log.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_ascii_model_word_is_recognised_after_the_engine_rewrites_it() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let model = root.join("hebrew.lib");
+        std::fs::write(&model, ".model dx D(AB\u{5e9}HIDDENPART=3)\n").unwrap();
+        let deck = flat(
+            ".title t\n.include \"INCLUDE\"\nR1 own 0 1k\n",
+            &model,
+            std::slice::from_ref(&root),
+        );
+        let log = "stderr unknown parameter (ab__hiddenpart)\n";
+        let (shown, hidden) = engine_complaints(log, &deck);
+        assert!(shown.is_empty(), "{shown:?}");
+        assert_eq!(hidden, 1);
+    }
+
+    #[test]
+    fn a_word_the_schematic_also_uses_is_not_private() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let model = root.join("shared.lib");
+        std::fs::write(&model, ".param sharedname=1\n").unwrap();
+        let deck = flat(
+            ".title t\n.include \"INCLUDE\"\n.param sharedname=2\nR1 own 0 1k\n",
+            &model,
+            std::slice::from_ref(&root),
+        );
+        let log = "stderr unknown parameter (sharedname)\n";
+        let (shown, hidden) = engine_complaints(log, &deck);
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn a_short_model_word_does_not_hide_a_line_about_the_schematic() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let model = root.join("diode.lib");
+        std::fs::write(&model, ".model dx D(IS=1e-14 N=1)\n").unwrap();
+        let deck = flat(
+            ".title t\n.include \"INCLUDE\"\nR9 own 0 1k\n",
+            &model,
+            std::slice::from_ref(&root),
+        );
+        let log = "stderr Warning: Value of resistor r9 is too small, set to 1.000000e-12\n";
+        let (shown, hidden) = engine_complaints(log, &deck);
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn a_long_model_warning_cannot_crowd_out_the_schematics_lines() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let model = root.join("big.lib");
+        std::fs::write(&model, ".param vendorsecret=1\n").unwrap();
+        let deck = flat(
+            ".title t\n.include \"INCLUDE\"\nR1 own 0 1k\n",
+            &model,
+            std::slice::from_ref(&root),
+        );
+        let log = format!(
+            "{}stderr r1 own 0 1k\n",
+            "stderr bad vendorsecret\n".repeat(50)
+        );
+        let (shown, hidden) = engine_complaints(&log, &deck);
+        assert_eq!(shown, ["r1 own 0 1k"]);
+        assert_eq!(hidden, 50);
+    }
+
+    #[test]
+    fn complaints_are_bounded() {
+        let log = format!("stderr {}\n", "x".repeat(5_000)).repeat(100);
+        let (complaints, _) = engine_complaints(&log, &FlatDeck::default());
+        assert_eq!(complaints.len(), MAX_LOG_ITEMS);
+        assert_eq!(complaints[0].chars().count(), MAX_LOG_ITEM_CHARS);
+    }
+
+    #[test]
+    fn a_changed_source_or_model_changes_the_hash() {
+        let folder = tempfile::tempdir().unwrap();
+        let sources = folder.path().join("src");
+        std::fs::create_dir_all(sources.join("sub")).unwrap();
+        std::fs::write(sources.join("top.kicad_sch"), "a").unwrap();
+        std::fs::write(sources.join("sub/one.kicad_sch"), "b").unwrap();
+        let model = folder.path().join("m.lib");
+        std::fs::write(&model, "m").unwrap();
+        let hash = || {
+            let models = std::slice::from_ref(&model);
+            inputs_hash(hash_sources(&sources).unwrap(), models).unwrap()
+        };
+        let first = hash();
+        assert_eq!(hash(), first);
+        std::fs::write(sources.join("sub/one.kicad_sch"), "c").unwrap();
+        let second = hash();
+        assert_ne!(second, first);
+        std::fs::write(&model, "n").unwrap();
+        assert_ne!(hash(), second);
+    }
+
+    fn transient(analysis: Value) -> Result<Transient, CallToolResult> {
+        Transient::from_args(&analysis)
+    }
+
+    #[test]
+    fn a_transient_line_holds_only_numbers_written_here() {
+        let line = |analysis: Value| transient(analysis).unwrap().line();
+        assert_eq!(line(json!({ "stop_time_seconds": 10 })), ".tran 5e-3 1e1");
+        assert_eq!(
+            line(json!({ "stop_time_seconds": 1, "max_step_seconds": 1e-6 })),
+            ".tran 5e-4 1e0 0e0 1e-6"
+        );
+        assert_eq!(
+            line(json!({ "stop_time_seconds": 1, "start_save_seconds": 0.5 })),
+            ".tran 5e-4 1e0 5e-1 5e-4"
+        );
+        assert_eq!(
+            line(json!({
+                "stop_time_seconds": 1,
+                "start_save_seconds": 0.5,
+                "max_step_seconds": 1e-3,
+                "use_initial_conditions": true
+            })),
+            ".tran 5e-4 1e0 5e-1 1e-3 uic"
+        );
+    }
+
+    #[test]
+    fn a_transient_the_engine_could_not_take_is_refused_with_its_field() {
+        let refused = |analysis: Value, field: &str| {
+            let result = transient(analysis).unwrap_err();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["error"]["field"], field, "{body}");
+        };
+        let stop = "analysis.stop_time_seconds";
+        refused(json!({}), stop);
+        refused(json!({ "stop_time_seconds": 0 }), stop);
+        refused(json!({ "stop_time_seconds": -1 }), stop);
+        refused(json!({ "stop_time_seconds": "soon" }), stop);
+        refused(json!({ "stop_time_seconds": 1e-16 }), stop);
+        refused(json!({ "stop_time_seconds": 1e7 }), stop);
+        let step = "analysis.max_step_seconds";
+        refused(
+            json!({ "stop_time_seconds": 1, "max_step_seconds": 0 }),
+            step,
+        );
+        refused(
+            json!({ "stop_time_seconds": 1, "max_step_seconds": -1 }),
+            step,
+        );
+        refused(
+            json!({ "stop_time_seconds": 1, "max_step_seconds": 1e-20 }),
+            step,
+        );
+        refused(
+            json!({ "stop_time_seconds": 1, "max_step_seconds": 2 }),
+            step,
+        );
+        let start = "analysis.start_save_seconds";
+        refused(
+            json!({ "stop_time_seconds": 1, "start_save_seconds": 1 }),
+            start,
+        );
+        refused(
+            json!({ "stop_time_seconds": 1, "start_save_seconds": -1 }),
+            start,
+        );
+    }
+
+    fn time_plot(last: f64) -> Plot {
+        let text = format!(
+            "Title: t\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 2\n\
+             No. Points: 2\nVariables:\n\t0\ttime\ttime\n\t1\tv(a)\tvoltage\nValues:\n\
+             0\t0.0\n\t1.0\n1\t{last:e}\n\t2.0\n"
+        );
+        crate::simulation::raw::parse(text.as_bytes())
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn a_transient_is_covered_only_by_reaching_its_stop_time() {
+        let run = transient(json!({ "stop_time_seconds": 1.0 })).unwrap();
+        assert!(run.covered(&time_plot(1.0)));
+        assert!(run.covered(&time_plot(1.0 - 1e-7)));
+        assert!(!run.covered(&time_plot(1.0 - 1e-5)));
+        assert!(!run.covered(&time_plot(0.5)));
+        assert!(!run.covered(&op_plot()));
+    }
+
+    #[test]
+    fn a_file_cut_short_never_covers_a_transient() {
+        let run = transient(json!({ "stop_time_seconds": 1.0 })).unwrap();
+        let mut plot = time_plot(1.0);
+        plot.declared_points += 1;
+        assert!(!run.covered(&plot));
+    }
+
+    #[test]
+    fn only_a_transient_takes_signals_and_measurements() {
+        let op = json!({ "kind": "operating_point" });
+        let run = json!({ "kind": "transient", "stop_time_seconds": 1 });
+        let none = Value::Null;
+        let signals = json!(["v(a)"]);
+        let measurements = json!([{ "kind": "max", "signal": "v(a)" }]);
+        assert!(Wanted::from_args(&op, &none, &none, 0).is_ok());
+        assert!(Wanted::from_args(&op, &signals, &none, 0).is_err());
+        assert!(Wanted::from_args(&op, &none, &measurements, 0).is_err());
+        assert!(Wanted::from_args(&op, &none, &none, 4).is_err());
+        assert!(Wanted::from_args(&run, &signals, &measurements, 4).is_ok());
+    }
+
+    #[test]
+    fn an_envelope_with_no_signals_or_a_bad_signal_is_refused() {
+        let run = json!({ "kind": "transient", "stop_time_seconds": 1 });
+        let none = Value::Null;
+        assert!(Wanted::from_args(&run, &none, &none, 4).is_err());
+        assert!(Wanted::from_args(&run, &json!(["x(a)"]), &none, 0).is_err());
+        let many = json!(vec!["v(a)"; MAX_SIGNALS + 1]);
+        assert!(Wanted::from_args(&run, &many, &none, 0).is_err());
+        let wanted = json!({ "kind": "max", "signal": "v(a)" });
+        let many = json!(vec![wanted; MAX_MEASUREMENTS + 1]);
+        assert!(Wanted::from_args(&run, &none, &many, 0).is_err());
+    }
+
+    #[test]
+    fn subcircuit_bodies_are_not_top_level_elements() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = [root.path().to_path_buf()];
+        let netlist = ".title t\nR1 a 0 1k\n.subckt s a\nR2 a 0 1k\n.SUBCKT t a\nR3 a 0 1k\n.ends\nR4 a 0 1k\n.ENDS s\nM1 a a 0 0 n\n.model n NMOS\n+ VTO=1\n.end\n";
+        let deck = flat(netlist, root.path(), &roots);
+        assert_eq!(top_level_elements(&deck), ["R1", "M1"]);
+    }
+
+    #[test]
+    fn a_node_condition_is_seen_in_any_case_and_a_device_value_is_not_one() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = [root.path().to_path_buf()];
+        let with = |card: &str| {
+            let netlist = format!(".title t\nR1 a 0 1k\nC1 a 0 1u IC=1\n{card}.end\n");
+            sets_node_conditions(&flat(&netlist, root.path(), &roots))
+        };
+        assert!(with(".ic v(a)=5\n"));
+        assert!(with(".IC V(a)=5\n"));
+        assert!(with(".nodeset v(a)=5\n"));
+        assert!(with(".NODESET V(a)=5\n"));
+        assert!(!with(""));
+    }
+
+    #[test]
+    fn a_probe_goes_ahead_of_the_analysis_and_after_the_saves() {
+        let run = Analysis::Transient(transient(json!({ "stop_time_seconds": 1 })).unwrap());
+        let probes = [".probe p(R1)".to_string()];
+        assert_eq!(
+            own_lines(&run, true, &probes),
+            [".save all", ".probe alli", ".probe p(R1)", ".tran 5e-4 1e0"]
+        );
+        assert_eq!(
+            own_lines(&Analysis::OperatingPoint, false, &[]),
+            [".save all", ".op"]
+        );
+    }
+
+    #[test]
+    fn the_engine_answering_a_halt_is_not_a_complaint() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = [root.path().to_path_buf()];
+        let deck = flat(".title t\nR1 a 0 1k\n.end\n", root.path(), &roots);
+        let log = "stderr doAnalyses: pause requested\nstderr run simulation interrupted\n\
+                   stderr something else\n";
+        let (shown, hidden) = engine_complaints(log, &deck);
+        assert_eq!(shown, ["something else"]);
+        assert_eq!(hidden, 0);
+    }
+
+    /// Unix only: every fake tool here is a shell script with an empty Windows
+    /// body, and one test changes directory permissions with Unix mode bits.
+    /// The Windows CI build stopped on the latter (`std::os::unix` does not
+    /// exist there), and the rest could never run on Windows.
+    #[cfg(unix)]
+    mod with_fake_cli {
+        use super::*;
+        /// Copperpour's `write_script` writes the body as given. Linux does not run
+        /// a script without a `#!` line (execve fails with ENOEXEC, "Exec format
+        /// error"); these tests were written on macOS, so this adds `#!/bin/sh`
+        /// when the body has none (merge adaptation, plan step 4).
+        fn write_script(
+            dir: &std::path::Path,
+            stem: &str,
+            unix_body: &str,
+            windows_body: &str,
+        ) -> std::path::PathBuf {
+            let body = if unix_body.starts_with("#!") {
+                unix_body.to_owned()
+            } else {
+                format!("#!/bin/sh\n{unix_body}")
+            };
+            crate::tools::cli::test_support::write_script(dir, stem, &body, windows_body)
+        }
+
+        const OP_FIXTURE: &str = "tests/fixtures/simulation/raw/op.ascii.raw";
+        /// Good status fields, for a fake worker to write.
+        const GOOD: &str = r#""protocol":3,"load_error":null,"engine_version":"44.2","code_models_loaded":["analog"],"code_models_failed":[],"exit_status":null"#;
+
+        /// Answers a probe as a working engine, then does `job` in the run folder.
+        fn fake_worker(dir: &Path, job: &str) -> PathBuf {
+            let body = format!(
+                "case \"$*\" in *--probe*)\n\
+                   echo '{{\"protocol\":{PROTOCOL_VERSION},\"load_error\":null,\"engine_version\":\"44.2\",\
+                 \"code_models_loaded\":[\"analog\"],\"code_models_failed\":[],\"exit_callback\":false}}'\n\
+                   exit 0 ;;\n\
+                 esac\n{job}\n"
+            );
+            write_script(dir, "fake-worker", &body, "")
+        }
+
+        fn status_json(sim_status: &str, halted: &str, written: bool) -> String {
+            format!(
+                "cat > status.json <<'JSON'\n{{{GOOD},\"sim_status\":{sim_status},\
+                 \"halted_reason\":{halted},\"results_written\":{written}}}\nJSON"
+            )
+        }
+
+        fn copy_raw() -> String {
+            let raw = Path::new(env!("CARGO_MANIFEST_DIR")).join(OP_FIXTURE);
+            format!("cp '{}' results.raw", raw.display())
+        }
+
+        /// A transient of three points: `v(a)` climbs 0, 1, 2 over 2 s.
+        fn copy_transient() -> String {
+            "cat > results.raw <<'RAW'\nTitle: t\nPlotname: Transient Analysis\nFlags: real\n\
+             No. Variables: 3\nNo. Points: 3\nVariables:\n\t0\ttime\ttime\n\
+             \t1\tv(a)\tvoltage\n\t2\ti(m1:d)\tcurrent\nValues:\n\
+             0\t0.0\n\t0.0\n\t5.0\n1\t1.0\n\t1.0\n\t5.0\n2\t2.0\n\t2.0\n\t5.0\n\nRAW"
+                .to_string()
+        }
+
+        fn transient_args(root: &Path, stop: f64) -> Value {
+            let mut arguments = args(root);
+            arguments["analysis"] = json!({ "kind": "transient", "stop_time_seconds": stop });
+            arguments["signals"] = json!(["v(a)"]);
+            arguments["measurements"] = json!([
+                { "name": "top", "kind": "max", "signal": "v(a)" },
+                { "kind": "crossing", "signal": "v(a)", "level": 9.0 }
+            ]);
+            arguments
+        }
+
+        #[tokio::test]
+        async fn a_finished_transient_counts_every_unit_and_a_null_is_not_a_failure() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let (failed, body) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+            assert_eq!(body["outcome"]["requested"], 4);
+            assert_eq!(body["outcome"]["completed"], 4);
+            assert_eq!(body["analysis"]["coverage_ratio"], 1.0);
+            assert_eq!(body["analysis"]["simulated_to_seconds"], 2.0);
+            assert_eq!(body["analysis"]["stop_time_seconds"], 2.0);
+            assert_eq!(body["analysis"]["points"], 3);
+            assert_eq!(body["measurements"][0]["value"], 2.0);
+            assert_eq!(body["measurements"][0]["window_truncated"], false);
+            assert!(body["measurements"][1]["value"].is_null());
+            assert_eq!(body["measurements"][1]["finding"], "level_not_reached");
+            assert_eq!(body["signal_summaries"][0]["final"], 2.0);
+            assert!(body.get("operating_point").is_none());
+            assert!(body.get("stopped").is_none());
+            let dirs = run_dirs(&scene);
+            let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+            assert!(deck.contains("\n.tran 1e-3 2e0\n.end"), "{deck}");
+        }
+
+        #[tokio::test]
+        async fn no_summaries_or_measurements_come_back_unless_asked_for() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = json!({ "kind": "transient", "stop_time_seconds": 2.0 });
+            let (_, body) = call(&scene, arguments).await;
+            assert_eq!(body["outcome"]["requested"], 2, "{body}");
+            assert!(body.get("signal_summaries").is_none(), "{body}");
+            assert!(body.get("measurements").is_none(), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_run_that_stops_early_is_partial_and_keeps_its_data_flagged() {
+            for reason in ["timeout", "size_limit"] {
+                let halted = format!("\"{reason}\"");
+                let job = format!("{}\n{}", copy_transient(), status_json("0", &halted, true));
+                let scene = scene(&job);
+                let (failed, body) = call(&scene, transient_args(&scene.root, 4.0)).await;
+                assert!(!failed, "{body}");
+                assert_eq!(body["outcome"]["status"], "partial", "{body}");
+                assert_eq!(body["outcome"]["requested"], 4);
+                assert_eq!(body["outcome"]["completed"], 1);
+                assert_eq!(body["outcome"]["failed"], 3);
+                assert_eq!(body["stopped"]["reason"], reason);
+                assert_eq!(body["stopped"]["at_point"], 3);
+                assert_eq!(body["analysis"]["coverage_ratio"], 0.5);
+                assert_eq!(body["measurements"][0]["value"], 2.0, "{body}");
+                assert_eq!(body["measurements"][0]["window_truncated"], true);
+                assert_eq!(body["measurements"][1]["window_truncated"], true);
+                assert_eq!(body["signal_summaries"][0]["window_truncated"], true);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_run_short_of_its_stop_time_is_never_complete() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let (_, body) = call(&scene, transient_args(&scene.root, 4.0)).await;
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["stopped"]["reason"], "incomplete_coverage");
+        }
+
+        #[tokio::test]
+        async fn a_run_that_lost_convergence_names_the_node() {
+            let job = format!(
+                "echo 'stderr doAnalyses: TRAN:  Timestep too small: trouble with node \"x1\"' \
+                 > engine.log\n{}\n{}",
+                copy_transient(),
+                status_json("1", "null", true)
+            );
+            let scene = scene(&job);
+            let (_, body) = call(&scene, transient_args(&scene.root, 4.0)).await;
+            assert_eq!(body["stopped"]["reason"], "no_convergence", "{body}");
+            assert_eq!(body["stopped"]["node"], "x1", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_signal_the_run_does_not_hold_is_partial_and_names_it() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["signals"] = json!(["v(zzz)"]);
+            arguments["measurements"] = json!([
+                { "kind": "max", "signal": "v(a)" },
+                { "kind": "max", "signal": "i(M1)" }
+            ]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["outcome"]["requested"], 4);
+            assert_eq!(body["outcome"]["failed"], 2);
+            assert_eq!(body["measurements"][0]["value"], 2.0);
+            assert_eq!(body["measurements"][1]["finding"], "signal_not_found");
+            assert_eq!(body["measurements"][1]["pins"], json!(["d"]));
+            assert_eq!(body["signal_summaries"][0]["finding"], "signal_not_found");
+            assert!(body.get("stopped").is_none());
+        }
+
+        fn run_from_half_a_second(start_save: f64) -> (String, Value) {
+            let job = format!(
+                "{}\nsed -i.bak 's/^0\\t0.0$/0\\t0.5/' results.raw\n{}",
+                copy_transient(),
+                status_json("0", "null", true)
+            );
+            (
+                job,
+                json!({
+                    "kind": "transient",
+                    "stop_time_seconds": 2.0,
+                    "start_save_seconds": start_save,
+                }),
+            )
+        }
+
+        #[tokio::test]
+        async fn a_save_start_at_zero_does_not_silence_the_missing_point() {
+            let (job, analysis) = run_from_half_a_second(0.0);
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = analysis;
+            let (_, body) = call(&scene, arguments).await;
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("no_point_at_start"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_late_save_start_is_not_a_missing_point() {
+            let (job, analysis) = run_from_half_a_second(0.4);
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = analysis;
+            let (_, body) = call(&scene, arguments).await;
+            let warnings = body["warnings"].to_string();
+            assert!(!warnings.contains("no_point_at_start"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_run_that_starts_at_zero_gives_no_start_warning() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let (_, body) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            assert_eq!(body["analysis"]["first_point_seconds"], 0.0, "{body}");
+            assert!(!body["warnings"].to_string().contains("no_point_at_start"));
+            assert_eq!(body["signal_summaries"][0]["window_truncated"], false);
+        }
+
+        #[tokio::test]
+        async fn a_summary_signal_alone_can_make_a_run_partial() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = json!({ "kind": "transient", "stop_time_seconds": 2.0 });
+            arguments["signals"] = json!(["v(zzz)"]);
+            let (_, body) = call(&scene, arguments).await;
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["outcome"]["requested"], 2);
+            assert_eq!(body["outcome"]["completed"], 1);
+        }
+
+        #[tokio::test]
+        async fn a_measurement_that_does_not_fit_is_refused_before_the_engine_starts() {
+            let scene = scene("touch worker-ran");
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["measurements"] = json!([{ "kind": "max", "signal": "nonsense" }]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], "measurements[0].signal");
+            assert_eq!(body["outcome"]["status"], "failed");
+            assert!(!scene.state.path().join("simulation").exists());
+        }
+
+        #[tokio::test]
+        async fn a_size_limit_that_left_no_data_says_so() {
+            fails_with(
+                &status_json("0", "\"size_limit\"", false),
+                "size_limit",
+                "run",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_power_probe_names_the_deck_element_and_never_the_callers_text() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["testbench"]["spice_lines"] = json!(["VX a 0 1", "RX a 0 1k"]);
+            arguments["signals"] = json!(["p(rx)", "p(NOPE)", "p(rx)"]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            let dirs = run_dirs(&scene);
+            let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+            assert_eq!(deck.matches(".probe p(").count(), 1, "{deck}");
+            assert!(deck.contains("\n.probe p(RX)\n"), "{deck}");
+            assert!(!deck.to_lowercase().contains("nope"), "{deck}");
+        }
+
+        fn with_initial_conditions(root: &Path, line: &str) -> Value {
+            let mut arguments = args(root);
+            arguments["analysis"] = json!({
+                "kind": "transient",
+                "stop_time_seconds": 2.0,
+                "use_initial_conditions": true,
+            });
+            arguments["signals"] = json!(["p(RX)"]);
+            arguments["testbench"]["spice_lines"] = json!(["VX a 0 1", "RX a 0 1k", line]);
+            arguments
+        }
+
+        #[tokio::test]
+        async fn a_node_condition_under_uic_keeps_every_probe_out_of_the_deck() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let arguments = with_initial_conditions(&scene.root, ".ic v(a)=5");
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            let deck = std::fs::read_to_string(run_dirs(&scene)[0].join(DECK_FILE)).unwrap();
+            assert!(!deck.contains(".probe"), "{deck}");
+            assert!(deck.contains("uic\n"), "{deck}");
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("device_currents_not_saved"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_callers_probe_that_would_lose_a_condition_is_refused() {
+            let scene = scene("touch worker-ran");
+            let mut arguments = with_initial_conditions(&scene.root, ".ic v(a)=5");
+            arguments["testbench"]["spice_lines"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(".probe alli"));
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(
+                body["error"]["reason"], "probe_loses_initial_conditions",
+                "{body}"
+            );
+            assert_eq!(body["error"]["items"][0], ".probe alli");
+            assert!(!scene.state.path().join("simulation").exists());
+        }
+
+        /// The protection stand-ins the skill shows, under their fixture names.
+        const PROTECTION_DECKS: [&str; 5] = ["short", "fuse", "efuse", "uvlo", "reverse"];
+
+        fn protection_lines(name: &str) -> Vec<String> {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/simulation/protection")
+                .join(format!("{name}.sp"));
+            let text = std::fs::read_to_string(path).unwrap();
+            text.lines().map(str::to_owned).collect()
+        }
+
+        fn protection_args(root: &Path, lines: &[String], uic: bool) -> Value {
+            let mut arguments = transient_args(root, 2.0);
+            arguments["analysis"]["use_initial_conditions"] = json!(uic);
+            arguments["testbench"] = json!({ "exclude_references": ["*"], "spice_lines": lines });
+            arguments
+        }
+
+        /// Hosted CI has no engine, so this is the part of the contract it can hold:
+        /// vetting keeps every line, preflight raises nothing, and no stand-in adds
+        /// a card PR 7 refuses. `protection/spliced.sp` needs the rectifier demo's own
+        /// parts, so only the live test runs it.
+        #[tokio::test]
+        async fn every_protection_stand_in_passes_vetting_and_preflight_untouched() {
+            for name in PROTECTION_DECKS {
+                for uic in [false, true] {
+                    let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+                    let scene = scene(&job);
+                    let lines = protection_lines(name);
+                    let (failed, body) =
+                        call(&scene, protection_args(&scene.root, &lines, uic)).await;
+                    assert!(!failed, "{name}: {body}");
+                    assert_eq!(body["simulated_circuit"], "modified", "{name}");
+                    // The stand-ins are lines the caller adds, so the one warning
+                    // is the disclosure that results depend on added lines.
+                    let codes: Vec<&str> = body["warnings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|warning| warning["code"].as_str())
+                        .collect();
+                    assert_eq!(codes, ["testbench_elements_added"], "{name}, uic {uic}");
+
+                    let dirs = run_dirs(&scene);
+                    let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+                    for line in lines.iter().filter(|line| !line.starts_with('*')) {
+                        assert!(
+                            deck.lines().any(|kept| kept == line),
+                            "{name} lost {line}\n{deck}"
+                        );
+                    }
+                    // The only probe is Copperpour's own, and with no `.ic` it stays under uic.
+                    assert_eq!(deck.matches(".probe").count(), 1, "{name}: {deck}");
+                    assert!(deck.contains("\n.probe alli\n"), "{name}: {deck}");
+                    for refused in [".ic", ".nodeset", "\nk", ".options interp"] {
+                        assert!(!deck.to_lowercase().contains(refused), "{name}: {refused}");
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_callers_probe_is_left_alone_without_a_condition_to_lose() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["testbench"]["spice_lines"] =
+                json!(["VX a 0 1", "RX a 0 1k", ".ic v(a)=5", ".probe alli"]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_device_condition_under_uic_keeps_its_probes() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let arguments = with_initial_conditions(&scene.root, "CX a 0 1u IC=1");
+            call(&scene, arguments).await;
+            let deck = std::fs::read_to_string(run_dirs(&scene)[0].join(DECK_FILE)).unwrap();
+            assert!(deck.contains(".probe alli"), "{deck}");
+            assert!(deck.contains(".probe p(RX)"), "{deck}");
+        }
+
+        #[tokio::test]
+        async fn a_run_with_no_point_at_zero_says_so() {
+            let job = format!(
+                "{}\nsed -i.bak 's/^0\\t0.0$/0\\t0.5/' results.raw\n{}",
+                copy_transient(),
+                status_json("0", "null", true)
+            );
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = json!({ "kind": "transient", "stop_time_seconds": 2.0 });
+            let (_, body) = call(&scene, arguments).await;
+            assert_eq!(body["analysis"]["first_point_seconds"], 0.5, "{body}");
+            assert!(
+                body["warnings"].to_string().contains("no_point_at_start"),
+                "{body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_worker_is_told_the_size_limit() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["max_raw_bytes"] = json!(5_000_000);
+            call(&scene, arguments).await;
+            let dirs = run_dirs(&scene);
+            let request: RunRequest =
+                serde_json::from_slice(&std::fs::read(dirs[0].join(REQUEST_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(request.max_raw_bytes, 5_000_000);
+        }
+
+        struct Scene {
+            tools: tempfile::TempDir,
+            project: tempfile::TempDir,
+            state: tempfile::TempDir,
+            ctx: ToolContext,
+            root: PathBuf,
+        }
+
+        fn scene(job: &str) -> Scene {
+            let tools = tempfile::tempdir().unwrap();
+            let project_dir = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let root = project(project_dir.path());
+            let cli = exporting_cli(tools.path());
+            let library = tools.path().join("libngspice.dylib");
+            std::fs::write(&library, "").unwrap();
+            let ctx = context(cli.to_str().unwrap());
+            let mut runtime = SimulationRuntime::new(
+                fake_worker(tools.path(), job),
+                crate::simulation::SimulationSettings {
+                    ngspice_library: library.display().to_string(),
+                    allow_digital_models: true,
+                    ..Default::default()
+                },
+            );
+            runtime.state_root = Some(state.path().to_path_buf());
+            ctx.simulation.set(Arc::new(runtime)).ok();
+            Scene {
+                tools,
+                project: project_dir,
+                state,
+                ctx,
+                root,
+            }
+        }
+
+        /// The fixture's unmodelled parts are gone, so the deck is modified.
+        fn args(root: &Path) -> Value {
+            json!({
+                "schematic": root,
+                "analysis": { "kind": "operating_point" },
+                "testbench": { "exclude_references": ["D1", "V1", "R1"] },
+            })
+        }
+
+        async fn call(scene: &Scene, arguments: Value) -> (bool, Value) {
+            let result = handle_run_simulation(&arguments, &scene.ctx).await.unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            (result.is_error, serde_json::from_str(text).unwrap())
+        }
+
+        fn run_dirs(scene: &Scene) -> Vec<PathBuf> {
+            let projects = scene.state.path().join("simulation");
+            std::fs::read_dir(projects)
+                .unwrap()
+                .flatten()
+                .flat_map(|project| std::fs::read_dir(project.path()).unwrap().flatten())
+                .map(|run| run.path())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_clean_run_reads_complete_and_says_what_it_simulated() {
+            let job = format!("{}\n{}", copy_raw(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let (failed, body) = call(&scene, args(&scene.root)).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+            assert_eq!(body["outcome"]["requested"], 2);
+            assert_eq!(body["outcome"]["completed"], 2);
+            assert_eq!(body["simulated_circuit"], "modified");
+            assert_eq!(
+                body["circuit"]["excluded_references"],
+                json!(["D1", "R1", "V1"])
+            );
+            assert_eq!(body["analysis"]["coverage_ratio"], 1.0);
+            assert_eq!(body["operating_point"]["total"], 3);
+            assert_eq!(body["operating_point"]["rows"][1]["value"], 2.0);
+            assert_eq!(body["engine"]["version"], "44.2");
+            assert_eq!(
+                body["source_evidence"]["excludes_unsaved_editor_state"],
+                true
+            );
+            assert_eq!(
+                body["source_evidence"]["inputs_hash"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                64
+            );
+            assert!(runs::is_valid_id(body["run_id"].as_str().unwrap()));
+            assert!(body.get("stopped").is_none());
+
+            let dirs = run_dirs(&scene);
+            assert_eq!(dirs.len(), 1);
+            let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+            let tail: Vec<&str> = deck.lines().rev().take(4).collect();
+            assert_eq!(tail, [".end", ".op", ".probe alli", ".save all"], "{deck}");
+            assert!(dirs[0].join(OPERATING_POINT_FILE).is_file());
+            assert!(body["artifacts"]["table_path"]
+                .as_str()
+                .unwrap()
+                .ends_with(OPERATING_POINT_FILE));
+            assert!(!scene.project.path().join("results.raw").exists());
+        }
+
+        #[tokio::test]
+        async fn the_limit_cuts_rows_after_counting_them() {
+            let job = format!("{}\n{}", copy_raw(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["limit"] = json!(1);
+            let (_, body) = call(&scene, arguments).await;
+            assert_eq!(body["operating_point"]["total"], 3, "{body}");
+            assert_eq!(body["operating_point"]["shown"], 1);
+            assert_eq!(body["operating_point"]["truncated"], true);
+            assert_eq!(body["operating_point"]["rows"].as_array().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_halted_run_with_data_is_partial_and_keeps_the_data() {
+            let job = format!("{}\n{}", copy_raw(), status_json("0", "\"timeout\"", true));
+            let scene = scene(&job);
+            let (failed, body) = call(&scene, args(&scene.root)).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "partial");
+            assert_eq!(body["outcome"]["completed"], 1);
+            assert_eq!(body["outcome"]["failed"], 1);
+            assert_eq!(body["stopped"]["reason"], "timeout");
+            assert_eq!(body["operating_point"]["total"], 3);
+        }
+
+        async fn fails_with(job: &str, reason: &str, stage: &str) -> Value {
+            let scene = scene(job);
+            let (failed, body) = call(&scene, args(&scene.root)).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["kind"], "simulation_failed", "{body}");
+            assert_eq!(body["error"]["reason"], reason, "{body}");
+            assert_eq!(body["error"]["stage"], stage, "{body}");
+            assert_eq!(body["outcome"]["status"], "failed", "{body}");
+            assert_eq!(body["outcome"]["failed"], 2);
+            body
+        }
+
+        #[tokio::test]
+        async fn a_crash_is_a_typed_failure_that_names_the_signal() {
+            let body = fails_with("kill -SEGV $$", "engine_crashed", "run").await;
+            assert_eq!(body["error"]["items"][0], "signal 11");
+            assert!(body["error"]["log_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("engine.log"));
+
+            let scene = scene("kill -SEGV $$");
+            let (failed, _) = call(&scene, args(&scene.root)).await;
+            assert!(failed);
+            let after =
+                handle_check_simulation_readiness(&json!({ "schematic": scene.root }), &scene.ctx)
+                    .await
+                    .unwrap();
+            assert!(!after.is_error, "the server must carry on after a crash");
+        }
+
+        #[tokio::test]
+        async fn every_run_failure_has_its_reason() {
+            let no_data = status_json("1", "null", false);
+            fails_with(&no_data, "no_convergence", "run").await;
+            let no_parse = status_json("null", "null", false);
+            fails_with(&no_parse, "circuit_not_parsed", "run").await;
+            let halted = status_json("0", "\"timeout\"", false);
+            fails_with(&halted, "timed_out", "run").await;
+            let lost = status_json("0", "null", true);
+            fails_with(&lost, "results_unreadable", "results").await;
+            fails_with("exit 124", "timed_out", "run").await;
+            let exited = "cat > status.json <<'JSON'\n{\"protocol\":3,\"load_error\":null,\
+                 \"engine_version\":null,\"code_models_loaded\":[],\"code_models_failed\":[],\
+                 \"exit_status\":1,\"sim_status\":null,\
+                 \"halted_reason\":null,\"results_written\":false}\nJSON"
+                .to_string();
+            fails_with(&exited, "engine_failed", "run").await;
+            let unloaded = exited.replace("\"load_error\":null", "\"load_error\":\"no\"");
+            let body = fails_with(&unloaded, "engine_load_failed", "engine").await;
+            assert_eq!(body["error"]["items"][0], "no");
+        }
+
+        #[tokio::test]
+        async fn what_the_engine_ignored_reaches_a_complete_result() {
+            let job = format!(
+                "echo 'stderr unrecognized parameter (bogus) - ignored' > engine.log\n{}\n{}",
+                copy_raw(),
+                status_json("0", "null", true)
+            );
+            let scene = scene(&job);
+            let (failed, body) = call(&scene, args(&scene.root)).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "complete");
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("engine_messages"), "{body}");
+            assert!(
+                warnings.contains("unrecognized parameter (bogus)"),
+                "{body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_probe_past_the_budget_reads_as_out_of_time() {
+            let scene = scene("touch worker-ran");
+            let body = "case \"$*\" in *--probe*) exec /bin/sleep 20 ;; esac\n";
+            let worker = write_script(scene.tools.path(), "fake-worker", body, "");
+            let mut runtime = (**scene.ctx.simulation.get().unwrap()).clone();
+            runtime.set_worker_exe(worker);
+            let ctx = context("kicad-cli");
+            ctx.simulation.set(Arc::new(runtime)).ok();
+            let scene = Scene { ctx, ..scene };
+            let mut arguments = args(&scene.root);
+            arguments["timeout_seconds"] = json!(1);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "timed_out", "{body}");
+            assert_eq!(body["error"]["stage"], "engine");
+        }
+
+        #[tokio::test]
+        async fn the_budget_covers_the_export() {
+            let scene = scene("touch worker-ran");
+            let slow = write_script(scene.tools.path(), "slow-cli", "exec /bin/sleep 20\n", "");
+            let ctx = context(slow.to_str().unwrap());
+            let runtime = scene.ctx.simulation.get().unwrap().clone();
+            ctx.simulation.set(runtime).ok();
+            let scene = Scene { ctx, ..scene };
+            let mut arguments = args(&scene.root);
+            arguments["timeout_seconds"] = json!(1);
+            let started = Instant::now();
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(
+                body["error"]["reason"], "netlist_export_timed_out",
+                "{body}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+
+        #[tokio::test]
+        async fn a_file_the_worker_did_not_report_is_not_read() {
+            let job = format!("{}\n{}", copy_raw(), status_json("1", "null", false));
+            fails_with(&job, "no_convergence", "run").await;
+        }
+
+        #[tokio::test]
+        async fn a_digital_circuit_saves_no_device_currents_and_says_so() {
+            let job = format!("{}\n{}", copy_raw(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["testbench"]["spice_lines"] = json!([
+                "A1 [/rect_out] [dout] inv",
+                ".model inv d_inverter",
+                "R9 dout 0 1k",
+            ]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            assert!(body["warnings"]
+                .to_string()
+                .contains("device_currents_not_saved"));
+            let deck = std::fs::read_to_string(run_dirs(&scene)[0].join(DECK_FILE)).unwrap();
+            assert!(deck.contains(".save all"), "{deck}");
+            assert!(!deck.contains(".probe alli"), "{deck}");
+        }
+
+        #[tokio::test]
+        async fn a_constants_only_file_reads_as_no_results() {
+            let raw = "Title: t\nPlotname: constants\nFlags: real\nNo. Variables: 1\n\
+                       No. Points: 1\nVariables:\n\t0\tpi\tnotype\nValues:\n 0\t3.0\n\n";
+            let job = format!(
+                "printf '{raw}' > results.raw\n{}",
+                status_json("0", "null", true)
+            );
+            fails_with(&job, "results_unreadable", "results").await;
+        }
+
+        #[tokio::test]
+        async fn a_failed_preflight_never_starts_the_worker() {
+            let job = "touch worker-ran";
+            let scene = scene(job);
+            let arguments = json!({
+                "schematic": scene.root,
+                "analysis": { "kind": "operating_point" },
+            });
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "unmodelled_symbols", "{body}");
+            assert_eq!(body["error"]["stage"], "preflight");
+            assert_eq!(body["error"]["items"], json!(["D1", "V1"]));
+            assert_eq!(body["outcome"]["status"], "failed");
+            assert!(!scene.state.path().join("simulation").exists());
+        }
+
+        #[tokio::test]
+        async fn a_floating_group_refuses_an_operating_point() {
+            let scene = scene("touch worker-ran");
+            let mut arguments = args(&scene.root);
+            arguments["testbench"]["spice_lines"] = json!(["Vx fl1 fl2 1", "Rx fl1 fl2 1k"]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "floating_subcircuit", "{body}");
+            assert!(!scene.state.path().join("simulation").exists());
+        }
+
+        #[tokio::test]
+        async fn a_refused_deck_names_the_form_and_stops_there() {
+            let scene = scene("touch worker-ran");
+            let mut arguments = args(&scene.root);
+            arguments["testbench"]["spice_lines"] = json!([".control"]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "unsafe_deck_content", "{body}");
+            assert!(!scene.state.path().join("simulation").exists());
+        }
+
+        #[tokio::test]
+        async fn a_broken_export_is_a_typed_failure() {
+            let scene = scene("touch worker-ran");
+            let broken = write_script(scene.tools.path(), "broken-cli", "exit 2\n", "");
+            let ctx = context(broken.to_str().unwrap());
+            let runtime = scene.ctx.simulation.get().unwrap().clone();
+            ctx.simulation.set(runtime).ok();
+            let scene = Scene { ctx, ..scene };
+            let (failed, body) = call(&scene, args(&scene.root)).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "netlist_export_failed", "{body}");
+            assert_eq!(body["error"]["stage"], "export");
+        }
+
+        #[tokio::test]
+        async fn arguments_and_missing_engines_are_refused_with_an_outcome() {
+            let scene = scene("touch worker-ran");
+            let mut other = args(&scene.root);
+            other["analysis"]["kind"] = json!("transient");
+            let (failed, body) = call(&scene, other).await;
+            assert!(failed);
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["outcome"]["status"], "failed");
+
+            let missing = json!({
+                "schematic": scene.project.path().join("gone.kicad_sch"),
+                "analysis": { "kind": "operating_point" },
+            });
+            let (failed, body) = call(&scene, missing).await;
+            assert!(failed);
+            assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+            assert_eq!(body["outcome"]["status"], "failed");
+
+            let bare = Scene {
+                ctx: context("kicad-cli"),
+                ..scene
+            };
+            let (failed, body) = call(&bare, args(&bare.root)).await;
+            assert!(failed);
+            assert_eq!(body["error"]["reason"], "engine_load_failed", "{body}");
+            assert_eq!(body["outcome"]["status"], "failed");
+        }
+
+        #[tokio::test]
+        async fn a_missing_library_lists_where_it_looked() {
+            let scene = scene("touch worker-ran");
+            let ctx = context("kicad-cli");
+            let missing = scene.tools.path().join("libngspice-gone.dylib");
+            let runtime = SimulationRuntime::new(
+                scene.tools.path().join("fake-worker"),
+                crate::simulation::SimulationSettings {
+                    ngspice_library: missing.display().to_string(),
+                    ..Default::default()
+                },
+            );
+            ctx.simulation.set(Arc::new(runtime)).ok();
+            let scene = Scene { ctx, ..scene };
+            let (failed, body) = call(&scene, args(&scene.root)).await;
+            assert!(failed);
+            assert_eq!(body["error"]["reason"], "engine_not_found", "{body}");
+            assert_eq!(body["error"]["items"][0], missing.display().to_string());
+        }
+
+        /// Scans argv, so it survives argument reordering, and logs each format.
+        fn exporting_cli(dir: &Path) -> std::path::PathBuf {
+            let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/simulation/rectifier_unmodelled");
+            let body = format!(
+                "format=''; output=''\n\
+                 while [ $# -gt 0 ]; do\n\
+                   case \"$1\" in\n\
+                     --output) output=\"$2\"; shift ;;\n\
+                     --format) format=\"$2\"; shift ;;\n\
+                   esac\n\
+                   shift\n\
+                 done\n\
+                 if read -r line; then echo stdin-open >> '{log}'; fi\n\
+                 echo \"$format\" >> '{log}'\n\
+                 case \"$format\" in\n\
+                   spice) cp '{fixture}.cir' \"$output\" ;;\n\
+                   *) cp '{fixture}.net' \"$output\" ;;\n\
+                 esac\n",
+                log = dir.join("calls.log").display(),
+                fixture = fixtures.display(),
+            );
+            write_script(dir, "fake-kicad-cli", &body, "")
+        }
+
+        fn project(dir: &Path) -> std::path::PathBuf {
+            let root = dir.join("top.kicad_sch");
+            std::fs::write(&root, sheet()).unwrap();
+            std::fs::write(dir.join("top.kicad_pro"), "{}").unwrap();
+            root
+        }
+
+        #[tokio::test]
+        async fn readiness_exports_kicad_format_first_and_lists_the_design() {
+            let tools = tempfile::tempdir().unwrap();
+            let project_dir = tempfile::tempdir().unwrap();
+            let root = project(project_dir.path());
+            let fake = exporting_cli(tools.path());
+
+            let design = inspect_design(fake.to_str().unwrap(), &root, &no_inputs())
+                .await
+                .unwrap();
+            assert_eq!(design.elements.len(), 5);
+            assert!(design.nets.iter().any(|net| net.kicad_name == "/rect_out"));
+
+            let calls = std::fs::read_to_string(tools.path().join("calls.log")).unwrap();
+            assert_eq!(calls, "kicadsexpr\nspice\n");
+        }
+
+        #[tokio::test]
+        async fn the_export_never_writes_into_the_project() {
+            use std::os::unix::fs::PermissionsExt;
+            let tools = tempfile::tempdir().unwrap();
+            let project_dir = tempfile::tempdir().unwrap();
+            let root = project(project_dir.path());
+            let fake = exporting_cli(tools.path());
+            let read_only = std::fs::Permissions::from_mode(0o555);
+            std::fs::set_permissions(project_dir.path(), read_only).unwrap();
+
+            let result = inspect_design(fake.to_str().unwrap(), &root, &no_inputs()).await;
+
+            let writable = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(project_dir.path(), writable).unwrap();
+            assert!(result.is_ok(), "{:?}", result.err());
+            assert_eq!(std::fs::read_dir(project_dir.path()).unwrap().count(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_nonzero_exit_fails_even_when_a_file_was_written() {
+            let tools = tempfile::tempdir().unwrap();
+            let project_dir = tempfile::tempdir().unwrap();
+            let root = project(project_dir.path());
+            let fake = write_script(
+                tools.path(),
+                "failing-cli",
+                "while [ $# -gt 1 ]; do\n\
+                   if [ \"$1\" = --output ]; then echo written > \"$2\"; fi\n\
+                   shift\n\
+                 done\n\
+                 echo 'Simulation model library not found'\n\
+                 exit 2\n",
+                "",
+            );
+            let error = inspect_design(fake.to_str().unwrap(), &root, &no_inputs())
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                format!("{error:#}").contains("library not found"),
+                "{error:#}"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_empty_export_is_a_failure() {
+            let tools = tempfile::tempdir().unwrap();
+            let project_dir = tempfile::tempdir().unwrap();
+            let root = project(project_dir.path());
+            let fake = write_script(
+                tools.path(),
+                "silent-cli",
+                "while [ $# -gt 1 ]; do\n\
+                   if [ \"$1\" = --output ]; then : > \"$2\"; fi\n\
+                   shift\n\
+                 done\n",
+                "",
+            );
+            assert!(inspect_design(fake.to_str().unwrap(), &root, &no_inputs())
+                .await
+                .is_err());
+        }
+
+        #[tokio::test]
+        async fn a_hung_export_is_killed_at_the_timeout() {
+            let tools = tempfile::tempdir().unwrap();
+            let pid_file = tools.path().join("pid");
+            let fake = write_script(
+                tools.path(),
+                "hung-cli",
+                &format!("echo $$ > '{}'\nexec /bin/sleep 30\n", pid_file.display()),
+                "",
+            );
+            let result = cli::export_simulation_netlists(
+                fake.to_str().unwrap(),
+                Path::new("/x.kicad_sch"),
+                tools.path(),
+                Duration::from_millis(500),
+            )
+            .await;
+            assert!(result.is_err());
+            let pid = std::fs::read_to_string(&pid_file).unwrap();
+            let pid = pid.trim();
+            let mut gone = false;
+            for _ in 0..50 {
+                let alive = std::process::Command::new("kill")
+                    .args(["-0", pid])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success();
+                if !alive {
+                    gone = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(gone, "the hung export is still running");
+        }
+    }
+}

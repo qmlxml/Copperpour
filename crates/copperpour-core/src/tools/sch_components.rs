@@ -2461,7 +2461,13 @@ fn component_delete_commit_refusal(
         SexpError::Conflict { .. } => "the schematic changed after deletion was planned",
         SexpError::ItemConflict { reason, .. } => reason,
         SexpError::KiCadEditorLocked { .. } => {
-            "KiCad owns the schematic; use a live editor mutation or close the document"
+            return Some(
+                ComponentDeleteTargetError::stale(
+                    path,
+                    copperpour_sexp::writer::schematic_lock_message(path),
+                )
+                .into_result(),
+            );
         }
         _ => return None,
     };

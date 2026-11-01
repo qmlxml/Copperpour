@@ -22,6 +22,17 @@ pub enum SexpError {
     #[error("write conflict: {path} changed since it was read")]
     Conflict { path: PathBuf },
 
+    /// The document changed while it was being made safe to replace, for
+    /// example because the live-editor bridge saved the user's unsaved work in
+    /// KiCad's Schematic Editor. Unlike [`SexpError::Conflict`], which writers
+    /// also return when the read-back after a write fails, this is always
+    /// raised before anything is written.
+    #[error(
+        "write refused: {path} changed while it was being prepared for writing, so nothing was \
+         written; reload it and retry the edit"
+    )]
+    ChangedBeforeWrite { path: PathBuf },
+
     /// KiCad owns, or may still own, the design document through its sibling
     /// lock.
     ///

@@ -1,5 +1,5 @@
 ---
-name: konnect
+name: copperpour
 description: "Mandatory operating rules for ANY task involving KiCAD projects. Loaded when the user mentions KiCAD, schematics, PCBs, or any .kicad_* file. Prevents file corruption by routing all changes through Copperpour MCP tools."
 ---
 
@@ -97,13 +97,14 @@ unload_toolset("name")  → Remove a toolset when done
 |----------|----------|
 | Project | project |
 | Schematic | sch_components, sch_wiring, sch_bus, sch_analysis, sch_batch, sch_export, sch_hierarchy |
-| PCB | pcb_board, pcb_components, pcb_routing, pcb_export, placement |
+| PCB | pcb_board, pcb_components, pcb_footprint_text, pcb_routing, pcb_export, placement |
 | Library | library |
 | Integration | integration (JLCPCB parts, Freerouting installation checks, datasheets) |
 | Verification & Review | verification, design_review |
 | Config | config |
 | Templates | templates |
 | Manufacturing | manufacturing |
+| Simulation | simulation |
 
 ## Agent Routing and Mutation Ownership
 

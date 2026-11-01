@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **21 toolsets** organized into 10 categories
+- **23 toolsets** organized into 11 categories
 - **245 registered tools** + **7 always-visible meta-tools** = **252 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
@@ -29,7 +29,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 21 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 23 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -136,7 +136,7 @@ and Windows servers do not.
 | `batch_add_no_connect` | Add multiple no-connect flags in one write. Marking one MCU's unused pins is routinely 15–20 flags. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
-| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. `stub_length: 0` puts the label on the pin with no wire. |
+| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. `stub_length: 0` puts the label on the pin with no wire. `label_orientation: "along_stub"` turns a label on an up or down stub to run along it (90° or 270°); the default keeps it horizontal. |
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire, taking the other L-bend or refusing (`plan_blocked`) when a route would join another net. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing, V+H or a `plan_blocked` refusal when a route would join another net). Use `connect_pins` if you have references instead of coordinates. |
 
@@ -171,7 +171,7 @@ and Windows servers do not.
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
-| `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
+| `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
 ### `sch_batch` · 13 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
@@ -180,7 +180,7 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `batch_add_power_symbol` | Tie several pins to one power net the way a schematic is drawn by hand: pins that face the same way, sit on one row and lie within `max_gap` of a neighbour get a short stub each, a bar joining the stubs, and ONE power symbol on the bar. Use it for the GND or supply pins along one edge of an IC, or for a row of decoupling caps (one call per rail). A pin with no neighbour gets a symbol on its endpoint, as `add_power_symbol` does. Stacked pins share one symbol, and a pin already carrying this net's power symbol is skipped. A group whose stubs or bar would touch any other pin, wire, label or junction is not joined; its pins get a symbol each and the group reports why. Unresolvable pins refuse the whole call before writing. One file write with committed-file readback. |
-| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. `stub_length`, `direction` and `label_type` give `connect_to_net`'s stub and label for every pin in the call. Single read → all edits → single write. |
+| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. `stub_length`, `direction` and `label_type` give `connect_to_net`'s stub and label for every pin in the call. Single read → all edits → single write. Accepts `label_orientation` as `connect_to_net` does. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID (`uuids`) or component reference designator (`references`) — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `batch_edit_schematic_components` | Update fields and the native `dnp` attribute on multiple schematic components in one atomic write. Set `create_missing: true` to create missing custom fields on every placed unit; built-in fields remain update-only. Per-field `updated_units` and `created_units` report what happened. |
@@ -194,7 +194,7 @@ and Windows servers do not.
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. A pair whose route would join another net is skipped and listed in `errors`. |
 
 ### `sch_export` · 10 tools
-**Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
+**Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC and set its checks' severities, and synchronize a live PCB.
 **Source:** [`crates/copperpour-core/src/tools/sch_export.rs`](crates/copperpour-core/src/tools/sch_export.rs)
 
 | Tool | Description |
@@ -205,10 +205,11 @@ and Windows servers do not.
 | `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged, never silently trusted. |
 | `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
-| `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
+| `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. The file scope does not require kicad-cli. `schematic_scope: "hierarchy"` summarises the whole design from the root sheet; the default (`"file"`) covers the one file and says how many child sheets it left out. The hierarchy scope runs kicad-cli and warns (`sheet_files_missing`, `not_the_project_root`) when referenced sheet files are absent or the file given is not the project's root. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. |
+| `set_erc_severity` | Set ERC checks' severities (`error`, `warning`, `ignore`) under `erc.rule_severities` in the `.kicad_pro`, by the check keys KiCad 10.0.6 has or the file already names; only the named keys change, and the reply gives each one's previous and current severity. Refused while KiCad holds the project. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
-| `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. |
+| `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. A pad may change net unless copper of its old net reaches it or a zone's net cannot be read (the conflict names the cause); a pour on either net does not block, and `zones_to_refill` with a `zones_need_refill` warning names the pours to refill after the apply. |
 
 ### `sch_hierarchy` · 16 tools
 **Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size and title block, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, net label renames, pin/label sync validation.
@@ -220,15 +221,15 @@ and Windows servers do not.
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `set_schematic_title_block` | Set any of a sheet's title-block fields (`title`, `date`, `revision`, `company`, `comment_1`..`comment_9`), which that sheet's `${REVISION}`, `${COMMENT1}` and the like resolve from. `scope: "hierarchy"` also sets every sheet file below it, each shared file once, in one journaled transaction. An omitted field is kept and an empty string clears it. Refused while KiCad holds a target or the project's root schematic. Returns each sheet's block read back and `changed`. |
 | `add_hierarchical_sheet` | Insert a hierarchical sheet into a parent schematic, linking it to a child `.kicad_sch` file. Creates the child file if it doesn't exist, or links to an existing one (multi-instance reuse). Patches existing symbols' instance paths if the linked file already has components. |
-| `edit_sheet` | Rename, resize, reposition, or repoint (`Sheetfile`) an existing sheet. |
-| `move_sheet` | Reposition a sheet on the parent canvas without touching any other field. |
+| `edit_sheet` | Rename, resize, reposition, or repoint (`Sheetfile`) an existing sheet. New position and size values are snapped to the 1.27 mm grid; restating the current value changes nothing. A resize that would leave pins past the box's edges, or move a pin onto another pin's point, is refused, naming them; coordinates beyond ±100,000 mm are refused. |
+| `move_sheet` | Reposition a sheet on the parent canvas without touching any other field. A new position is snapped to the 1.27 mm grid; restating the current position changes nothing. |
 | `delete_sheet` | Remove a sheet reference from the parent schematic. Does not delete the child file. |
 | `duplicate_sheet` | Copy an existing sheet and its child file under a new name/file, offset from the source, with an independent internal UUID. |
 | `get_sheet_hierarchy` | Recursively walk the sheet tree, returning nested JSON with each sheet's name/file/uuid/position/size/page/pins and its own children. |
 | `renumber_sheet_pages` | Walk the whole sheet tree and reassign sequential page numbers in depth-first order, fixing gaps left by delete/duplicate. |
 | `import_sheet_pins` | Scan the child sheet's hierarchical_labels and auto-generate matching pins on the parent sheet block, skipping names that already have a pin — the primary way pins get created. Optional `side` (`right`, `left`, `top`, `bottom`, default `right`) picks the edge and sets each pin's rotation, which is what KiCad reads the edge from; a `right`/`left` stack runs down the edge, a `top`/`bottom` one across it. Pins stack after the pin that reaches furthest along that edge, so an existing gap is left alone rather than filled — one pin on the last slot therefore fills the edge, and the refusal says so rather than suggesting a resize. An occupied slot is never written over, including one held by a pin whose rotation names no edge or one the sheet shrank away from. The whole import is planned and validated before anything is written, and refused entire — nothing written — if it would run past a corner, because KiCad clamps such a pin back onto the box. |
 | `add_sheet_pin` | Manually add a single pin to an existing sheet block. Optional `side` (`right`, `left`, `top`, `bottom`) selects the edge by writing the rotation KiCad reads it from, and makes the call validate `x`/`y` against that edge on both axes, corners included — an off-edge position is refused rather than written and then relocated by KiCad on load. Omitting `side` keeps the previous behavior: rotation `0` and no position check. `x`, `y`, and `side` in the response are read back off the saved pin. |
-| `edit_sheet_pin` | Rename a pin, change its electrical type, reposition it along the sheet border, or move it to another edge with the optional `side` (`right`, `left`, `top`, `bottom`). `side` is judged against the position the pin ends up with, so `side` and `x`+`y` in one call are checked together. `changed_fields` names only what actually differs — restating the side a pin already has is an honest no-op that writes nothing — alongside `requested_fields` and the `pin` read back off the file. |
+| `edit_sheet_pin` | Rename a pin, change its electrical type, reposition it along the sheet border, or move it to another edge with the optional `side` (`right`, `left`, `top`, `bottom`). `side` is judged against the position the pin ends up with, so `side` and `x`+`y` in one call are checked together. `changed_fields` names only what actually differs — restating the side a pin already has writes nothing and reports no change — alongside `requested_fields` and the `pin` read back off the file. A move that would put the pin on another pin's point, and a rename to another pin's name, are refused. |
 | `rename_schematic_net_label` | Rename a net label in place, by uuid or position, or every label of a net on a sheet or down the hierarchy with its sheet pins; refuses a rename that joins or splits nets unless allowed. |
 | `delete_sheet_pin` | Remove a single pin without touching the rest of the sheet. |
 | `validate_sheet_pins` | Read-only. Walk the sheet tree and report unmatched hierarchical labels/pins and stored pin positions inconsistent with their rotation-selected edge or its span. Geometry findings identify the pin, stored position, expected edge and recovery action; no pins are repaired. |
@@ -248,9 +249,10 @@ and Windows servers do not.
 | `set_board_title_block` | Set any of the board's title-block fields — `title`, `date`, `revision`, `company`, `comment_1`..`comment_9`, which `${TITLE}`, `${REVISION}`, `${COMMENT1}` and the like resolve from. An omitted field is kept and an empty string clears it. Writes the open board over IPC (KiCad 10.0.1+, else `unsupported_capability`, never a file fallback), unsaved and without an undo step, or the saved file when KiCad does not hold it. Returns the block read back, `changed` and `source`. |
 | `get_board_extents` | Return the box enclosing the board's items, footprint text excluded. Reads the live board where it can (`board_source`); a saved-file answer names what it could not measure, and a live answer names each item class KiCad would not list (tables and generators on KiCad 10). |
 | `get_layer_list` | Return the board's enabled layers: `name`, `display_name` and a `copper` flag, plus the file-backed `id`, `type` and optional `user_name`. IPC-first, so an unsaved stackup change in a live KiCad is visible; `board_source` (`auto`/`live`/`saved`) selects the board state and `sources` names where each part of the answer came from. |
-| `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup. |
+| `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup, or by `set_board_stackup` on a closed board. |
+| `set_board_stackup` | Replace the physical stackup of a board KiCad does not hold open: copper thicknesses (or ounces, read as KiCad reads `oz`), each dielectric's type, thickness, material, εr and loss tangent, solder mask color and thickness, silkscreen color, finish and impedance control; a value left out is the board's, else KiCad's default. The board thickness written is the stack's sum. kicad-cli loads and saves a copy first, and the write is refused unless KiCad reads back every value, or with no kicad-cli. Does not change the copper-layer count. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
-| `set_active_layer` | Return `unsupported_capability` without writing: active layer is editor-session state and the bundled stable KiCad IPC protocol exposes no supported mutation/readback. |
+| `set_active_layer` | Make a layer the PCB editor's active layer on a board open in KiCad, read it back, and report it with the previous one. Editor state only: never writes the board file. `editor_unavailable` when the board is not open in KiCad, `unsupported_capability` when KiCad does not handle the command. No Copperpour tool uses the active layer; it changes only where the person's next hand-drawn item goes. |
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. Appends — clear the old edges with `delete_graphics` first. |
 | `replace_board_outline` | Replace the board's own Edge.Cuts shapes with closed contours of lines and arcs (`start`, `mid`, `end` in mm), outlines and cut-outs alike. The default dry run lists what would go and returns a `plan_revision`; apply takes it as `expected_plan_revision`. Refuses, before writing, a joint whose points differ, a line or arc of 0.001 mm or less, and primitives that cross or touch other than at their shared joint. One KiCad commit on a live board, else the saved file; read back either way. |
 | `delete_graphics` | Delete board graphics (lines, rects, arcs, circles, polys, curves, text, textboxes, dimensions) matching a UUID/layer/type filter; `dry_run` lists them instead. |
@@ -261,6 +263,15 @@ and Windows servers do not.
 | `delete_zone` | Delete exactly one zone UUID returned by `list_zones` using its matching source and revision. Live deletion uses one KiCad commit; it then requests refill, waits for readiness and verifies full readback. Saved-file deletion checks the same revision under the atomic document lock and verifies absence and preserved zone metadata. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 | `set_footprint_field` | Add or update a custom field (LCSC, MPN, …) on a placed footprint via KiCAD IPC. Refuses the mandatory fields; a new field is hidden by default and sits on the footprint's Fab layer. One undo step; the response is a fresh read-back. |
+
+### `pcb_footprint_text` · 2 tools
+**Purpose:** List, move, rotate, re-layer and hide the texts of placed footprints: reference designators, values, custom fields, plain texts.
+**Source:** [`crates/copperpour-core/src/tools/pcb_components.rs`](crates/copperpour-core/src/tools/pcb_components.rs)
+
+| Tool | Description |
+|------|-------------|
+| `list_board_footprint_texts` | List the texts of placed footprints — reference, value, custom fields and plain texts — with layer, absolute board and footprint-local position (`local` is null on a back-side footprint), angle, size and visibility. Requires KiCAD running with the board open. |
+| `move_footprint_texts` | Move, rotate, re-layer or hide footprint texts (reference designators, values, custom fields, plain texts) without moving the footprints: absolute, relative or footprint-local positions (not on a back-side footprint), checked first and sent in one commit (one undo step); the response is the texts read back from the board. Unknown keys, an entry that changes nothing, and a layer on the other board side are refused. Requires KiCAD running with the board open. |
 
 ### `pcb_components` · 20 tools
 **Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics and 3D models.
@@ -300,7 +311,7 @@ and Windows servers do not.
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. Reads the via back and reports the net KiCad stored; a via KiCad put on another net (it landed on that net's copper) is removed again and refused with `plan_blocked`. |
 | `plan_specctra_ses_import` | Strictly validate a Freerouting SES against its revision-bound manifest and the exact live board, returning every planned route item and the preserved locked-track/via inventory without mutation. |
-| `apply_specctra_ses` | Preserve the manifest-bound locked straight tracks and through vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence (including whether it is clean). |
+| `apply_specctra_ses` | Preserve the manifest-bound locked straight tracks and through vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence. `drc.clean` requires complete evidence and zero findings (parity is not checked for a candidate and is reported as missing; for complete evidence run `run_drc` on the source board with `sync_live_board: true`, which saves the live board over the source file; the candidate's DRC runs on a temporary copy beside the source project's `.kicad_pro`, `.kicad_dru` and `fp-lib-table` (with `${KIPRJMOD}` expanded), named in `rules_applied`; `routing_clean` is true when design-rule violations and unconnected items were both checked and are zero, and does not cover parity); unavailable category counts are `null`, with `missing_categories` and the parity diagnostic preserved. Import success alone does not establish design acceptance. Findings are split into `introduced_violations` and `preexisting_violations` by whether they name an item the import created; `import_clean` is true when none was introduced, connectivity was checked and is zero, and the footprint library table was applied. If the DRC itself cannot run, the verified import is kept and `drc_status` is `not_run`. |
 | `add_copper_pour` | Alias of `add_zone`, kept for compatibility: same arguments, same defaults, same IPC-first behaviour. (Its `min_width` default was 0.25 and is now 0.2, matching `add_zone` and KiCad.) |
 | `delete_trace` | Delete one observed trace segment by UUID via KiCad IPC. Refuses non-trace or stale UUIDs before deletion, targets the requested board, and reports the observed preimage only after readback proves the segment is absent. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
@@ -399,8 +410,8 @@ and Windows servers do not.
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID — from the local JLCPCB catalog first, falling back to the LCSC API. |
-| `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, then report `engine_found`, `native_mcp_available`, and `bridge_available` as separate observed facts. |
-| `route_specctra_dsn` | Route a DSN through the discovered local Freerouting JAR's native headless MCP server and create a new SES without cloud upload or replacement. The owned unauthenticated service is loopback-only; its child is reaped on every exit path. |
+| `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, then report `engine_found`, `native_mcp_available`, and `bridge_available` as separate observed facts. `available` is true only when `java -jar <jar> --version` succeeds; a Java too old for the JAR is reported with `java_release` and `required_java_release`. |
+| `route_specctra_dsn` | Route a DSN through the discovered local Freerouting JAR's native headless MCP server and create a new SES without cloud upload or replacement. The owned unauthenticated service is loopback-only; its child is reaped on every exit path. Accepts `optimize_seconds`, `plane_nets`, `plane_as_obstacle`, `router_settings` (refused before routing if Freerouting does not apply a setting) and `project_path` (the project's edge and hole rules are sent by default). `success` is true only when Freerouting's log shows no unrouted connections and no clearance violations, the project's rules were found and applied, and the settings sent were verified; an unreadable log, `allow_below_project_rules`, a missing `.kicad_pro` or an unapplied project rule gives `false` with the reason in `message` (fields `unrouted_connections_checked`, `clearance_violations`, `settings_checked`). Relaxing the project's rules through `router_settings` is refused unless `allow_below_project_rules`. Sends `notifications/progress` on stdio. |
 
 Migration from the former `autoroute` tool: use `export_specctra_dsn`,
 `route_specctra_dsn`, then `plan_specctra_ses_import` / `apply_specctra_ses`.
@@ -417,7 +428,8 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
+| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic) when KiCad says it could not fetch one or when no `<board stem>.kicad_sch` exists beside the board — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
+| `check_specctra_candidate` | Run KiCad DRC on an existing `apply_specctra_ses` candidate with the source project's `.kicad_pro`, `.kicad_dru` and `fp-lib-table`, as a temporary copy; modifies neither file. Returns the same `drc` object, with `import_clean` and the introduced/preexisting split `null` unless `created_item_ids` from the apply response is passed. Reports `candidate_sha256`; refuses the source board as a candidate. For a candidate whose DRC did not run during the import. |
 | `set_design_rules` | Set board-level design rules (clearance, trace width, via size, via annular width, hole clearance, copper-to-edge clearance, silkscreen text height and thickness) in the sibling `.kicad_pro` project file. The board file is not modified. |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
@@ -459,7 +471,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 |------|-------------|
 | `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 | `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. Global rails (power symbols other than `(power local)`, and global labels) are judged on the whole design in a hierarchy review, with `rail_coverage`. |
 | `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
 | `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
 | `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
@@ -476,7 +488,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 |------|-------------|
 | `search_templates` | Search the reference circuit template library. Returns matches for common subcircuits; templates have verified component values. |
 | `get_template` | Get full details for a template: components, connections, design notes. Use the template ID from `search_templates`. |
-| `apply_template` | Instantiate a template into the current schematic. Places all components and wires per the connection map; `net_mappings` re-binds template nets to project nets. |
+| `apply_template` | Instantiate a template into the current schematic. Places all components and wires per the connection map; `net_mappings` re-binds template nets to project nets. The connection map is wired, not returned: the response lists `connections_made`, `connections_unresolved` (with reasons, including pins a wiring call could not connect), `unconnected_pins` and `joined_existing_nets`. |
 | `list_template_categories` | List all available template categories and the number of templates in each. |
 
 **Built-in templates** (loaded by `load_all_templates` in `templates.rs`):
@@ -497,6 +509,18 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
 
 ---
+
+## Simulation
+
+### `simulation` · 2 tools
+
+**Purpose:** Simulate a schematic with KiCad's SPICE engine and check whether it is ready to run.
+**Source:** [`crates/copperpour-core/src/tools/simulation.rs`](crates/copperpour-core/src/tools/simulation.rs)
+
+| Tool | Description |
+|------|-------------|
+| `check_simulation_readiness` | Report whether a schematic can be simulated, and why not, without running a simulation. Works from the saved files on a private copy, so the project is not touched and unsaved editor changes are not seen. Also vets the deck: every include is inlined, and anything that could run commands is removed or refused. Then checks models, values, ground, net names and connectivity, including any testbench changes given. |
+| `run_simulation` | Run one analysis on a schematic in an isolated simulator process and return compact results, with the full data on disk. Works from the saved files on a private copy. Read simulated_circuit: a result from a modified circuit does not describe the schematic as drawn. Runs an operating point or a transient. A transient can summarise signals and take time-weighted measurements such as inrush peak, I²t and settling time. |
 
 ## Appendix: Structural observations
 

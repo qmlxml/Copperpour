@@ -30,6 +30,11 @@ pub struct McpHandler {
     /// to receive the same notifications. Without this, notifications are
     /// silently dropped on stdio — the cause of issue #19.
     notif_sinks: Arc<RwLock<Vec<mpsc::Sender<String>>>>,
+    /// Sinks the transport writes as soon as they arrive, while a call is still
+    /// running (`notifications/progress`). `notif_sinks` is flushed by stdio
+    /// only after the response, which is right for tools/list_changed and
+    /// useless for progress.
+    immediate_sinks: Arc<std::sync::RwLock<Vec<mpsc::Sender<String>>>>,
     observer: CallObserver,
     /// Meta-tools bypass the domain router, so their advertised schemas are
     /// compiled here once and enforced at the same dispatch boundary.
@@ -109,6 +114,7 @@ impl McpHandler {
             reload: meta_tools::ReloadControl::default(),
             sse_senders: Arc::new(RwLock::new(Vec::new())),
             notif_sinks: Arc::new(RwLock::new(Vec::new())),
+            immediate_sinks: Arc::new(std::sync::RwLock::new(Vec::new())),
             observer,
             meta_input_validators: Arc::new(meta_input_validators),
         })
@@ -136,6 +142,12 @@ impl McpHandler {
         let _ = self.ctx.guidance.set(probe);
     }
 
+    /// Tell the simulation tools how to reach the worker. Only the standalone
+    /// binary, which contains it, calls this; a second call is ignored.
+    pub fn set_simulation_runtime(&self, runtime: Arc<crate::simulation::SimulationRuntime>) {
+        let _ = self.ctx.simulation.set(runtime);
+    }
+
     pub fn take_reload_request(&self) -> Option<meta_tools::ReloadPlan> {
         self.reload.take()
     }
@@ -149,6 +161,37 @@ impl McpHandler {
     /// JSON-RPC string, which the transport writes to its output stream.
     pub async fn register_notification_sink(&self, tx: mpsc::Sender<String>) {
         self.notif_sinks.write().await.push(tx);
+    }
+
+    /// Register a sink for notifications that must be written while the call
+    /// that emits them is still running (`notifications/progress`).
+    pub fn register_immediate_sink(&self, tx: mpsc::Sender<String>) {
+        if let Ok(mut sinks) = self.immediate_sinks.write() {
+            sinks.push(tx);
+        }
+    }
+
+    /// Progress channel for one `tools/call`, or `None` when the client sent no
+    /// `_meta.progressToken`. Delivery is best effort: `try_send` never blocks
+    /// the tool, and a full channel drops that one update.
+    fn progress_reporter(
+        &self,
+        params: &CallToolParams,
+    ) -> Option<crate::progress::ProgressReporter> {
+        let token = params.progress_token()?.clone();
+        let sinks = self.immediate_sinks.clone();
+        // Progress goes only to the stdio transport's immediate sink. It is
+        // not broadcast to HTTP GET event streams: those belong to every
+        // client, so one client would receive another's progress, and a client
+        // that opened none would get nothing anyway (merge review, plan step 5;
+        // per-request streams are recorded in docs/BACKLOG.md).
+        Some(crate::progress::ProgressReporter::new(token, move |json| {
+            if let Ok(sinks) = sinks.read() {
+                for tx in sinks.iter() {
+                    let _ = tx.try_send(json.clone());
+                }
+            }
+        }))
     }
 
     /// Process one JSON-RPC message and return an optional response.
@@ -252,7 +295,12 @@ impl McpHandler {
                 let params: CallToolParams =
                     serde_json::from_value(req.params.clone().unwrap_or(Value::Null))?;
 
-                let call_result = self.execute_tool(&params).await;
+                let reporter = self.progress_reporter(&params);
+                if reporter.is_some() {
+                    info!(tool = %params.name, "tool_call_progress_token");
+                }
+                let call_result =
+                    crate::progress::scope(reporter, self.execute_tool(&params)).await;
                 Ok(Some(serde_json::to_value(call_result)?))
             }
 
@@ -441,9 +489,20 @@ impl McpHandler {
                                 ToolErrorKind::Conflict {
                                     paths: vec![path.clone()],
                                 },
-                                format!(
-                                    "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
-                                ),
+                                // Only a refusal the live-editor hook made carries
+                                // its reason; a strict check (rename, recovery)
+                                // or a write the hook was never asked about gets
+                                // the plain lock message.
+                                if refused_by_live_editor(&e) {
+                                    format!(
+                                        "Schematic '{path}': {}. Copperpour did not modify it.",
+                                        copperpour_sexp::writer::schematic_lock_message(locked)
+                                    )
+                                } else {
+                                    format!(
+                                        "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
+                                    )
+                                },
                             ),
                             CallStatus::Error,
                             Some("conflict".to_string()),
@@ -521,6 +580,20 @@ impl McpHandler {
             sinks.retain(|tx| tx.try_send(json.clone()).is_ok());
         }
     }
+}
+
+/// Whether a lock refusal came from the live-editor hook (its reason is
+/// recorded as `inspection_error: "live editor: ..."`).
+fn refused_by_live_editor(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<copperpour_sexp::SexpError>(),
+            Some(copperpour_sexp::SexpError::KiCadEditorLocked {
+                inspection_error: Some(reason),
+                ..
+            }) if reason.starts_with("live editor: ")
+        )
+    })
 }
 
 fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
@@ -868,6 +941,23 @@ mod required_argument_dispatch_tests {
         );
     }
 
+    #[test]
+    fn only_a_refusal_by_the_live_editor_carries_its_reason() {
+        let locked = |inspection_error: Option<&str>| {
+            anyhow::Error::from(copperpour_sexp::SexpError::KiCadEditorLocked {
+                path: "/p/a.kicad_sch".into(),
+                lock_path: "/p/~a.kicad_sch.lck".into(),
+                inspection_error: inspection_error.map(str::to_owned),
+            })
+            .context("add_wire")
+        };
+        assert!(refused_by_live_editor(&locked(Some(
+            "live editor: a dialog is open"
+        ))));
+        assert!(!refused_by_live_editor(&locked(None)));
+        assert!(!refused_by_live_editor(&locked(Some("permission denied"))));
+    }
+
     #[tokio::test]
     async fn a_kicad_schematic_lock_is_a_typed_conflict() {
         let handler = handler().await;
@@ -1089,6 +1179,59 @@ mod reliability_contract_dispatch_tests {
         );
         assert_eq!(body["outcome"]["target"], schematic.display().to_string());
     }
+
+    async fn served_simulation(analysis: Value) -> Value {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("gone.kicad_sch");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_simulation",
+                    "arguments": {
+                        "schematic": schematic.display().to_string(),
+                        "analysis": analysis
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().expect("JSON text");
+        serde_json::from_str(text).expect("tool body is JSON")
+    }
+
+    #[tokio::test]
+    async fn a_simulation_refusal_keeps_its_outcome_through_the_served_dispatch() {
+        let body = served_simulation(json!({"kind": "operating_point"})).await;
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(body["outcome"]["status"], "failed", "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_transient_with_no_stop_time_is_named_through_the_served_dispatch() {
+        let body = served_simulation(json!({"kind": "transient"})).await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(
+            body["error"]["field"], "analysis.stop_time_seconds",
+            "{body}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1198,11 +1341,14 @@ mod active_layer_dispatch_tests {
     use crate::tools::ServerConfig;
 
     #[tokio::test]
-    async fn set_active_layer_refusal_survives_served_dispatch_without_writing() {
+    /// Through dispatch, with KiCad unreachable (an address that cannot exist,
+    /// so a KiCad running on the developer's machine is never used): the
+    /// typed refusal, and the file untouched.
+    async fn set_active_layer_without_kicad_is_refused_through_dispatch_without_writing() {
         let handler = McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
-            ipc_address: String::new(),
+            ipc_address: "ipc:///nonexistent/copperpour-test-unreachable.sock".to_string(),
             project_dir: None,
             jlcpcb_db_path: None,
             auto_load_toolsets: true,
@@ -1237,8 +1383,8 @@ mod active_layer_dispatch_tests {
             .expect("tool returns JSON text");
         let body: Value = serde_json::from_str(text).expect("tool body is JSON");
 
-        assert_eq!(body["error"]["kind"], "unsupported_capability");
-        assert_eq!(body["error"]["capability"], "set_active_layer");
+        assert_eq!(body["error"]["kind"], "editor_unavailable");
+        assert_eq!(body["error"]["editor"], "pcb");
         assert_eq!(std::fs::read(&board).unwrap(), original);
     }
 }

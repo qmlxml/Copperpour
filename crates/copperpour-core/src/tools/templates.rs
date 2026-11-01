@@ -272,9 +272,13 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "apply_template",
-            "Instantiate a reference circuit template into the current schematic. Places all \
-             components and wires them according to the template's connection map. Use net_mappings \
-             to connect template nets to your project's existing nets.",
+            "Instantiate a reference circuit template into the current schematic. Places its \
+             components in a column from position_x/position_y, then connects every pin its \
+             connection map names: a short wire stub and a net label per pin, so the circuit is \
+             joined by net names. Use net_mappings to rename template nets to your project's. \
+             connections_made lists what was wired; connections_unresolved lists map entries that \
+             name no pin on the placed symbol; unconnected_pins lists the template's pins no \
+             entry reaches (often its passives), which still need wiring.",
             json!({
                 "type": "object",
                 "properties": {
@@ -405,7 +409,7 @@ async fn handle_get_template(
 
 async fn handle_apply_template(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let template_id = match require_str(args, "template_id") {
@@ -578,33 +582,382 @@ async fn handle_apply_template(
         "Template applied successfully"
     );
 
-    // Build the net mapping guide for the user/Claude to wire up
-    let connections = tmpl["connections"].as_array().cloned().unwrap_or_default();
-    let mapped_connections: Vec<serde_json::Value> = connections
+    // Wire what the connection map describes (#784): each pin it names gets
+    // a stub and a label for its net, drawn as connect_to_net draws one.
+    let wiring = match wire_template_connections(&sch_path, &tmpl, &net_mappings, ref_start, ctx)
+        .await
+    {
+        Ok(wiring) => wiring,
+        Err(error) => {
+            // Enough to finish by hand: what was placed, and which placed
+            // reference each template reference became (merge review,
+            // plan step 6). Re-running would place a second copy.
+            let references = template_references(&tmpl, ref_start);
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                    &sch_path,
+                    "apply_template",
+                    format!(
+                        "the parts were placed ({}), with template references placed as {}, but \
+                         wiring them failed: {error:#}. Do not apply the template again; finish the \
+                         remaining nets with batch_connect_to_net on the placed references.",
+                        serde_json::to_string(&placed).unwrap_or_default(),
+                        serde_json::to_string(&references).unwrap_or_default()
+                    ),
+                ));
+        }
+    };
+    let mut response = json!({
+        "template": template_id,
+        "components_placed": placed,
+        "connections_made": wiring.made,
+        "connections_unresolved": wiring.unresolved,
+        "unconnected_pins": wiring.unconnected,
+        "joined_existing_nets": wiring.joined_existing,
+        "design_notes": tmpl["design_notes"],
+    });
+    if !response["connections_unresolved"]
+        .as_array()
+        .is_some_and(Vec::is_empty)
+        || !response["unconnected_pins"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    {
+        response["next_steps"] = json!(
+            "Wire the pins in unconnected_pins that the design needs, mark the rest no-connect, \
+             and resolve the entries in connections_unresolved, with connect_to_net or \
+             connect_pins."
+        );
+    }
+    Ok(CallToolResult::text(serde_json::to_string(&response)?))
+}
+
+/// What [`wire_template_connections`] did: each map entry it wired, with the
+/// net and placed pins, each it could not, with why, and the template's
+/// placed pins no entry reached.
+struct TemplateWiring {
+    made: Vec<serde_json::Value>,
+    unresolved: Vec<serde_json::Value>,
+    unconnected: Vec<String>,
+    /// Template nets the caller did not map that already exist in the
+    /// schematic, so the template's parts were joined to them.
+    joined_existing: Vec<String>,
+}
+
+/// A placed pin: its symbol's reference and the pin number.
+type TemplatePin = (String, String);
+
+/// Template-local references to placed ones. The template's k-th part with
+/// prefix `R` is `R{k}` in its connection map and `R{ref_start + k - 1}` on
+/// the sheet, matching the placement loop. A bare prefix (`J`) names the
+/// template's only part with that prefix.
+fn template_references(
+    tmpl: &serde_json::Value,
+    ref_start: usize,
+) -> std::collections::HashMap<String, String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut references = std::collections::HashMap::new();
+    for comp in tmpl["components"].as_array().into_iter().flatten() {
+        let prefix = comp["ref_prefix"].as_str().unwrap_or("U");
+        for _ in 0..comp["quantity"].as_u64().unwrap_or(1) {
+            let k = counts.entry(prefix.to_string()).or_insert(0);
+            *k += 1;
+            references.insert(
+                format!("{prefix}{k}"),
+                format!("{prefix}{}", ref_start + *k - 1),
+            );
+        }
+    }
+    for (prefix, count) in counts {
+        if count == 1 {
+            references.insert(prefix.clone(), format!("{prefix}{ref_start}"));
+        }
+    }
+    references
+}
+
+/// The placed pins a map endpoint such as `R1.2`, `J.VBUS` or `U.VDD` names:
+/// the pin with that number, or else every pin with that name, as in "all VDD
+/// pins to 3.3V".
+fn resolve_template_endpoint(
+    endpoint: &str,
+    references: &std::collections::HashMap<String, String>,
+    pins: &std::collections::HashMap<String, Vec<(String, String)>>,
+) -> Result<Vec<TemplatePin>, String> {
+    let (local, pin) = endpoint
+        .split_once('.')
+        .ok_or_else(|| format!("'{endpoint}' names no pin"))?;
+    let reference = references
+        .get(local)
+        .ok_or_else(|| format!("the template has no part '{local}'"))?;
+    let symbol_pins = pins
+        .get(reference)
+        .ok_or_else(|| format!("{reference} has no resolvable pins on the sheet"))?;
+    if symbol_pins.iter().any(|(number, _)| number == pin) {
+        return Ok(vec![(reference.clone(), pin.to_string())]);
+    }
+    let named: Vec<TemplatePin> = symbol_pins
         .iter()
-        .map(|conn| {
-            let mut c = conn.clone();
-            let original_net = c["to_net"].as_str().map(String::from);
-            if let Some(net) = original_net {
-                if let Some(mapped) = net_mappings.get(&net) {
-                    c["to_net"] = json!(mapped);
-                    c["mapped_from"] = json!(net);
+        .filter(|(_, name)| name == pin)
+        .map(|(number, _)| (reference.clone(), number.clone()))
+        .collect();
+    if named.is_empty() {
+        Err(format!("{reference} has no pin numbered or named '{pin}'"))
+    } else {
+        Ok(named)
+    }
+}
+
+/// Connect the placed template parts as its connection map says.
+///
+/// Entries take four shapes: `from` a pin `to_net` a net; `from` a pin `via` a
+/// two-pin part (pin 1 on the `from` side, pin 2 on `to_net`); `from` a pin
+/// `to` another pin; and `from` an outside signal (no `.`) `to` a pin. Nets go
+/// through `net_mappings`; a net between two template pins is named after
+/// the first, such as `J1_CC1`. Each net is drawn with
+/// [`handle_batch_connect_to_net`](crate::tools::sch_batch::handle_batch_connect_to_net):
+/// a 2.54 mm stub and a label per pin.
+async fn wire_template_connections(
+    sch_path: &std::path::Path,
+    tmpl: &serde_json::Value,
+    net_mappings: &std::collections::HashMap<String, String>,
+    ref_start: usize,
+    ctx: &ToolContext,
+) -> anyhow::Result<TemplateWiring> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    let references = template_references(tmpl, ref_start);
+    let placed: HashSet<&String> = references.values().collect();
+    let (_, tree) = copperpour_sexp::schematic::read_schematic(sch_path)?;
+    let mut pins: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (instance, instance_pins) in crate::tools::placed_pins_by_reference(&tree) {
+        if placed.contains(&instance.reference) {
+            pins.entry(instance.reference.clone()).or_default().extend(
+                instance_pins
+                    .iter()
+                    .map(|(pin, _)| (pin.number.clone(), pin.name.clone())),
+            );
+        }
+    }
+    // Nets already in the schematic, by name, before anything is wired: an
+    // unmapped template net of the same name joins them, which the response
+    // must say (merge review, plan step 6: a template's 6 V VIN joined a
+    // project's 24 V VIN without a word).
+    let existing_nets: HashSet<String> = copperpour_sexp::schematic::extract_labels(&tree)
+        .into_iter()
+        .chain(copperpour_sexp::schematic::extract_power_symbol_labels(
+            &tree,
+        ))
+        .map(|label| label.net)
+        .collect();
+    // The template's own net names, as the connection map below reads them:
+    // `to_net`, or `from` when an entry connects a net to a pin (`to`).
+    let joined_existing: Vec<String> = tmpl["connections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|conn| {
+            let from = conn["from"].as_str().unwrap_or_default();
+            match (conn["to_net"].as_str(), conn["to"].as_str()) {
+                (Some(net), _) => Some(net.to_string()),
+                (None, Some(_)) if !from.contains('.') => Some(from.to_string()),
+                _ => None,
+            }
+        })
+        .filter(|net| !net_mappings.contains_key(net) && existing_nets.contains(net))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mapped = |net: &str| {
+        net_mappings
+            .get(net)
+            .cloned()
+            .unwrap_or_else(|| net.to_string())
+    };
+    let local_net = |first: &TemplatePin| {
+        let (reference, number) = first;
+        let name = pins
+            .get(reference)
+            .and_then(|p| p.iter().find(|(n, _)| n == number))
+            .map(|(_, name)| name.as_str())
+            .filter(|name| !name.is_empty() && *name != "~")
+            .unwrap_or(number);
+        format!("{reference}_{name}")
+    };
+    let endpoint = |e: &str| resolve_template_endpoint(e, &references, &pins);
+
+    let mut nets: BTreeMap<String, Vec<TemplatePin>> = BTreeMap::new();
+    let mut made = Vec::new();
+    let mut unresolved = Vec::new();
+    for conn in tmpl["connections"].as_array().into_iter().flatten() {
+        let from = conn["from"].as_str().unwrap_or_default();
+        let groups: Result<Vec<(String, Vec<TemplatePin>)>, String> = (|| match (
+            conn["to_net"].as_str(),
+            conn["to"].as_str(),
+            conn["via"].as_str(),
+        ) {
+            (Some(to_net), _, None) => Ok(vec![(mapped(to_net), endpoint(from)?)]),
+            (Some(to_net), _, Some(via)) => {
+                let start = endpoint(from)?;
+                let inner = local_net(&start[0]);
+                let mut first = start;
+                first.extend(endpoint(&format!("{via}.1"))?);
+                Ok(vec![
+                    (inner, first),
+                    (mapped(to_net), endpoint(&format!("{via}.2"))?),
+                ])
+            }
+            (None, Some(to), _) if from.contains('.') => {
+                let mut start = endpoint(from)?;
+                let inner = local_net(&start[0]);
+                start.extend(endpoint(to)?);
+                Ok(vec![(inner, start)])
+            }
+            (None, Some(to), _) => Ok(vec![(mapped(from), endpoint(to)?)]),
+            _ => Err("the entry names neither a net nor a pin to connect to".to_string()),
+        })();
+        match groups {
+            Ok(groups) => {
+                for (net, net_pins) in groups {
+                    made.push(json!({
+                        "connection": conn,
+                        "net": net,
+                        "pins": net_pins.iter().map(|(r, n)| format!("{r}.{n}")).collect::<Vec<_>>(),
+                    }));
+                    nets.entry(net).or_default().extend(net_pins);
                 }
             }
-            c
+            Err(reason) => unresolved.push(json!({ "connection": conn, "reason": reason })),
+        }
+    }
+
+    // The pins each batch call reports as connected, not the pins requested:
+    // a pin the batch could not resolve is in its `errors`, not in `added`
+    // (merge review, plan step 6). The nets already written when one fails
+    // are named in the error.
+    // A pin claimed by two nets would get a second label on the same stub,
+    // and KiCad would join the two nets: keep it on the first and report the
+    // rest (merge review, plan step 6).
+    let mut owner: HashMap<TemplatePin, String> = HashMap::new();
+    for (net, net_pins) in &mut nets {
+        net_pins.retain(|pin| match owner.get(pin) {
+            Some(first) if first != net => {
+                unresolved.push(json!({
+                    "reason": format!(
+                        "pin {}.{} is in both net '{first}' and net '{net}'; it was connected to \
+                         '{first}' only, because one pin cannot carry two nets",
+                        pin.0, pin.1
+                    )
+                }));
+                false
+            }
+            _ => {
+                owner.insert(pin.clone(), net.clone());
+                true
+            }
+        });
+    }
+    let mut wired: HashSet<TemplatePin> = HashSet::new();
+    let mut wiring_errors: Vec<String> = Vec::new();
+    let mut written_nets: Vec<String> = Vec::new();
+    for (net, net_pins) in &mut nets {
+        net_pins.sort();
+        net_pins.dedup();
+        let args = json!({
+            "schematic": sch_path.display().to_string(),
+            "net": net,
+            "pins": net_pins
+                .iter()
+                .map(|(reference, number)| json!({ "reference": reference, "pin_number": number }))
+                .collect::<Vec<_>>(),
+            "stub_length": 2.54,
+            "direction": "auto",
+            "label_type": "net_label",
+        });
+        let done = |written: &[String]| {
+            if written.is_empty() {
+                "no net was written".to_string()
+            } else {
+                format!("nets already written: {}", written.join(", "))
+            }
+        };
+        let result = match crate::tools::sch_batch::handle_batch_connect_to_net(&args, ctx).await {
+            Ok(result) => result,
+            Err(error) => {
+                anyhow::bail!(
+                    "connecting net '{net}' failed ({}): {error:#}",
+                    done(&written_nets)
+                )
+            }
+        };
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            _ => String::new(),
+        };
+        if result.is_error {
+            anyhow::bail!(
+                "connecting net '{net}' failed ({}): {text}",
+                done(&written_nets)
+            );
+        }
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        // Written only if something was added to it (merge review, plan step 6).
+        if body["added"]
+            .as_array()
+            .is_some_and(|added| !added.is_empty())
+        {
+            written_nets.push(net.clone());
+        }
+        for added in body["added"].as_array().into_iter().flatten() {
+            if let (Some(reference), Some(pin)) =
+                (added["reference"].as_str(), added["pin"].as_str())
+            {
+                wired.insert((reference.to_string(), pin.to_string()));
+            }
+        }
+        for error in body["errors"].as_array().into_iter().flatten() {
+            if let Some(error) = error.as_str() {
+                wiring_errors.push(format!("{net}: {error}"));
+            }
+        }
+    }
+    let mut unconnected: Vec<String> = pins
+        .iter()
+        .flat_map(|(reference, symbol_pins)| {
+            symbol_pins
+                .iter()
+                .filter(|(number, _)| !wired.contains(&(reference.clone(), number.clone())))
+                .map(move |(number, _)| format!("{reference}.{number}"))
         })
         .collect();
-
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "template": template_id,
-            "components_placed": placed,
-            "connections_to_wire": mapped_connections,
-            "design_notes": tmpl["design_notes"],
-            "next_steps": "Use connect_to_net or connect_pins to wire the placed components according to the connections list above."
-        }))
-        .unwrap(),
-    ))
+    unconnected.sort();
+    unconnected.dedup();
+    for error in wiring_errors {
+        unresolved.push(json!({ "reason": error }));
+    }
+    // `connections_made` lists only the pins the wiring connected; the pins of
+    // an entry that were not connected are named beside them.
+    for entry in &mut made {
+        let pins: Vec<String> = entry["pins"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pin| pin.as_str().map(str::to_string))
+            .collect();
+        let (connected, missing): (Vec<String>, Vec<String>) = pins.into_iter().partition(|pin| {
+            pin.split_once('.')
+                .is_some_and(|(r, n)| wired.contains(&(r.to_string(), n.to_string())))
+        });
+        entry["pins"] = json!(connected);
+        if !missing.is_empty() {
+            entry["not_connected"] = json!(missing);
+        }
+    }
+    Ok(TemplateWiring {
+        made,
+        unresolved,
+        unconnected,
+        joined_existing,
+    })
 }
 
 async fn handle_list_categories(
@@ -689,6 +1042,7 @@ mod tests {
             .env(CHILD, "1")
             .env("APPDATA", home.path())
             .env("HOME", home.path())
+            .env(copperpour_test_home::UNCHANGED, "1")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -764,6 +1118,126 @@ mod tests {
             .find(|tool| tool.name == name)
             .expect("registered tool");
         (tool.handler)(&args, ctx).await.unwrap()
+    }
+
+    /// The map is executed, not handed back (#784): each entry that names a
+    /// pin is wired to its (mapped) net, an entry naming no pin is reported
+    /// with why, and pins no entry reaches are listed as still unconnected.
+    #[tokio::test]
+    async fn apply_template_wires_its_connection_map() {
+        // Copperpour's fixture writes templates to user_templates_dir(), so
+        // the test runs in a child with its own HOME, as the other fixture
+        // tests do. Without that, the merged test wrote into the developer's
+        // real ~/.copperpour/templates (found by step 6 review 1).
+        if !in_isolated_home("tools::templates::tests::apply_template_wires_its_connection_map") {
+            return;
+        }
+        let (_dir, schematic) = template_fixture();
+        let template_dir = user_templates_dir().unwrap();
+        std::fs::write(
+            template_dir.join("pullups.json"),
+            serde_json::to_vec_pretty(&json!({
+                "id": "test_pullups",
+                "name": "Pull-ups",
+                "description": "Wiring fixture",
+                "category": "test",
+                "components": [
+                    {"ref_prefix": "R", "lib_id": "Device:R", "value": "4.7k", "quantity": 3}
+                ],
+                "connections": [
+                    {"from": "R1.1", "to_net": "SDA"},
+                    {"from": "R1.2", "to_net": "VCC_3V3"},
+                    {"from": "R2.1", "to_net": "SCL"},
+                    {"from": "R2.2", "to_net": "VCC_3V3"},
+                    {"from": "R3.9", "to_net": "X"},
+                    {"from": "Q.1", "to_net": "Y"}
+                ],
+                "design_notes": "test"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        let applied = call_registered(
+            tools(),
+            "apply_template",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "template_id": "test_pullups",
+                "position_x": 180.34,
+                "position_y": 101.6,
+                "net_mappings": {"SDA": "I2C_SDA", "VCC_3V3": "+3V3"}
+            }),
+            ctx.clone(),
+        )
+        .await;
+        assert!(!applied.is_error, "{applied:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &applied.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        // The fixture already holds R1 and R2, so the template's R1..R3 are R3..R5.
+        let made: Vec<(String, Vec<String>)> = body["connections_made"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["net"].as_str().unwrap().to_string(),
+                    serde_json::from_value(m["pins"].clone()).unwrap(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, Vec<String>)> = vec![
+            ("I2C_SDA".into(), vec!["R3.1".into()]),
+            ("+3V3".into(), vec!["R3.2".into()]),
+            ("SCL".into(), vec!["R4.1".into()]),
+            ("+3V3".into(), vec!["R4.2".into()]),
+        ];
+        assert_eq!(made, expected, "{body}");
+        let reasons: Vec<&str> = body["connections_unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "R5 has no pin numbered or named '9'",
+                "the template has no part 'Q'"
+            ],
+            "{body}"
+        );
+        assert_eq!(body["unconnected_pins"], json!(["R5.1", "R5.2"]), "{body}");
+        assert!(body["next_steps"].is_string(), "{body}");
+
+        // The written file says the same: each pin is on its net.
+        for (reference, pin, net) in [
+            ("R3", "1", "I2C_SDA"),
+            ("R3", "2", "+3V3"),
+            ("R4", "1", "SCL"),
+            ("R4", "2", "+3V3"),
+        ] {
+            let result = call_registered(
+                crate::tools::sch_analysis::tools(),
+                "get_pin_net_name",
+                json!({
+                    "schematic": schematic.display().to_string(),
+                    "reference": reference,
+                    "pin_number": pin
+                }),
+                ctx.clone(),
+            )
+            .await;
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let pin_net: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(pin_net["net"], net, "{reference}.{pin}: {pin_net}");
+        }
     }
 
     #[tokio::test]

@@ -19,5 +19,7 @@ fs4.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+copperpour-test-home.workspace = true
+ctor.workspace = true
 pretty_assertions = "1"
 proptest = "1"

@@ -153,3 +153,10 @@ fn absent_attributes_are_not_invented() {
     }
     assert_eq!(symbol_block(&out), symbol_block(&src));
 }
+
+/// Keep this test binary out of the developer's home (see
+/// `copperpour-test-home`).
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

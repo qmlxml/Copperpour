@@ -212,7 +212,11 @@ mod tests {
                         "set_symbol_properties/properties/fields" |
                         "set_symbol_properties/properties/rename_fields" |
                         "copy_routing_pattern/properties/net_map" |
-                        "apply_template/properties/net_mappings"
+                        "apply_template/properties/net_mappings" |
+                        // Passed through to Freerouting; what it does not
+                        // apply is read back and reported (settings_not_applied).
+                        "route_specctra_dsn/properties/router_settings" |
+                        "set_erc_severity/properties/severities"
                     ),
                         "unreviewed open input record: {path}"
                     );

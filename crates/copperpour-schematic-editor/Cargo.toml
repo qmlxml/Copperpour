@@ -13,4 +13,6 @@ uuid.workspace = true
 copperpour-sexp.workspace = true  # For geometry (pin transforms, snap, T-junction detection)
 
 [dev-dependencies]
+copperpour-test-home.workspace = true
+ctor.workspace = true
 tempfile = "3"

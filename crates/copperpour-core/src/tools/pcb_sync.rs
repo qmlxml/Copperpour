@@ -128,6 +128,11 @@ struct BoardFootprint {
     /// Every pad the live footprint has, netted or not. `pad_nets` holds only
     /// pads that carry a net, so it cannot answer whether a pad exists.
     pad_numbers: BTreeSet<String>,
+    /// Where each pad sits on the board and how far its copper reaches, so a
+    /// pad-net change can be judged by the copper that touches that pad
+    /// (merge of the `marju212` fork, plan step 7). Empty when the footprint
+    /// was not read from a live board.
+    pad_reach: Vec<PadReach>,
     position: Point,
     rotation: f64,
     layer: String,
@@ -146,7 +151,147 @@ struct BoardState {
     /// Net name to the number of routed copper objects (tracks, arcs, vias,
     /// and zones) carrying the net.
     routed_nets: BTreeMap<String, usize>,
+    /// The routed copper itself, when read from a live board. Without it a
+    /// pad on a routed net cannot change net at all (the coarser rule).
+    copper: Option<RoutedCopper>,
     bounds: Bounds,
+}
+
+/// One pad's centre in board coordinates and the radius its copper reaches:
+/// half the diagonal of its largest copper shape, so a touch is never
+/// missed. `None` for a pad whose reach cannot be bounded (a custom shape,
+/// whose primitives may extend past its anchor size, or no size at all).
+#[derive(Debug, Clone, PartialEq)]
+struct PadReach {
+    number: String,
+    at: Point,
+    radius: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CopperPiece {
+    Segment { a: Point, b: Point, half_width: f64 },
+    Disc { at: Point, radius: f64 },
+}
+
+/// Tracks, arcs and vias by net, the nets that carry a copper zone, and
+/// whether a zone's net could not be read.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct RoutedCopper {
+    pieces: BTreeMap<String, Vec<CopperPiece>>,
+    /// For each net, what each of `pieces` is ("track 3fa…"), index for
+    /// index, so a refusal can name the item to remove. Filled by the
+    /// snapshot; a piece without one is named by its net alone.
+    sources: BTreeMap<String, Vec<String>>,
+    /// Nets with a routed item whose geometry could not be read (wrong
+    /// declared type, no start, end, position or width): copper of these
+    /// nets counts as reaching every pad, since where it is is unknown.
+    incomplete_nets: BTreeSet<String>,
+    zone_nets: BTreeSet<String>,
+    unreadable_zone: bool,
+}
+
+/// Slack added to every touch distance, in mm, so a track ending exactly on
+/// a pad's edge counts as touching it.
+const TOUCH_SLACK_MM: f64 = 0.01;
+
+impl RoutedCopper {
+    /// Whether copper of `net` reaches a pad of `footprint` numbered
+    /// `number`, and if so why. Layers are not compared, so copper on another
+    /// layer counts: that errs towards refusing. A pad with no reach read (no
+    /// geometry, a custom shape) counts as touched.
+    #[cfg(test)]
+    fn touches_pad(&self, footprint: &BoardFootprint, number: &str, net: &str) -> bool {
+        self.reach(footprint, number, net).is_some()
+    }
+
+    /// Why copper of `net` counts as reaching pad `number`, or `None`.
+    fn reach(&self, footprint: &BoardFootprint, number: &str, net: &str) -> Option<String> {
+        let pads: Vec<&PadReach> = footprint
+            .pad_reach
+            .iter()
+            .filter(|pad| pad.number == number)
+            .collect();
+        if pads.is_empty() || pads.iter().any(|pad| pad.radius.is_none()) {
+            return Some(format!(
+                "the pad's copper shape could not be bounded (a custom or unread shape), so any \
+                 copper of '{net}' counts as reaching it"
+            ));
+        }
+        if self.incomplete_nets.contains(net) {
+            return Some(format!(
+                "copper of '{net}' whose geometry could not be read counts as reaching it; find \
+                 and remove it in KiCad"
+            ));
+        }
+        let pieces = self.pieces.get(net)?;
+        let index = pieces.iter().position(|piece| {
+            pads.iter().any(|pad| {
+                let reach = pad.radius.unwrap_or(f64::INFINITY) + TOUCH_SLACK_MM;
+                match piece {
+                    CopperPiece::Segment { a, b, half_width } => {
+                        point_segment_distance(&pad.at, a, b) <= reach + half_width
+                    }
+                    CopperPiece::Disc { at, radius } => {
+                        (pad.at.x - at.x).hypot(pad.at.y - at.y) <= reach + radius
+                    }
+                }
+            })
+        })?;
+        let source = self
+            .sources
+            .get(net)
+            .and_then(|sources| sources.get(index))
+            .cloned()
+            .unwrap_or_else(|| format!("copper of '{net}'"));
+        Some(format!("{source} reaches it"))
+    }
+}
+
+/// "track <uuid> at (x, y)", for a refusal to name the item to remove.
+fn item_label(
+    kind: &str,
+    id: Option<&copperpour_ipc::gen::kiapi::common::types::Kiid>,
+    at: &Point,
+) -> String {
+    let id = id.map(|id| id.value.as_str()).filter(|id| !id.is_empty());
+    format!(
+        "{kind}{} at ({:.3}, {:.3})",
+        id.map(|id| format!(" {id}")).unwrap_or_default(),
+        at.x,
+        at.y
+    )
+}
+
+fn point_segment_distance(p: &Point, a: &Point, b: &Point) -> f64 {
+    let (vx, vy) = (b.x - a.x, b.y - a.y);
+    let len2 = vx * vx + vy * vy;
+    let t = if len2 == 0.0 {
+        0.0
+    } else {
+        (((p.x - a.x) * vx + (p.y - a.y) * vy) / len2).clamp(0.0, 1.0)
+    };
+    (p.x - a.x - t * vx).hypot(p.y - a.y - t * vy)
+}
+
+/// An arc as two chords (start to mid, mid to end), each widened by the
+/// arc's sagitta, the most the arc bulges past its chord start to end. The
+/// chords alone would miss copper on the bulge; widened, they cover it and
+/// err towards refusing.
+fn arc_pieces(a: Point, m: Point, b: Point, half_width: f64) -> [CopperPiece; 2] {
+    let half_width = half_width + point_segment_distance(&m, &a, &b);
+    [
+        CopperPiece::Segment {
+            a,
+            b: m,
+            half_width,
+        },
+        CopperPiece::Segment {
+            a: m,
+            b,
+            half_width,
+        },
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -238,6 +383,12 @@ struct SyncPlan {
     /// Survives a conflict: it is a report about the schematic, not a change
     /// the plan would make.
     unassigned: Vec<UnassignedFootprint>,
+    /// Nets of copper zones a planned pad reassignment involves (old or new
+    /// net). A pour is recomputed from the pads by `refill_zones`, so it does
+    /// not block the change the way a track does; its fill is stale after the
+    /// apply until refilled (owner ruling 2026-11-01, plan step 7b, after the
+    /// `marju212` fork's `6dad58a`). Empty for a conflicted plan.
+    zones_to_refill: BTreeSet<String>,
     /// What the live board's measured extent was, set from the snapshot the
     /// plan was made against, so the dry run and the apply report the same.
     /// Not part of the plan's identity: `sync_response` reports it.
@@ -315,6 +466,11 @@ struct PreparedFootprint {
     /// footprint definition.
     description_and_keywords: copperpour_ipc::gen::kiapi::board::types::FootprintAttributes,
     models: Vec<copperpour_ipc::gen::kiapi::board::types::Footprint3DModel>,
+    /// The library's net-tie pad groups and footprint-level zone connection
+    /// (from the `marju212` fork): without the ties a solder jumper's bridge
+    /// reaches the board as a short.
+    net_ties: Vec<copperpour_ipc::gen::kiapi::board::types::NetTieDefinition>,
+    zone_connection: Option<copperpour_ipc::gen::kiapi::board::types::ZoneConnectionStyle>,
     /// The library's properties as typed fields, or why they could not be
     /// read. Unreadable properties never refuse the part (#789).
     library_fields: std::result::Result<super::library_footprint::LibraryProperties, String>,
@@ -420,6 +576,10 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     };
     let ipc_board = board.clone();
     let library_board = board.clone();
+    // The pour nets of the plan being applied, kept outside the IPC closure
+    // so an uncertain commit outcome can still name them (step 7b review 1).
+    let planned_refill = std::sync::Arc::new(std::sync::Mutex::new(BTreeSet::<String>::new()));
+    let planned_refill_in = planned_refill.clone();
     let result = attempt_ipc_write(
         ctx,
         &board,
@@ -484,6 +644,9 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 return Ok(sync_response(&plan, "noop", hierarchy.len(), false, &options));
             }
 
+            if let Ok(mut refill) = planned_refill_in.lock() {
+                refill.clone_from(&plan.zones_to_refill);
+            }
             let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
@@ -530,7 +693,11 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 crate::mcp::error::extract_error_kind(&result).as_deref(),
                 Some("ipc_outcome_unknown" | "ipc_batch_recovered")
             ) {
-                return Ok(result);
+                let refill = planned_refill
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                return Ok(with_refill_guidance(result, &refill));
             }
             let message = result
                 .content
@@ -602,6 +769,11 @@ struct SyncResponse<'a> {
     /// collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
     /// `coverage` entry beside it is a count category and stays singular.
     unassigned_footprints: &'a [UnassignedFootprint],
+    /// Zone nets whose fills are stale after the apply (see
+    /// `SyncPlan::zones_to_refill`), with a `zones_need_refill` warning naming
+    /// `refill_zones`, in the dry run as well as after the apply.
+    zones_to_refill: &'a BTreeSet<String>,
+    warnings: Vec<serde_json::Value>,
     /// Bounded as rendered only: `plan.changes` stays whole, since the plan
     /// revision hashes it and the apply sends it.
     changes: &'a [PlannedChange],
@@ -640,8 +812,89 @@ impl<'a> SyncResponse<'a> {
             undo: applied.then_some("Ctrl-Z reverses the whole schematic-to-PCB update."),
             diagnostics: Cow::Borrowed(&plan.diagnostics),
             unassigned_footprints: &plan.unassigned,
+            // A conflicted plan applies nothing, whichever stage refused it
+            // (planner, preflight or a stale revision), so it leaves no fill
+            // stale (step 7b review 1).
+            zones_to_refill: if status == "conflict" || plan.status == PlanStatus::Conflict {
+                &NO_ZONES
+            } else {
+                &plan.zones_to_refill
+            },
+            warnings: if status == "conflict" || plan.status == PlanStatus::Conflict {
+                Vec::new()
+            } else {
+                refill_warning(&plan.zones_to_refill, applied)
+                    .into_iter()
+                    .collect()
+            },
         }
     }
+}
+
+static NO_ZONES: BTreeSet<String> = BTreeSet::new();
+
+/// An uncertain commit outcome, given the pours the plan would have left
+/// stale: `zones_to_refill` and the `zones_need_refill` warning go into the
+/// error's JSON body, where a caller reads fields (step 7b review 2). A
+/// recovered batch (`ipc_batch_recovered`) is confirmed unchanged, so it gets
+/// nothing: telling the caller to refill and save would be false.
+fn with_refill_guidance(mut result: CallToolResult, zones: &BTreeSet<String>) -> CallToolResult {
+    if crate::mcp::error::extract_error_kind(&result).as_deref() != Some("ipc_outcome_unknown") {
+        return result;
+    }
+    let Some(mut warning) = refill_warning(zones, true) else {
+        return result;
+    };
+    warning["message"] = serde_json::json!(format!(
+        "If the commit took effect: {}",
+        warning["message"].as_str().unwrap_or_default()
+    ));
+    let Some(ToolContent::Text { text }) = result.content.first_mut() else {
+        return result;
+    };
+    let Ok(mut body) = serde_json::from_str::<serde_json::Value>(text) else {
+        return result;
+    };
+    if let Some(object) = body.as_object_mut() {
+        object.insert("zones_to_refill".to_string(), serde_json::json!(zones));
+        object.insert("warnings".to_string(), serde_json::json!([warning]));
+        if let Ok(serialized) = serde_json::to_string(&body) {
+            *text = serialized;
+        }
+    }
+    result
+}
+
+/// The warning for stale zone fills: before the apply it says what the apply
+/// will leave, after it what to do now.
+fn refill_warning(zones: &BTreeSet<String>, applied: bool) -> Option<serde_json::Value> {
+    if zones.is_empty() {
+        return None;
+    }
+    let nets = zones
+        .iter()
+        .map(|net| format!("{net:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = if applied {
+        format!(
+            "Pads changed net under zones on {nets}; their fills are stale. Run refill_zones \
+             (toolset pcb_export), then save_project; or run_drc (toolset verification) with \
+             sync_live_board: true \
+             and refill_zones: true, which refills the live board, saves it and checks it. A \
+             refill only recomputes the fills, so it can be repeated if it fails. Until it \
+             succeeds DRC can report shorts or unconnected items there, and a board saved and \
+             plotted with the stale fill can have a short. This is reported only in this \
+             response: a later sync does not detect a stale fill."
+        )
+    } else {
+        format!(
+            "Applying this plan changes pads' nets under zones on {nets}; their fills will be \
+             stale until refill_zones (toolset pcb_export) runs after the apply, followed by \
+             save_project."
+        )
+    };
+    Some(serde_json::json!({ "code": "zones_need_refill", "message": message }))
 }
 
 fn sync_response(
@@ -716,6 +969,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
     let mut diagnostics = Vec::new();
     let mut counts = SyncCounts::default();
     let mut changes = Vec::new();
+    let mut zones_to_refill = BTreeSet::new();
     let mut board_by_path = HashMap::new();
     let mut board_by_reference = HashMap::new();
 
@@ -1005,11 +1259,46 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             if old_net == new_net {
                 continue;
             }
-            if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
+            // With the live copper read, only copper of the old net reaching
+            // this pad, or a zone whose net cannot be read, blocks the change;
+            // a part could otherwise never leave a busy net such as +5V (merge
+            // of the `marju212` fork, plan steps 7 and 7b). Without the
+            // copper, any routed net blocks.
+            // Each refusal names its cause, so the caller removes what
+            // blocks rather than tracks that do not (review 3 of plan step 7).
+            // A pour on either net does not block (owner ruling 2026-11-01,
+            // plan step 7b): it is recorded in `zones_to_refill`, since a
+            // refill recomputes it from the pads. An unreadable zone still
+            // refuses, as its net is unknown.
+            let blocked: Option<String> = match &board.copper {
+                Some(copper) if copper.unreadable_zone => Some(
+                    "a zone's net could not be read, so it may pour either net; check the zones \
+                     with list_zones or in KiCad"
+                        .to_string(),
+                ),
+                Some(copper) => {
+                    let reached = (!old_net.is_empty())
+                        .then(|| copper.reach(footprint, number, old_net))
+                        .flatten()
+                        .map(|why| format!("{why} (query_traces, delete_trace, delete_via)"));
+                    if reached.is_none() {
+                        for net in [old_net, new_net] {
+                            if copper.zone_nets.contains(net) {
+                                zones_to_refill.insert(net.to_string());
+                            }
+                        }
+                    }
+                    reached
+                }
+                None => (board.routed_nets.contains_key(old_net)
+                    || board.routed_nets.contains_key(new_net))
+                .then(|| "routed copper uses that net".to_string()),
+            };
+            if let Some(why) = blocked {
                 diagnostics.push(conflict(
                     "routed_pad_net_change",
                     format!(
-                        "{} pad {} would change from '{}' to '{}' while routed copper uses that net",
+                        "{} pad {} would change from '{}' to '{}': {why}",
                         component.reference, number, old_net, new_net
                     ),
                     Some(&component.reference),
@@ -1072,6 +1361,10 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         PlanStatus::Ready
     };
     let plan_revision = plan_revision(netlist_source, board);
+    // A conflicted plan reassigns nothing, so it leaves no fill stale.
+    if !diagnostics.is_empty() {
+        zones_to_refill.clear();
+    }
     SyncPlan {
         status,
         plan_revision,
@@ -1079,6 +1372,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         changes,
         diagnostics,
         unassigned,
+        zones_to_refill,
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
     }
@@ -2042,29 +2336,153 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
         .map(|net| (net.name.clone(), net.netcode))
         .collect::<BTreeMap<_, _>>();
     let mut routed_nets = BTreeMap::new();
+    let mut copper = RoutedCopper::default();
+    let mm = |v: Option<&kiapi::common::types::Vector2>| {
+        v.map(|v| Point {
+            x: copperpour_ipc::builders::nm_to_mm(v.x_nm),
+            y: copperpour_ipc::builders::nm_to_mm(v.y_nm),
+        })
+    };
+    let net_of = |net: Option<&kiapi::board::types::Net>| {
+        net.map(|net| net.name.clone())
+            .filter(|name| !name.is_empty())
+    };
+    // A negative width would shrink the touch distance: read as unknown.
+    let half = |width: Option<&kiapi::common::types::Distance>| {
+        width
+            .filter(|w| w.value_nm >= 0)
+            .map(|w| copperpour_ipc::builders::nm_to_mm(w.value_nm) / 2.0)
+    };
+    // The geometry is read only from items of their declared type. KiCad
+    // 10.0.7 returns only the requested types (`api_handler_pcb.cpp`, review 3
+    // of plan step 7), so this is a second check: decoding one message as
+    // another would place copper at random. An item
+    // with a net whose geometry is not read puts that net in
+    // `incomplete_nets`, so it still refuses (review 1 of plan step 7).
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
         if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, track.net.as_ref());
+            let Some(net) = net_of(track.net.as_ref()) else {
+                continue;
+            };
+            match (
+                copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Track"),
+                mm(track.start.as_ref()),
+                mm(track.end.as_ref()),
+                half(track.width.as_ref()),
+            ) {
+                (true, Some(a), Some(b), Some(half_width)) => {
+                    copper
+                        .sources
+                        .entry(net.clone())
+                        .or_default()
+                        .push(item_label("track", track.id.as_ref(), &a));
+                    copper
+                        .pieces
+                        .entry(net)
+                        .or_default()
+                        .push(CopperPiece::Segment { a, b, half_width });
+                }
+                _ => {
+                    copper.incomplete_nets.insert(net);
+                }
+            }
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
         if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, arc.net.as_ref());
+            let Some(net) = net_of(arc.net.as_ref()) else {
+                continue;
+            };
+            match (
+                copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Arc"),
+                mm(arc.start.as_ref()),
+                mm(arc.mid.as_ref()),
+                mm(arc.end.as_ref()),
+                half(arc.width.as_ref()),
+            ) {
+                (true, Some(a), Some(m), Some(b), Some(half_width)) => {
+                    // No tool lists or deletes an arc on a live board.
+                    let label = format!(
+                        "{} (remove it in KiCad)",
+                        item_label("arc", arc.id.as_ref(), &a)
+                    );
+                    copper
+                        .sources
+                        .entry(net.clone())
+                        .or_default()
+                        .extend([label.clone(), label]);
+                    copper
+                        .pieces
+                        .entry(net)
+                        .or_default()
+                        .extend(arc_pieces(a, m, b, half_width));
+                }
+                _ => {
+                    copper.incomplete_nets.insert(net);
+                }
+            }
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
         if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, via.net.as_ref());
+            let Some(net) = net_of(via.net.as_ref()) else {
+                continue;
+            };
+            let at = mm(via.position.as_ref())
+                .filter(|_| copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Via"));
+            // The largest copper size on any layer; a via with none read is
+            // given 1 mm, larger than any standard via, so it errs towards
+            // touching.
+            let radius = via
+                .pad_stack
+                .as_ref()
+                .into_iter()
+                .flat_map(|stack| stack.copper_layers.iter())
+                .filter_map(|layer| layer.size.as_ref())
+                .map(|size| copperpour_ipc::builders::nm_to_mm(size.x_nm.max(size.y_nm)) / 2.0)
+                .fold(None, |max: Option<f64>, r| {
+                    Some(max.map_or(r, |m| m.max(r)))
+                })
+                .unwrap_or(1.0);
+            match at {
+                Some(at) => {
+                    copper
+                        .sources
+                        .entry(net.clone())
+                        .or_default()
+                        .push(item_label("via", via.id.as_ref(), &at));
+                    copper
+                        .pieces
+                        .entry(net)
+                        .or_default()
+                        .push(CopperPiece::Disc { at, radius });
+                }
+                None => {
+                    copper.incomplete_nets.insert(net);
+                }
+            }
         }
     }
     let mut unreadable_zone = false;
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
         match zone_net(item.value.as_slice()) {
-            ZoneNet::Copper(net) => record_routed_net(&mut routed_nets, Some(&net)),
+            ZoneNet::Copper(net) => {
+                // A copper zone on no net pours nothing a pad is on; recording
+                // its empty name would refuse every pad gaining or losing a
+                // net (review 1 of plan step 7).
+                if !net.name.is_empty() {
+                    copper.zone_nets.insert(net.name.clone());
+                }
+                record_routed_net(&mut routed_nets, Some(&net))
+            }
             ZoneNet::RuleArea => {}
             ZoneNet::Unreadable => unreadable_zone = true,
         }
     }
+    copper.unreadable_zone = unreadable_zone;
     if unreadable_zone {
         // A zone whose net cannot be read could pour any net, so every pad-net
         // reassignment fails closed.
@@ -2086,6 +2504,7 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
         state: BoardState {
             footprints,
             routed_nets,
+            copper: Some(copper),
             bounds: Bounds {
                 min_x: extents.min.x,
                 min_y: extents.min.y,
@@ -2122,6 +2541,7 @@ fn board_footprint_from_instance(
         .context("KiCad returned a footprint without a definition")?;
     let mut pad_nets = BTreeMap::new();
     let mut pad_numbers = BTreeSet::new();
+    let mut pad_reach = Vec::new();
     for child in &definition.items {
         // Same discriminator as `apply_footprint_fields`, for the same
         // reason: a graphic can decode as an empty pad.
@@ -2142,6 +2562,42 @@ fn board_footprint_from_instance(
             continue;
         };
         pad_numbers.insert(pad.number.clone());
+        // Pads come back in board coordinates (`client.rs`,
+        // `get_footprint_pads_in`), so no footprint transform is applied. A
+        // pad with no position, no size, a zero size or a custom shape gets
+        // no bounded reach and counts as touched (review 2 of plan step 7).
+        {
+            use kiapi::board::types::PadStackShape;
+            let layers = pad
+                .pad_stack
+                .as_ref()
+                .map(|stack| stack.copper_layers.as_slice())
+                .unwrap_or_default();
+            let custom = layers
+                .iter()
+                .any(|layer| layer.shape() == PadStackShape::PssCustom);
+            let radius = layers
+                .iter()
+                .filter_map(|layer| layer.size.as_ref())
+                .map(|size| {
+                    copperpour_ipc::builders::nm_to_mm(size.x_nm)
+                        .hypot(copperpour_ipc::builders::nm_to_mm(size.y_nm))
+                        / 2.0
+                })
+                .fold(None, |max: Option<f64>, r| {
+                    Some(max.map_or(r, |m| m.max(r)))
+                })
+                .filter(|radius| *radius > 0.0 && !custom);
+            let at = pad.position.as_ref().map(|at| Point {
+                x: copperpour_ipc::builders::nm_to_mm(at.x_nm),
+                y: copperpour_ipc::builders::nm_to_mm(at.y_nm),
+            });
+            pad_reach.push(PadReach {
+                number: pad.number.clone(),
+                at: at.unwrap_or(Point { x: 0.0, y: 0.0 }),
+                radius: radius.filter(|_| at.is_some()),
+            });
+        }
         if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
             pad_nets.insert(pad.number, net.name);
         }
@@ -2183,6 +2639,7 @@ fn board_footprint_from_instance(
         symbol_path: board_symbol_path(footprint.symbol_path.as_ref()),
         pad_nets,
         pad_numbers,
+        pad_reach,
         position: Point {
             x: position
                 .map(|point| copperpour_ipc::builders::nm_to_mm(point.x_nm))
@@ -2360,6 +2817,8 @@ fn prepare_footprint_source(
     let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
     let description_and_keywords = super::library_footprint::description_and_keywords(&root);
     let models = super::library_footprint::models(&root).map_err(unsupported)?;
+    let net_ties = super::library_footprint::net_ties(&root).map_err(unsupported)?;
+    let zone_connection = super::library_footprint::zone_connection(&root).map_err(unsupported)?;
     let library_fields =
         super::library_footprint::properties(&root).map_err(|error| format!("{error:#}"));
     // Properties travel as typed fields when they can be read. Drawing visible
@@ -2379,6 +2838,8 @@ fn prepare_footprint_source(
         attributes,
         description_and_keywords,
         models,
+        net_ties,
+        zone_connection,
         library_fields,
         width,
         height,
@@ -2406,6 +2867,11 @@ fn apply_library_data(
     definition.items.extend(part.models.iter().map(|model| {
         copperpour_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
     }));
+    super::library_footprint::apply_net_ties_and_zone_connection(
+        footprint,
+        &part.net_ties,
+        part.zone_connection,
+    )?;
     if let Ok(fields) = &part.library_fields {
         apply_library_fields(footprint, fields)?;
     }
@@ -3761,6 +4227,7 @@ mod tests {
                 ("2".to_string(), "GND".to_string()),
             ]),
             pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
+            pad_reach: Vec::new(),
             position: Point { x: 1.0, y: 2.0 },
             rotation: 0.0,
             layer: "F.Cu".to_string(),
@@ -3776,6 +4243,7 @@ mod tests {
         BoardState {
             footprints,
             routed_nets: BTreeMap::new(),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -3808,6 +4276,7 @@ mod tests {
                         ("2".to_string(), "GND".to_string()),
                     ]),
                     pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
+                    pad_reach: Vec::new(),
                     position: Point { x: 25.0, y: 30.0 },
                     rotation: 90.0,
                     layer: "B.Cu".to_string(),
@@ -3825,6 +4294,7 @@ mod tests {
                     symbol_path: None,
                     pad_nets: BTreeMap::new(),
                     pad_numbers: BTreeSet::new(),
+                    pad_reach: Vec::new(),
                     position: Point { x: 2.0, y: 2.0 },
                     rotation: 0.0,
                     layer: "F.Cu".to_string(),
@@ -3836,6 +4306,7 @@ mod tests {
                 },
             ],
             routed_nets: BTreeMap::new(),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -4648,6 +5119,172 @@ mod tests {
         );
     }
 
+    /// R1's pad 1 moves from VCC to BUS. `vcc` is the routed VCC copper on
+    /// the board, `zone_nets` the nets a zone pours, and `pad1` the reach
+    /// read for pad 1 (`None`: no bound, as for a custom-shape pad). After the
+    /// `marju212` fork's pad-reach rule (plan step 7).
+    fn pad_move_plan(
+        vcc: Vec<CopperPiece>,
+        zone_nets: &[&str],
+        pad1: Option<f64>,
+        unreadable_zone: bool,
+    ) -> SyncPlan {
+        let design = ExportedDesign {
+            components: vec![DesignComponent {
+                pad_nets: BTreeMap::from([
+                    ("1".to_string(), "BUS".to_string()),
+                    ("2".to_string(), "GND".to_string()),
+                ]),
+                ..resistor("R1", "/sheet/existing")
+            }],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.pad_reach = vec![
+            PadReach {
+                number: "1".to_string(),
+                at: Point { x: 0.2, y: 2.0 },
+                radius: pad1,
+            },
+            PadReach {
+                number: "2".to_string(),
+                at: Point { x: 1.8, y: 2.0 },
+                radius: Some(0.6),
+            },
+        ];
+        let mut board = board_with(vec![footprint]);
+        board.routed_nets = BTreeMap::from([("VCC".to_string(), vcc.len())]);
+        board.copper = Some(RoutedCopper {
+            pieces: BTreeMap::from([("VCC".to_string(), vcc)]),
+            sources: BTreeMap::new(),
+            incomplete_nets: BTreeSet::new(),
+            zone_nets: zone_nets.iter().map(|net| net.to_string()).collect(),
+            unreadable_zone,
+        });
+        plan_sync("netlist", &design, &board)
+    }
+
+    fn far_vcc_track() -> Vec<CopperPiece> {
+        vec![CopperPiece::Segment {
+            a: Point { x: 5.0, y: 5.0 },
+            b: Point { x: 9.0, y: 5.0 },
+            half_width: 0.2,
+        }]
+    }
+
+    /// (a) Not refusing is right here: VCC is routed only far from R1's pad 1,
+    /// so moving the pad strands no copper and KiCad's Update PCB would make
+    /// the same change. Before this rule a part could never leave a routed
+    /// net such as +5V. (b) Refusing is right when copper of VCC reaches the
+    /// pad, when a zone pours VCC or BUS, or when a zone's net is unreadable,
+    /// which the tests below assert.
+    #[test]
+    fn a_pad_no_copper_touches_may_leave_a_routed_net() {
+        let plan = pad_move_plan(far_vcc_track(), &[], Some(0.6), false);
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert!(!plan
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "routed_pad_net_change"));
+    }
+
+    #[test]
+    fn copper_reaching_the_pad_still_blocks_the_change() {
+        let track = vec![CopperPiece::Segment {
+            a: Point { x: -3.0, y: 2.0 },
+            b: Point { x: 0.2, y: 2.0 },
+            half_width: 0.2,
+        }];
+        assert_eq!(
+            pad_move_plan(track, &[], Some(0.6), false).status,
+            PlanStatus::Conflict
+        );
+        let via = vec![CopperPiece::Disc {
+            at: Point { x: 0.2, y: 3.0 },
+            radius: 0.45,
+        }];
+        assert_eq!(
+            pad_move_plan(via, &[], Some(0.6), false).status,
+            PlanStatus::Conflict
+        );
+    }
+
+    /// With the copper read, a pour on the old or new net is planned and named
+    /// for a refill (owner ruling 2026-11-01, plan step 7b). (a) Not refusing
+    /// is right: a refill recomputes the fill from the pads. (b) Refusing is
+    /// right when a zone's net cannot be read, asserted here, and when copper
+    /// of the old net reaches the pad (`a_poured_net_with_copper_on_the_pad_still_blocks`).
+    #[test]
+    fn with_copper_read_a_pour_asks_for_a_refill_and_an_unreadable_zone_blocks() {
+        for poured in ["VCC", "BUS"] {
+            let plan = pad_move_plan(far_vcc_track(), &[poured], Some(0.6), false);
+            assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+            assert_eq!(plan.zones_to_refill, BTreeSet::from([poured.to_string()]));
+        }
+        let unreadable = pad_move_plan(far_vcc_track(), &["VCC"], Some(0.6), true);
+        assert_eq!(unreadable.status, PlanStatus::Conflict);
+        assert!(unreadable.zones_to_refill.is_empty());
+    }
+
+    /// Copper of the old net on the pad still refuses, pour or not, and a
+    /// conflicted plan names no zone to refill, since it changes nothing.
+    #[test]
+    fn a_poured_net_with_copper_on_the_pad_still_blocks() {
+        let track = vec![CopperPiece::Segment {
+            a: Point { x: -3.0, y: 2.0 },
+            b: Point { x: 0.2, y: 2.0 },
+            half_width: 0.2,
+        }];
+        let plan = pad_move_plan(track, &["VCC"], Some(0.6), false);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.zones_to_refill.is_empty());
+    }
+
+    /// A pad whose reach cannot be bounded (custom shape) counts as touched.
+    #[test]
+    fn a_pad_without_a_bounded_reach_counts_as_touched() {
+        assert_eq!(
+            pad_move_plan(far_vcc_track(), &[], None, false).status,
+            PlanStatus::Conflict
+        );
+    }
+
+    /// An arc bulges past its chords: a pad on the bulge is touched although
+    /// both chords (start to mid, mid to end) pass about 0.59 mm from it.
+    #[test]
+    fn an_arc_touches_a_pad_on_its_bulge() {
+        // Semicircle of radius 2 around (0.2, 4.0), from (-1.8, 4) through
+        // (0.2, 2) to (2.2, 4). The pad at (1.614, 2.586) sits on the arc
+        // itself, 2.0 mm from the centre.
+        let pieces = arc_pieces(
+            Point { x: -1.8, y: 4.0 },
+            Point { x: 0.2, y: 2.0 },
+            Point { x: 2.2, y: 4.0 },
+            0.1,
+        );
+        let pad = Point { x: 1.614, y: 2.586 };
+        for piece in &pieces {
+            if let CopperPiece::Segment { a, b, .. } = piece {
+                assert!(
+                    point_segment_distance(&pad, a, b) > 0.5,
+                    "a chord alone misses"
+                );
+            }
+        }
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.pad_reach = vec![PadReach {
+            number: "1".to_string(),
+            at: pad,
+            radius: Some(0.1),
+        }];
+        let copper = RoutedCopper {
+            pieces: BTreeMap::from([("VCC".to_string(), pieces.to_vec())]),
+            ..Default::default()
+        };
+        assert!(copper.touches_pad(&footprint, "1", "VCC"));
+    }
+
     #[test]
     fn removing_a_pad_from_a_routed_net_conflicts_the_whole_plan() {
         let design = ExportedDesign {
@@ -4667,6 +5304,7 @@ mod tests {
                 symbol_path: Some("/sheet/existing".to_string()),
                 pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
                 pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
+                pad_reach: Vec::new(),
                 position: Point { x: 1.0, y: 2.0 },
                 rotation: 0.0,
                 layer: "F.Cu".to_string(),
@@ -4677,6 +5315,7 @@ mod tests {
                 fields: BTreeMap::new(),
             }],
             routed_nets: BTreeMap::from([("VCC".to_string(), 1)]),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -4851,6 +5490,7 @@ mod tests {
         let board = BoardState {
             footprints: Vec::new(),
             routed_nets: BTreeMap::new(),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -5785,6 +6425,62 @@ mod tests {
         }
     }
 
+    /// A plan refused after the pad loop (a preflight failure or a stale
+    /// revision) applies nothing, so its response names no zone to refill and
+    /// carries no refill warning, while the same plan answered as ready does
+    /// (step 7b review 1).
+    #[test]
+    fn a_conflicted_response_names_no_zone_to_refill() {
+        let mut plan = plan_adding(Vec::new());
+        plan.zones_to_refill = BTreeSet::from(["GND".to_string()]);
+        let body = |status: &str| {
+            let result = sync_response(&plan, status, 1, false, &ResponseOptions::default());
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text content");
+            };
+            serde_json::from_str::<serde_json::Value>(text).unwrap()
+        };
+        let ready = body("ready");
+        assert_eq!(ready["zones_to_refill"], serde_json::json!(["GND"]));
+        assert_eq!(ready["warnings"][0]["code"], "zones_need_refill");
+        let refused = body("conflict");
+        assert_eq!(refused["zones_to_refill"], serde_json::json!([]));
+        assert_eq!(refused["warnings"], serde_json::json!([]));
+    }
+
+    /// An uncertain commit outcome names the pours to refill in its JSON
+    /// body; a recovered batch, confirmed unchanged, does not (step 7b review
+    /// 2: telling the caller to refill and save an unchanged board is false).
+    #[test]
+    fn only_an_uncertain_outcome_carries_the_refill_guidance() {
+        let zones = BTreeSet::from(["GND".to_string()]);
+        let body = |result: &CallToolResult| {
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text content");
+            };
+            serde_json::from_str::<serde_json::Value>(text).unwrap()
+        };
+        let uncertain = with_refill_guidance(
+            crate::tools::ipc_uncertain_result("commit reply lost"),
+            &zones,
+        );
+        assert_eq!(uncertain.content.len(), 1);
+        let uncertain = body(&uncertain);
+        assert_eq!(
+            uncertain["zones_to_refill"],
+            serde_json::json!(["GND"]),
+            "{uncertain}"
+        );
+        assert!(uncertain["warnings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("If the commit took effect:"));
+        let recovered =
+            with_refill_guidance(crate::tools::ipc_recovered_result("rolled back"), &zones);
+        let recovered = body(&recovered);
+        assert!(recovered.get("zones_to_refill").is_none(), "{recovered}");
+    }
+
     fn plan_adding(changes: Vec<PlannedChange>) -> SyncPlan {
         SyncPlan {
             status: PlanStatus::Ready,
@@ -5799,6 +6495,7 @@ mod tests {
             changes,
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
+            zones_to_refill: BTreeSet::new(),
             staging: None,
         }
     }
@@ -6059,6 +6756,8 @@ mod tests {
     struct HeldBoard {
         footprints: Vec<prost_types::Any>,
         zones: Vec<prost_types::Any>,
+        /// Tracks the board answers a `KotPcbTrace` query with.
+        tracks: Vec<prost_types::Any>,
         nets: Vec<&'static str>,
     }
 
@@ -6131,10 +6830,18 @@ mod tests {
                         .map(|id| id.value)
                         .unwrap_or_default()
                 }))
+                .chain(held.tracks.iter().map(|item| {
+                    kiapi::board::types::Track::decode(item.value.as_slice())
+                        .ok()
+                        .and_then(|track| track.id)
+                        .map(|id| id.value)
+                        .unwrap_or_default()
+                }))
                 .collect::<Vec<_>>();
             let held_footprints = std::sync::Arc::new(std::sync::Mutex::new(held.footprints));
             let board_held = held_footprints.clone();
             let held_zones = held.zones;
+            let held_tracks = held.tracks;
             let held_nets = held.nets;
             let board_text = std::sync::Arc::new(std::sync::Mutex::new(
                 String::from_utf8_lossy(include_bytes!(
@@ -6201,6 +6908,12 @@ mod tests {
                                 )
                                 .collect(),
                             _ if request.types.contains(&zones) => held_zones.clone(),
+                            _ if request.types.contains(
+                                &(kiapi::common::types::KiCadObjectType::KotPcbTrace as i32),
+                            ) =>
+                            {
+                                held_tracks.clone()
+                            }
                             _ => Vec::new(),
                         };
                         return Some(copperpour_ipc::builders::pack_any(
@@ -6607,6 +7320,7 @@ mod tests {
         let served = ServedSync::holding(HeldBoard {
             footprints: vec![schematic_backed_resistor()],
             zones,
+            tracks: Vec::new(),
             nets: vec!["VCC", "GND"],
         })
         .await;
@@ -6620,6 +7334,156 @@ mod tests {
             .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
             .replace("/Power/VCC", "VCC")
             .replace(&format!("(name \"{net}\")"), "(name \"NEW_NET\")")
+    }
+
+    /// A track on `net` from `(x, y)` to 2 mm right of it, 0.25 mm wide.
+    fn track_item(net: &str, x_nm: i64, y_nm: i64) -> prost_types::Any {
+        use copperpour_ipc::gen::kiapi;
+        let track = kiapi::board::types::Track {
+            id: Some(kiapi::common::types::Kiid {
+                value: format!("track-{x_nm}-{y_nm}"),
+            }),
+            start: Some(kiapi::common::types::Vector2 { x_nm, y_nm }),
+            end: Some(kiapi::common::types::Vector2 {
+                x_nm: x_nm + 2_000_000,
+                y_nm,
+            }),
+            width: Some(kiapi::common::types::Distance { value_nm: 250_000 }),
+            net: Some(kiapi::board::types::Net {
+                name: net.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        copperpour_ipc::builders::pack_any(&track, "kiapi.board.types.Track")
+    }
+
+    /// The board position, in nm, of the captured `R1`'s pad on `net`, read
+    /// from the capture directly rather than through the snapshot.
+    fn captured_pad_on(net: &str) -> (i64, i64) {
+        use copperpour_ipc::gen::kiapi;
+        let footprint = kiapi::board::types::FootprintInstance::decode(
+            schematic_backed_resistor().value.as_slice(),
+        )
+        .unwrap();
+        footprint
+            .definition
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+            .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
+            .find(|pad| pad.net.as_ref().is_some_and(|n| n.name == net))
+            .and_then(|pad| pad.position)
+            .map(|at| (at.x_nm, at.y_nm))
+            .unwrap_or_else(|| panic!("the captured R1 has a pad on {net}"))
+    }
+
+    async fn plan_moving_off_with_tracks(
+        net: &str,
+        tracks: Vec<prost_types::Any>,
+    ) -> serde_json::Value {
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![schematic_backed_resistor()],
+            zones: Vec::new(),
+            tracks,
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        served.dry_run(&netlist_moving_off(net)).await
+    }
+
+    /// Through `tools/call`, with the captured `R1` and the tracks read by
+    /// `snapshot_board` (review 1 of plan step 7: the pad-reach tests built
+    /// the copper by hand). (a) Not refusing is right for a VCC track 20 mm
+    /// from the pad: moving the pad strands nothing. (b) Refusing is right
+    /// for a VCC track that starts on the pad, and for one whose geometry
+    /// is unreadable, both asserted here.
+    #[tokio::test]
+    async fn served_tracks_far_from_or_on_the_pad_decide_the_change() {
+        let (x, y) = captured_pad_on("VCC");
+        let far =
+            plan_moving_off_with_tracks("VCC", vec![track_item("VCC", x, y + 20_000_000)]).await;
+        assert_eq!(far["status"], "ready", "{far:#}");
+        assert_eq!(routed_pad_conflicts(&far), Vec::<String>::new());
+
+        let on = plan_moving_off_with_tracks("VCC", vec![track_item("VCC", x, y)]).await;
+        assert_eq!(on["status"], "conflict", "{on:#}");
+        let refused = routed_pad_conflicts(&on);
+        assert_eq!(refused.len(), 1, "{on:#}");
+        // The refusal names the track to remove (review 3 of plan step 7).
+        assert!(
+            refused[0].contains(&format!("track track-{x}-{y} at"))
+                && refused[0].contains("delete_trace"),
+            "{refused:?}"
+        );
+
+        let mut unreadable = track_item("VCC", x, y + 20_000_000);
+        let mut track =
+            copperpour_ipc::gen::kiapi::board::types::Track::decode(unreadable.value.as_slice())
+                .unwrap();
+        track.width = None;
+        unreadable = copperpour_ipc::builders::pack_any(&track, "kiapi.board.types.Track");
+        let unknown = plan_moving_off_with_tracks("VCC", vec![unreadable]).await;
+        assert_eq!(unknown["status"], "conflict", "{unknown:#}");
+    }
+
+    /// A copper zone on no net (its net name empty) pours nothing a pad is
+    /// on. The board's R1 has its VCC pad on no net and the schematic gives
+    /// it VCC, so the change starts from the empty net, the case review 1 of
+    /// plan step 7 found refused: the empty name was recorded as poured.
+    /// (a) Not refusing is right: no copper touches the pad, and the zone pours
+    /// no net, so nothing needs a refill either. (b) Refusing would be right if
+    /// copper of the pad's old net reached it, or a zone's net could not be read
+    /// (`copper_reaching_the_pad_still_blocks_the_change`,
+    /// `with_copper_read_a_pour_asks_for_a_refill_and_an_unreadable_zone_blocks`).
+    #[tokio::test]
+    async fn a_zone_on_no_net_does_not_block_a_pad_gaining_a_net() {
+        use copperpour_ipc::gen::kiapi;
+        use kiapi::board::types::{zone::Settings, Zone};
+        let mut zone = Zone::decode(GND_POUR).unwrap();
+        let Some(Settings::CopperSettings(copper)) = zone.settings.as_mut() else {
+            panic!("the captured pour is a copper zone");
+        };
+        copper.net.as_mut().unwrap().name = String::new();
+        let no_net = copperpour_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone");
+
+        let mut footprint = kiapi::board::types::FootprintInstance::decode(
+            schematic_backed_resistor().value.as_slice(),
+        )
+        .unwrap();
+        let mut cleared = 0;
+        for item in &mut footprint.definition.as_mut().unwrap().items {
+            if !copperpour_ipc::builders::any_is(item, "kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            if pad.net.as_ref().is_some_and(|net| net.name == "VCC") {
+                pad.net = None;
+                *item = copperpour_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+                cleared += 1;
+            }
+        }
+        assert_eq!(cleared, 1, "the captured R1 has one VCC pad");
+        let footprint =
+            copperpour_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![footprint],
+            zones: vec![no_net],
+            tracks: Vec::new(),
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        let plan = served
+            .dry_run(
+                &ONE_RESISTOR
+                    .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
+                    .replace("/Power/VCC", "VCC"),
+            )
+            .await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(routed_pad_conflicts(&plan), Vec::<String>::new());
     }
 
     /// The messages of a served dry run's `routed_pad_net_change` conflicts.
@@ -6659,26 +7523,54 @@ mod tests {
         assert_eq!(update["reference"], "R1", "{plan:#}");
     }
 
-    /// The pour's own net still conflicts: moving `R1`'s `GND` pad would
-    /// leave it under copper KiCad pours as `GND`.
+    /// The refill warning of a served response, if any.
+    fn refill_warnings(plan: &serde_json::Value) -> Vec<String> {
+        plan["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|warning| warning["code"] == "zones_need_refill")
+            .map(|warning| warning["message"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Owner ruling 2026-11-01 (plan step 7b, after the `marju212` fork's
+    /// `6dad58a`): moving `R1`'s `GND` pad off the `GND` pour is planned, and
+    /// the pour is named for a refill. (a) Not refusing is right: a pour's
+    /// fill is recomputed from the pads by `refill_zones`, as KiCad's own
+    /// Update PCB leaves it to a refill; that needs a live KiCad, which this
+    /// IPC-only tool always has. A path without one (a file-only sync) must
+    /// not inherit this rule. (b) Refusing is right when a track,
+    /// arc or via of `GND` reaches the pad, or a zone's net cannot be read
+    /// (`a_poured_net_with_copper_on_the_pad_still_blocks`,
+    /// `a_pour_without_a_net_blocks_every_net`).
     #[tokio::test]
-    async fn a_pour_still_blocks_its_own_net() {
+    async fn a_pad_leaving_a_poured_net_asks_for_a_refill() {
         let plan = plan_moving_off("GND", vec![zone_item(GND_POUR)]).await;
 
-        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(routed_pad_conflicts(&plan), Vec::<String>::new());
         assert_eq!(
-            routed_pad_conflicts(&plan),
-            vec!["R1 pad 2 would change from 'GND' to 'NEW_NET' while routed copper uses that net"],
+            plan["zones_to_refill"],
+            serde_json::json!(["GND"]),
+            "{plan:#}"
+        );
+        let warnings = refill_warnings(&plan);
+        assert_eq!(warnings.len(), 1, "{plan:#}");
+        assert!(
+            warnings[0].contains("\"GND\"") && warnings[0].contains("refill_zones"),
+            "{warnings:?}"
         );
     }
 
-    /// Moving a pad onto the pour's net conflicts too: the check covers the
-    /// new net as well as the old one.
+    /// Moving a pad onto the pour's net is planned the same way: its new net's
+    /// pour does not reach it until refilled. (a)/(b) as above.
     #[tokio::test]
-    async fn a_pour_blocks_a_pad_moving_onto_its_net() {
+    async fn a_pad_moving_onto_a_poured_net_asks_for_a_refill() {
         let served = ServedSync::holding(HeldBoard {
             footprints: vec![schematic_backed_resistor()],
             zones: vec![zone_item(GND_POUR)],
+            tracks: Vec::new(),
             nets: vec!["VCC", "GND"],
         })
         .await;
@@ -6687,11 +7579,28 @@ mod tests {
             .replace("(name \"/Power/VCC\")", "(name \"GND\")");
 
         let plan = served.dry_run(&netlist).await;
-
-        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(plan["status"], "ready", "{plan:#}");
         assert_eq!(
-            routed_pad_conflicts(&plan),
-            vec!["R1 pad 1 would change from 'VCC' to 'GND' while routed copper uses that net"],
+            plan["zones_to_refill"],
+            serde_json::json!(["GND"]),
+            "{plan:#}"
+        );
+
+        // After the apply the warning says what to do now.
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(
+            applied["zones_to_refill"],
+            serde_json::json!(["GND"]),
+            "{applied:#}"
+        );
+        let warnings = refill_warnings(&applied);
+        assert!(
+            warnings.len() == 1
+                && warnings[0].contains("Run refill_zones")
+                && warnings[0].contains("then save_project")
+                && warnings[0].contains("sync_live_board: true"),
+            "{warnings:?}"
         );
     }
 
@@ -6702,6 +7611,7 @@ mod tests {
         let served = ServedSync::holding(HeldBoard {
             footprints: vec![schematic_backed_resistor()],
             zones: vec![zone_item(GND_POUR), zone_item(RULE_AREA)],
+            tracks: Vec::new(),
             nets: vec!["VCC", "GND"],
         })
         .await;
@@ -6728,7 +7638,7 @@ mod tests {
         assert_eq!(plan["status"], "conflict", "{plan:#}");
         assert_eq!(
             routed_pad_conflicts(&plan),
-            vec!["R1 pad 1 would change from 'VCC' to 'NEW_NET' while routed copper uses that net"],
+            vec!["R1 pad 1 would change from 'VCC' to 'NEW_NET': a zone's net could not be read, so it may pour either net; check the zones with list_zones or in KiCad"],
             "{plan:#}"
         );
     }
@@ -7345,6 +8255,44 @@ mod tests {
         assert_eq!(applied["staging"], expected, "{applied:#}");
     }
 
+    /// A part the sync adds from a library with net-tie pad groups and a
+    /// footprint-level zone connection carries both (merge of the `marju212`
+    /// fork); a solder jumper added without its ties is a short in DRC.
+    #[test]
+    fn an_added_solder_jumper_carries_its_net_ties_and_zone_connection() {
+        use copperpour_ipc::gen::kiapi;
+
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod")
+            .replacen(
+                "\t(layer \"F.Cu\")",
+                "\t(layer \"F.Cu\")\n\t(zone_connect 2)\n\t(net_tie_pad_groups \"1, 2\")",
+                1,
+            );
+        let part = prepare_footprint_source(&source).unwrap();
+        let addition = PlannedChange::Add {
+            reference: "JP1".into(),
+            value: "Jumper".into(),
+            footprint_id: STOCK_0603.into(),
+            symbol_path: "/jp1-uuid".into(),
+            dnp: false,
+            exclude_from_bom: false,
+            pad_nets: BTreeMap::new(),
+            position: Point { x: 10.0, y: 10.0 },
+            fields: Vec::new(),
+        };
+        let item = build_added_footprint(&addition, &part, &BTreeMap::new()).unwrap();
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        assert_eq!(
+            footprint.overrides.unwrap().zone_connection,
+            kiapi::board::types::ZoneConnectionStyle::ZcsFull as i32
+        );
+        assert_eq!(
+            footprint.definition.unwrap().net_ties[0].pad_number,
+            vec!["1".to_string(), "2".to_string()]
+        );
+    }
+
     /// The schematic decides DNP, over whatever the library footprint says,
     /// as KiCad's own Update PCB from Schematic does. The library data is
     /// applied first and the schematic's fields second, so the order is what
@@ -7521,6 +8469,7 @@ mod tests {
         let served = ServedSync::holding(HeldBoard {
             footprints: vec![held],
             zones: Vec::new(),
+            tracks: Vec::new(),
             nets: vec!["VCC", "GND"],
         })
         .await;

@@ -15,7 +15,7 @@ use copperpour_sexp::paths::display_path;
 use copperpour_sexp::title_block::TitleBlock;
 // NNG SetOpt trait is brought in scope automatically by the nng crate's prelude
 use prost::Message;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -3370,6 +3370,199 @@ impl KiCadIpcClient {
         )
     }
 
+    /// Every text of the placed footprints named in `references` (all
+    /// footprints when empty): fields and plain text items. See
+    /// [`crate::footprint_text`] for the coordinate frames.
+    pub fn list_footprint_texts(&self, references: &[String]) -> Result<Vec<IpcFootprintText>> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for item in &items {
+            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let reference = crate::footprint_text::reference_of(&fp).to_string();
+            if !references.is_empty() && !references.contains(&reference) {
+                continue;
+            }
+            seen.insert(reference);
+            out.extend(crate::footprint_text::list_texts(&fp));
+        }
+        if let Some(missing) = references.iter().find(|r| !seen.contains(*r)) {
+            anyhow::bail!("Footprint '{}' not found", missing);
+        }
+        Ok(out)
+    }
+
+    /// Move, rotate, re-layer or hide footprint texts. Every edit is checked
+    /// against the live footprints before anything is sent; then all touched
+    /// footprints go to KiCad in one `UpdateItems`, so the batch is one undo
+    /// step and a refused edit writes nothing. Returns the texts as edited.
+    pub fn edit_footprint_texts(
+        &self,
+        edits: &[IpcFootprintTextEdit],
+    ) -> Result<Vec<IpcFootprintText>> {
+        // Read, check and send inside one commit (review 2 of plan step 7): a
+        // refused edit or a failed send drops the commit, so nothing of the
+        // batch stays on the board, and the window in which an edit made in
+        // the GUI is overwritten by the stale copy is as short as it can be.
+        let results = self.run_commit("Move footprint texts", |c| {
+            let items = c.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+            // Decoded once, by reference; a reference on two footprints is
+            // refused when an edit names it.
+            let mut by_reference: BTreeMap<String, Vec<kiapi::board::types::FootprintInstance>> =
+                BTreeMap::new();
+            for item in &items {
+                if let Ok(fp) =
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                {
+                    by_reference
+                        .entry(crate::footprint_text::reference_of(&fp).to_string())
+                        .or_default()
+                        .push(fp);
+                }
+            }
+            let mut touched: BTreeMap<String, kiapi::board::types::FootprintInstance> =
+                BTreeMap::new();
+            let mut results = Vec::with_capacity(edits.len());
+            for (i, edit) in edits.iter().enumerate() {
+                if !touched.contains_key(&edit.reference) {
+                    let fp = match by_reference.get(&edit.reference).map(Vec::as_slice) {
+                        Some([fp]) => fp.clone(),
+                        Some([]) | None => {
+                            anyhow::bail!("edit {i}: footprint '{}' not found", edit.reference)
+                        }
+                        Some(_) => anyhow::bail!(
+                            "edit {i}: more than one footprint is called '{}'",
+                            edit.reference
+                        ),
+                    };
+                    touched.insert(edit.reference.clone(), fp);
+                }
+                let fp = touched.get_mut(&edit.reference).expect("inserted above");
+                let result = crate::footprint_text::apply_edit(fp, edit)
+                    .with_context(|| format!("edit {i} ({})", edit.reference))?;
+                results.push(result);
+            }
+            if !touched.is_empty() {
+                c.update_items(
+                    touched
+                        .values()
+                        .map(|fp| pack_any(fp, "kiapi.board.types.FootprintInstance"))
+                        .collect(),
+                )?;
+            }
+            Ok(results)
+        })?;
+
+        // Report what the board holds, not what was computed: each edited
+        // text read back, by footprint and field name or UUID. The last edit
+        // of a text is what the board should show. The commit is published by
+        // now, so a failure here is an uncertain outcome, not a refusal
+        // (review 3 of plan step 7).
+        self.read_back_footprint_texts(edits, &results)
+            .map_err(|error| {
+                anyhow::Error::new(IpcOutcomeUnknown {
+                    command: "move_footprint_texts".to_string(),
+                    reason: format!(
+                        "the edit was sent and committed as one undo step, but reading it back \
+                         failed: {error:#}. Call list_board_footprint_texts to see what the board \
+                         holds; undo in KiCad reverts the whole batch"
+                    ),
+                })
+            })
+    }
+
+    /// The texts `results` describe, as the board now holds them, or every
+    /// difference between the two.
+    fn read_back_footprint_texts(
+        &self,
+        edits: &[IpcFootprintTextEdit],
+        results: &[IpcFootprintText],
+    ) -> Result<Vec<IpcFootprintText>> {
+        let references: Vec<String> = edits
+            .iter()
+            .map(|edit| edit.reference.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let board = self.list_footprint_texts(&references)?;
+        let same_text = |a: &IpcFootprintText, b: &IpcFootprintText| {
+            a.reference == b.reference && a.field == b.field && a.uuid == b.uuid
+        };
+        let name = |text: &IpcFootprintText| {
+            format!(
+                "{} {}",
+                text.reference,
+                text.field
+                    .as_deref()
+                    .or(text.uuid.as_deref())
+                    .unwrap_or("text")
+            )
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let mut read_back: Vec<IpcFootprintText> = Vec::new();
+        let mut differences: Vec<String> = Vec::new();
+        for expected in results.iter().rev() {
+            if read_back.iter().any(|seen| same_text(seen, expected)) {
+                continue;
+            }
+            let Some(actual) = board.iter().find(|text| same_text(text, expected)) else {
+                differences.push(format!("{} is not on the board", name(expected)));
+                continue;
+            };
+            if !close(actual.position.x, expected.position.x)
+                || !close(actual.position.y, expected.position.y)
+            {
+                differences.push(format!(
+                    "{} is at ({}, {}), not ({}, {})",
+                    name(actual),
+                    actual.position.x,
+                    actual.position.y,
+                    expected.position.x,
+                    expected.position.y
+                ));
+            }
+            if actual.layer != expected.layer {
+                differences.push(format!(
+                    "{} is on {}, not {}",
+                    name(actual),
+                    actual.layer,
+                    expected.layer
+                ));
+            }
+            // KiCad may hold an angle normalised (-90 as 270).
+            let turn = (actual.angle - expected.angle).rem_euclid(360.0);
+            if !close(turn.min(360.0 - turn), 0.0) {
+                differences.push(format!(
+                    "{} is at {} degrees, not {}",
+                    name(actual),
+                    actual.angle,
+                    expected.angle
+                ));
+            }
+            if actual.visible != expected.visible {
+                differences.push(format!(
+                    "{} is {}, not {}",
+                    name(actual),
+                    if actual.visible { "visible" } else { "hidden" },
+                    if expected.visible {
+                        "visible"
+                    } else {
+                        "hidden"
+                    }
+                ));
+            }
+            read_back.push(actual.clone());
+        }
+        if !differences.is_empty() {
+            anyhow::bail!("KiCad holds something else: {}", differences.join("; "));
+        }
+        read_back.reverse();
+        Ok(read_back)
+    }
+
     /// The placed footprint carrying `reference`, and its index among items.
     fn find_footprint_instance(
         &self,
@@ -4818,6 +5011,41 @@ impl KiCadIpcClient {
             );
         }
         Ok(any)
+    }
+
+    /// The PCB editor's active layer for `document`. (From the wilfredo-a14
+    /// fork's `f517fd8`; measured on stock KiCad 10.0.7, 2026-11-01.)
+    pub fn get_active_layer_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<kiapi::board::types::BoardLayer> {
+        let response = unpack_required::<kiapi::board::commands::BoardLayerResponse>(
+            self.send_command(
+                &kiapi::board::commands::GetActiveLayer {
+                    board: Some(document),
+                },
+                "kiapi.board.commands.GetActiveLayer",
+            )?,
+            "GetActiveLayer",
+        )?;
+        Ok(kiapi::board::types::BoardLayer::try_from(response.layer)
+            .unwrap_or(kiapi::board::types::BoardLayer::BlUndefined))
+    }
+
+    /// Make `layer` the PCB editor's active layer for `document`.
+    pub fn set_active_layer_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        layer: kiapi::board::types::BoardLayer,
+    ) -> Result<()> {
+        self.send_command(
+            &kiapi::board::commands::SetActiveLayer {
+                board: Some(document),
+                layer: layer as i32,
+            },
+            "kiapi.board.commands.SetActiveLayer",
+        )?;
+        Ok(())
     }
 
     /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).
@@ -8017,5 +8245,163 @@ mod stackup_tests {
         assert_eq!(stackup.edge_connector, "unknown");
         assert!(!stackup.has_edge_plating);
         assert!(stackup.layers.is_empty());
+    }
+}
+
+/// Measures whether a stock KiCad answers the editor commands the wilfredo-a14
+/// fork's `f517fd8` relies on (owner ruling 2026-11-01: measure before any
+/// narrow implementation of `set_active_layer`, `set_layer_visibility` and
+/// `run_editor_action`). Copperpour's `set_active_layer` then refused on the
+/// claim that the stable protocol had no supported active-layer mutation; this
+/// probe showed the claim wrong, and the tool now uses the commands.
+///
+/// Changes nothing in the design: the first "set" sends back the value just
+/// read; the active layer is then set to another layer, read back and
+/// restored; and the action only zooms the view. Prints one line per command. The
+/// visible-layer pair is skipped unless STOCK_PROBE_VISIBLE=1 (see below).
+///
+///     KICAD_API_SOCKET=ipc:///tmp/kicad/api.sock STOCK_PROBE_BOARD=/path/board.kicad_pcb \
+///       cargo test -p copperpour-ipc --lib stock_editor_command_probe -- --ignored --nocapture
+#[cfg(test)]
+mod stock_editor_command_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a running KiCad with the board in STOCK_PROBE_BOARD open"]
+    fn stock_editor_command_probe() {
+        use kiapi::board::commands as board;
+        let socket = std::env::var("KICAD_API_SOCKET")
+            .unwrap_or_else(|_| "ipc:///tmp/kicad/api.sock".into());
+        let path = std::path::PathBuf::from(std::env::var("STOCK_PROBE_BOARD").unwrap());
+        let client = KiCadIpcClient::new(socket);
+        let document = client
+            .find_open_board(&path)
+            .expect("the board is open in KiCad");
+        let report = |name: &str, result: Result<Option<prost_types::Any>>| match result {
+            Ok(Some(any)) => println!("{name}: handled, reply {}", any.type_url),
+            Ok(None) => println!("{name}: handled, empty reply"),
+            Err(error) => println!("{name}: refused: {error:#}"),
+        };
+
+        let active = client.send_command(
+            &board::GetActiveLayer {
+                board: Some(document.clone()),
+            },
+            "kiapi.board.commands.GetActiveLayer",
+        );
+        let layer = active
+            .as_ref()
+            .ok()
+            .and_then(|any| any.as_ref())
+            .and_then(|any| board::BoardLayerResponse::decode(any.value.as_slice()).ok())
+            .map(|reply| reply.layer);
+        report("GetActiveLayer", active);
+        println!("  active layer: {layer:?}");
+        if let Some(layer) = layer {
+            report(
+                "SetActiveLayer (same layer)",
+                client.send_command(
+                    &board::SetActiveLayer {
+                        board: Some(document.clone()),
+                        layer,
+                    },
+                    "kiapi.board.commands.SetActiveLayer",
+                ),
+            );
+        }
+
+        // A different layer, read back, then the original restored: shows
+        // the change takes effect, not only that the command is accepted.
+        if let Some(original) = layer {
+            let other = if original == kiapi::board::types::BoardLayer::BlBCu as i32 {
+                kiapi::board::types::BoardLayer::BlFCu as i32
+            } else {
+                kiapi::board::types::BoardLayer::BlBCu as i32
+            };
+            report(
+                "SetActiveLayer (other layer)",
+                client.send_command(
+                    &board::SetActiveLayer {
+                        board: Some(document.clone()),
+                        layer: other,
+                    },
+                    "kiapi.board.commands.SetActiveLayer",
+                ),
+            );
+            let now = client
+                .send_command(
+                    &board::GetActiveLayer {
+                        board: Some(document.clone()),
+                    },
+                    "kiapi.board.commands.GetActiveLayer",
+                )
+                .ok()
+                .flatten()
+                .and_then(|any| board::BoardLayerResponse::decode(any.value.as_slice()).ok())
+                .map(|reply| reply.layer);
+            println!("  read back after setting {other}: {now:?}");
+            report(
+                "SetActiveLayer (restore)",
+                client.send_command(
+                    &board::SetActiveLayer {
+                        board: Some(document.clone()),
+                        layer: original,
+                    },
+                    "kiapi.board.commands.SetActiveLayer",
+                ),
+            );
+        }
+
+        // Measured 2026-11-01 on stock KiCad 10.0.7 (Arch package, assertions
+        // enabled) with the pic_programmer demo: GetVisibleLayers fails an
+        // internal assertion in ToProtoEnum<PCB_LAYER_ID> for a visible layer
+        // the protocol has no value for, opens one modal dialog per such layer,
+        // and blocks every later command until a person closes them. Sent only
+        // when STOCK_PROBE_VISIBLE=1.
+        if std::env::var("STOCK_PROBE_VISIBLE").as_deref() == Ok("1") {
+            let visible = client.send_command(
+                &board::GetVisibleLayers {
+                    board: Some(document.clone()),
+                },
+                "kiapi.board.commands.GetVisibleLayers",
+            );
+            let layers = visible
+                .as_ref()
+                .ok()
+                .and_then(|any| any.as_ref())
+                .and_then(|any| board::BoardLayers::decode(any.value.as_slice()).ok())
+                .map(|reply| reply.layers);
+            report("GetVisibleLayers", visible);
+            println!("  visible layers: {}", layers.as_ref().map_or(0, Vec::len));
+            if let Some(layers) = layers {
+                report(
+                    "SetVisibleLayers (same set)",
+                    client.send_command(
+                        &board::SetVisibleLayers {
+                            board: Some(document.clone()),
+                            layers,
+                        },
+                        "kiapi.board.commands.SetVisibleLayers",
+                    ),
+                );
+            }
+        }
+
+        let action = client.send_command(
+            &kiapi::common::commands::RunAction {
+                action: "common.Control.zoomFitScreen".into(),
+            },
+            "kiapi.common.commands.RunAction",
+        );
+        let status = action
+            .as_ref()
+            .ok()
+            .and_then(|any| any.as_ref())
+            .and_then(|any| {
+                kiapi::common::commands::RunActionResponse::decode(any.value.as_slice()).ok()
+            })
+            .map(|reply| reply.status());
+        report("RunAction common.Control.zoomFitScreen", action);
+        println!("  RunAction status: {status:?}");
     }
 }

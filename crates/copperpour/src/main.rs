@@ -1,7 +1,9 @@
 mod config;
 mod install;
+mod live_editor;
 mod manifest;
 mod run_registry;
+mod sim_worker;
 mod transaction_cli;
 mod transport;
 
@@ -37,6 +39,7 @@ const SUBCOMMANDS: &[&str] = &[
     "skill",
     "hook",
     "transaction",
+    copperpour_core::simulation::protocol::WORKER_SUBCOMMAND,
 ];
 
 fn classify(args: &[String]) -> Cli<'_> {
@@ -101,6 +104,9 @@ async fn main() -> Result<()> {
             return install::print_hook_output(name);
         }
         Cli::Subcommand("transaction") => return transaction_cli::run(&args[2..]),
+        Cli::Subcommand(copperpour_core::simulation::protocol::WORKER_SUBCOMMAND) => {
+            return sim_worker::run(&args[2..]);
+        }
         Cli::Subcommand(_) | Cli::Server => {}
     }
 
@@ -135,6 +141,9 @@ async fn main() -> Result<()> {
 
     info!("Copperpour v{} starting", env!("CARGO_PKG_VERSION"));
     ipc_source.log(&config.ipc_address);
+
+    // Fork: let schematic writes proceed while KiCad's Schematic Editor has the file open.
+    live_editor::install();
 
     // Name the configuration that actually started this process. A user whose
     // settings appear to be ignored otherwise has nothing to go on before the
@@ -185,6 +194,17 @@ async fn main() -> Result<()> {
     match install::InstalledGuidanceProbe::for_current_user() {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
+    }
+    match copperpour_core::simulation::SimulationRuntime::for_current_executable(
+        copperpour_core::simulation::SimulationSettings {
+            ngspice_library: config.ngspice_library.clone(),
+            ngspice_code_models_dir: config.ngspice_code_models_dir.clone(),
+            allow_digital_models: config.ngspice_allow_digital_models,
+            model_dirs: config.ngspice_model_dirs.clone(),
+        },
+    ) {
+        Ok(runtime) => handler.set_simulation_runtime(std::sync::Arc::new(runtime)),
+        Err(error) => tracing::warn!("simulation worker unavailable: {error:#}"),
     }
 
     match config.transport {
@@ -409,4 +429,12 @@ mod cli_dispatch_tests {
         );
         assert_eq!(classify(&cli(&["--client", "codex"])), Cli::Server);
     }
+}
+
+/// Keep this crate's unit tests out of the developer's home (see
+/// `copperpour-test-home`).
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
 }

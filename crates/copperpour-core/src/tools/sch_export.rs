@@ -135,12 +135,23 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "export_netlist_summary",
             "Return a human-readable JSON summary of the schematic netlist: all \
-             components, their nets, pin counts. Nets come from labels and from \
-             power symbols. Does not require kicad-cli.",
+             components, their nets, pin counts. Defaults to one file, read directly \
+             (nets come from labels and power symbols; no kicad-cli needed), and then \
+             reports how many child sheets it left out. Set schematic_scope to \
+             'hierarchy' for the whole design: kicad-cli's netlist export flattens \
+             every sheet reachable from this one, merging nets across sheet pins, \
+             hierarchical labels and power symbols the way KiCad does, and each \
+             component carries its sheet path.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "schematic_scope": {
+                        "type": "string",
+                        "enum": ["file", "hierarchy"],
+                        "default": "file",
+                        "description": "Summarise only the supplied file (default) or the whole hierarchy below it (requires kicad-cli)"
+                    }
                 },
                 "required": ["schematic"]
             }),
@@ -170,6 +181,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_run_erc(args, ctx).await }
         ),
+        super::erc_severity::tool(),
         tool!(
             "fix_connectivity",
             "Scan the schematic for near-miss wire endpoints (within snap_tolerance of a \
@@ -199,7 +211,11 @@ pub fn tools() -> Vec<ToolDef> {
              KiCad's API would drop. \
              Added footprints are staged beside the board as KiCad measured it; `staging` \
              names the item classes KiCad would not list, so a partial or unmeasured board \
-             is never reported as complete or empty. `changes` lists the first `limit` \
+             is never reported as complete or empty. A pad may change net unless a track, \
+             arc or via of its old net reaches it, or a zone's net cannot be read; a copper \
+             pour on either net does not block, and `zones_to_refill` (with a \
+             `zones_need_refill` warning) names the pour nets to refill with refill_zones \
+             (toolset pcb_export) after the apply, then save_project. `changes` lists the first `limit` \
              planned changes, `changes_count` all of them; `output` writes the whole \
              response to a file.",
             json!({
@@ -545,9 +561,31 @@ async fn handle_generate_netlist(
 
 async fn handle_export_netlist_summary(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    // A present value that is not a string is refused, not read as "file"
+    // (merge review, plan step 6).
+    let scope = match &args["schematic_scope"] {
+        serde_json::Value::Null => "file",
+        serde_json::Value::String(scope) => scope.as_str(),
+        _ => {
+            return Ok(super::invalid_arg(
+                "schematic_scope",
+                "must be the string 'file' or 'hierarchy'",
+            ))
+        }
+    };
+    match scope {
+        "file" => {}
+        "hierarchy" => return hierarchy_netlist_summary(&sch_path, ctx).await,
+        other => {
+            return Ok(super::invalid_arg(
+                "schematic_scope",
+                &format!("'{other}' is not one of 'file' or 'hierarchy'"),
+            ))
+        }
+    }
     let (_, tree) = read_schematic(&sch_path)?;
 
     let instances = extract_symbol_instances(&tree);
@@ -607,12 +645,201 @@ async fn handle_export_netlist_summary(
         })
         .collect();
 
-    Ok(CallToolResult::json(&json!({
+    let mut summary = json!({
         "component_count": components.len(),
         "net_count": net_names.len(),
         "nets": net_names,
         "components": components
-    })))
+    });
+    // A root sheet often holds no components at all, so an empty summary of
+    // one must not read as an empty design.
+    let child_sheets = tree.find_all("sheet").len();
+    if child_sheets > 0 {
+        summary["child_sheets"] = json!(child_sheets);
+        summary["note"] = json!(format!(
+            "This file has {child_sheets} child sheet(s) whose components and nets are not \
+             included; set schematic_scope to 'hierarchy' for the whole design."
+        ));
+    }
+    Ok(CallToolResult::json(&summary))
+}
+
+/// [`handle_export_netlist_summary`] for the whole design: kicad-cli flattens
+/// every sheet below `sch_path`, merging nets across sheet pins, hierarchical
+/// labels and power symbols exactly as KiCad does.
+async fn hierarchy_netlist_summary(
+    sch_path: &Path,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let temp = tempfile::Builder::new().suffix(".net").tempfile()?;
+    if let Err(error) =
+        cli::export_netlist(&ctx.config.kicad_cli, sch_path, temp.path(), "kicadsexpr").await
+    {
+        return Ok(CallToolResult::error(format!(
+            "KiCad netlist export failed: {error:#}"
+        )));
+    }
+    let source = std::fs::read_to_string(temp.path())?;
+    let mut summary = summarize_exported_netlist(&source)?;
+    // kicad-cli exports a hierarchy with a missing child sheet with exit 0
+    // and no message, and treats a child file it is given as a root (both
+    // measured on kicad-cli 10.0.7 in the merge review, plan step 6), so the
+    // summary says when either applies.
+    let missing = missing_sheet_files(sch_path);
+    let mut warnings = Vec::new();
+    if !missing.is_empty() {
+        warnings.push(json!({
+            "code": "sheet_files_missing",
+            "detail": "These sheet files are referenced but do not exist, so their parts and \
+                       nets are not in this summary.",
+            "items": missing,
+        }));
+    }
+    if let Some(root) = project_root_schematic(sch_path) {
+        warnings.push(json!({
+            "code": "not_the_project_root",
+            "detail": format!(
+                "This file is not the project's root schematic ({}); it was summarised as if it \
+                 were one, with its own references and no parent connections.",
+                root.display()
+            ),
+        }));
+    }
+    summary["warnings"] = json!(warnings);
+    Ok(CallToolResult::json(&summary))
+}
+
+/// Sheet files referenced from `root` (recursively) that do not exist. Each
+/// file is visited once, so a cycle ends.
+fn missing_sheet_files(root: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(file) = queue.pop() {
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        let Ok((_, tree)) = read_schematic(&file) else {
+            continue;
+        };
+        let dir = file.parent().unwrap_or_else(|| Path::new("."));
+        for child in copperpour_sexp::schematic::sheet_files(&tree) {
+            let path = dir.join(child);
+            if path.is_file() {
+                queue.push(path);
+            } else {
+                missing.push(path.display().to_string());
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// The project's root schematic, when it exists beside `file` and is a
+/// different file: `<project stem>.kicad_sch` for the one `.kicad_pro` in
+/// `file`'s folder.
+fn project_root_schematic(file: &Path) -> Option<std::path::PathBuf> {
+    let dir = file.parent()?;
+    let mut projects = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "kicad_pro"));
+    let project = projects.next()?;
+    if projects.next().is_some() {
+        return None;
+    }
+    let root = project.with_extension("kicad_sch");
+    let same = match (root.canonicalize(), file.canonicalize()) {
+        (Ok(root), Ok(file)) => root == file,
+        _ => true,
+    };
+    (!same && root.is_file()).then_some(root)
+}
+
+/// Shape a `kicadsexpr` netlist like the file-scope summary, adding each
+/// component's sheet path. A pin KiCad left unconnected reports net `"~"`, as
+/// the file scope does, and its `unconnected-(…)` net is not listed.
+fn summarize_exported_netlist(source: &str) -> anyhow::Result<serde_json::Value> {
+    let root = parse_sexp(source)?;
+    let export = if root.head() == Some("export") {
+        &root
+    } else {
+        root.find("export")
+            .ok_or_else(|| anyhow::anyhow!("not a KiCad netlist: no (export …)"))?
+    };
+    let text = |node: &SexpNode, tag: &str| node.find_str(tag).unwrap_or_default().to_string();
+
+    let mut net_names = Vec::new();
+    let mut pins: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for net in export
+        .find("nets")
+        .map(|n| n.find_all("net"))
+        .unwrap_or_default()
+    {
+        let name = text(net, "name");
+        let unconnected = name.starts_with("unconnected-");
+        if !unconnected {
+            net_names.push(name.clone());
+        }
+        for node in net.find_all("node") {
+            // KiCad 10 writes a pin's function as `<name>_<number>`, so `EN` on
+            // pin 3 arrives as `EN_3`; the summary reports the name itself.
+            let number = text(node, "pin");
+            let function = text(node, "pinfunction");
+            let pin_name = function
+                .strip_suffix(&format!("_{number}"))
+                .unwrap_or(&function);
+            pins.entry(text(node, "ref")).or_default().push(json!({
+                "number": number,
+                "name": pin_name,
+                "net": if unconnected { "~" } else { name.as_str() },
+            }));
+        }
+    }
+    net_names.sort();
+
+    let components: Vec<serde_json::Value> = export
+        .find("components")
+        .map(|c| c.find_all("comp"))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|comp| {
+            let reference = text(comp, "ref");
+            let lib_id = comp
+                .find("libsource")
+                .map(|l| format!("{}:{}", text(l, "lib"), text(l, "part")))
+                .unwrap_or_default();
+            let sheet = comp
+                .find("sheetpath")
+                .map(|s| text(s, "names"))
+                .unwrap_or_default();
+            let mut comp_pins = pins.remove(&reference).unwrap_or_default();
+            comp_pins.sort_by_key(|p| {
+                let number = p["number"].as_str().unwrap_or_default().to_string();
+                (number.len(), number)
+            });
+            json!({
+                "reference": reference,
+                "value": text(comp, "value"),
+                "footprint": text(comp, "footprint"),
+                "lib_id": lib_id,
+                "sheet": sheet,
+                "pin_count": comp_pins.len(),
+                "pins": comp_pins
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "schematic_scope": "hierarchy",
+        "component_count": components.len(),
+        "net_count": net_names.len(),
+        "nets": net_names,
+        "components": components
+    }))
 }
 
 /// ERC positions ride on the entry itself as a pair of keys, not as a nested
@@ -1084,7 +1311,10 @@ fn connectivity_write_refusal(path: &Path, error: &SexpError) -> Option<CallTool
             "the schematic changed after connectivity fixes were planned; reload and retry"
         }
         SexpError::KiCadEditorLocked { .. } => {
-            "KiCad owns the schematic; use a live editor mutation or close the document"
+            return Some(stale_connectivity_target(
+                path.display().to_string(),
+                copperpour_sexp::writer::schematic_lock_message(path),
+            ));
         }
         _ => return None,
     };
@@ -1213,6 +1443,84 @@ mod netlist_summary_tests {
     const SCH: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
     const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
 
+    /// kicad-cli exports a hierarchy with a missing child sheet with exit 0
+    /// and no message, and treats a child file as a root; the summary must
+    /// say so (measured on kicad-cli 10.0.7, merge review of plan step 6).
+    ///
+    ///     KICAD_DEMOS=... cargo test -p copperpour-core --lib hierarchy_summary_live -- --ignored
+    #[tokio::test]
+    #[ignore = "needs kicad-cli and KICAD_DEMOS"]
+    async fn hierarchy_summary_live_reports_missing_sheets_and_a_child_given_as_root() {
+        let demos = std::path::PathBuf::from(std::env::var_os("KICAD_DEMOS").unwrap());
+        let source = demos.join("complex_hierarchy");
+        let tmp = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(&source).unwrap().flatten() {
+            if entry.path().is_file() {
+                std::fs::copy(entry.path(), tmp.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let config = ServerConfig {
+            kicad_cli: std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".into()),
+            ..Default::default()
+        };
+        let ctx = ToolContext::new(config, Arc::new(crate::router::ToolRouter::new()));
+        let call = |schematic: std::path::PathBuf| {
+            let ctx = &ctx;
+            async move {
+                let result = handle_export_netlist_summary(
+                    &json!({ "schematic": schematic, "schematic_scope": "hierarchy" }),
+                    ctx,
+                )
+                .await
+                .unwrap();
+                let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                    panic!("expected text content");
+                };
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            }
+        };
+        let codes = |body: &serde_json::Value| -> Vec<String> {
+            body["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|w| w["code"].as_str().map(str::to_string))
+                .collect()
+        };
+        let whole = call(tmp.path().join("complex_hierarchy.kicad_sch")).await;
+        assert!(codes(&whole).is_empty(), "{whole}");
+        let child = call(tmp.path().join("ampli_ht.kicad_sch")).await;
+        assert!(
+            codes(&child).contains(&"not_the_project_root".to_string()),
+            "{child}"
+        );
+        std::fs::remove_file(tmp.path().join("ampli_ht.kicad_sch")).unwrap();
+        let missing = call(tmp.path().join("complex_hierarchy.kicad_sch")).await;
+        assert!(
+            codes(&missing).contains(&"sheet_files_missing".to_string()),
+            "{missing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schematic_scope_that_is_not_a_string_is_refused() {
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_export_netlist_summary(
+            &json!({ "schematic": "/nowhere/top.kicad_sch", "schematic_scope": 5 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert!(text.contains("schematic_scope"), "{text}");
+    }
+
     async fn summary(content: &str) -> serde_json::Value {
         let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
         f.write_all(content.as_bytes()).unwrap();
@@ -1277,6 +1585,123 @@ mod netlist_summary_tests {
     async fn the_power_symbol_pin_resolves_to_its_own_rail() {
         let s = summary(SCH).await;
         assert_eq!(net_of(&s, "#PWR01", "1"), "GND");
+    }
+
+    /// A root sheet usually holds no components, so file scope has to say it
+    /// left its child sheets out rather than look like an empty design.
+    #[tokio::test]
+    async fn file_scope_reports_the_child_sheets_it_left_out() {
+        let s = summary(include_str!(
+            "../../tests/fixtures/junction_sheet_pin.kicad_sch"
+        ))
+        .await;
+        assert_eq!(s["child_sheets"], 1, "{s}");
+        assert!(s["note"].as_str().unwrap().contains("'hierarchy'"), "{s}");
+        // A file with no sheets says nothing extra.
+        let flat = summary(SCH).await;
+        assert!(flat.get("child_sheets").is_none(), "{flat}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_scope_is_refused() {
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_export_netlist_summary(
+            &json!({ "schematic": "unused.kicad_sch", "schematic_scope": "everything" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+    }
+
+    /// Trimmed from `kicad-cli sch export netlist` (KiCad 10.0.5) on a
+    /// hierarchical design: parts on two sheets, a net named by its sheet,
+    /// a global rail, and a pin KiCad left unconnected.
+    const FLATTENED: &str = r#"(export
+	(version "E")
+	(components
+		(comp
+			(ref "R4")
+			(value "10k")
+			(footprint "Resistor_SMD:R_0402_1005Metric")
+			(libsource (lib "Device") (part "R") (description "Resistor"))
+			(sheetpath (names "/MCU/") (tstamps "/494e681f/"))
+		)
+		(comp
+			(ref "R5")
+			(value "4.7k")
+			(footprint "Resistor_SMD:R_0402_1005Metric")
+			(libsource (lib "Device") (part "R") (description "Resistor"))
+			(sheetpath (names "/Sensors/") (tstamps "/d4823722/"))
+		)
+		(comp
+			(ref "U3")
+			(value "ESP32-S3-WROOM-1")
+			(footprint "JLC:WIRELM-SMD_ESP32-S3-WROOM-1")
+			(libsource (lib "JLC") (part "ESP32-S3-WROOM-1") (description ""))
+			(sheetpath (names "/MCU/") (tstamps "/494e681f/"))
+		)
+	)
+	(nets
+		(net (code "1") (name "+3V3") (class "Default")
+			(node (ref "R4") (pin "1") (pintype "passive"))
+			(node (ref "R5") (pin "2") (pintype "passive"))
+			(node (ref "U3") (pin "2") (pinfunction "3V3_2") (pintype "unspecified")))
+		(net (code "4") (name "/MCU/EN") (class "Default")
+			(node (ref "R4") (pin "2") (pintype "passive"))
+			(node (ref "U3") (pin "3") (pinfunction "EN_3") (pintype "unspecified")))
+		(net (code "9") (name "unconnected-(U3-IO4-Pad4)") (class "Default")
+			(node (ref "U3") (pin "4") (pinfunction "IO4_4") (pintype "unspecified")))
+		(net (code "12") (name "/Sensors/I2C_SDA") (class "Default")
+			(node (ref "R5") (pin "1") (pintype "passive"))
+			(node (ref "U3") (pin "39") (pinfunction "IO1_39") (pintype "unspecified")))
+	)
+)"#;
+
+    #[test]
+    fn hierarchy_scope_summarises_kicads_flattened_netlist() {
+        let s = summarize_exported_netlist(FLATTENED).unwrap();
+        assert_eq!(s["component_count"], 3);
+        assert_eq!(
+            s["nets"],
+            json!(["+3V3", "/MCU/EN", "/Sensors/I2C_SDA"]),
+            "named nets only, unconnected-(…) left out"
+        );
+        assert_eq!(net_of(&s, "R5", "2"), "+3V3", "a rail shared across sheets");
+        assert_eq!(net_of(&s, "R5", "1"), "/Sensors/I2C_SDA");
+        assert_eq!(
+            net_of(&s, "U3", "39"),
+            "/Sensors/I2C_SDA",
+            "one net across sheets"
+        );
+        assert_eq!(
+            net_of(&s, "U3", "4"),
+            "~",
+            "unconnected, as file scope says it"
+        );
+
+        let u3 = s["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["reference"] == "U3")
+            .unwrap();
+        assert_eq!(u3["sheet"], "/MCU/");
+        assert_eq!(u3["lib_id"], "JLC:ESP32-S3-WROOM-1");
+        let numbers: Vec<&str> = u3["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["number"].as_str().unwrap())
+            .collect();
+        assert_eq!(numbers, ["2", "3", "4", "39"], "pins in number order");
+        assert_eq!(
+            u3["pins"][1]["name"], "EN",
+            "KiCad's `EN_3` is the pin name EN"
+        );
     }
 
     /// A rail with no wire on it is still a net: the symbol declares it.
@@ -1630,7 +2055,9 @@ mod connectivity_edit_tests {
 ///
 /// Returns `None` for a proven root or a loose schematic with no project
 /// candidate. Unproven or ambiguous ownership is a structured conflict.
-fn owning_project_root(file: &Path) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
+pub(crate) fn owning_project_root(
+    file: &Path,
+) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
     Ok(
         crate::tools::resolve_schematic_ownership(file)?.and_then(|ownership| {
             (!same_file(&ownership.root_schematic, file)).then_some(ownership.root_schematic)
@@ -1681,7 +2108,7 @@ mod tests {
         assert!(names.contains(&"render_schematic_png"), "{names:?}");
         assert!(names.contains(&"set_visual_baseline"), "{names:?}");
         assert!(names.contains(&"compare_visual_baseline"), "{names:?}");
-        assert_eq!(names.len(), 10, "sch_export tool count");
+        assert_eq!(names.len(), 11, "sch_export tool count");
     }
 
     #[tokio::test]

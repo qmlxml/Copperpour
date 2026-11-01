@@ -393,24 +393,100 @@ async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<Stri
 
 /// [`run_cli`], keeping stderr as well.
 async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<CliOutput> {
+    run_cli_owned(cli, args, timeout_dur, false).await
+}
+
+/// How long a killed kicad-cli is waited for before the call returns.
+const KILL_WAIT: Duration = Duration::from_secs(5);
+
+/// A kicad-cli that was killed because it did not finish within `limit`
+/// (only calls on a private copy kill; see [`run_cli_owned`]). A caller can
+/// tell it from a kicad-cli that ran and failed with `downcast_ref`.
+#[derive(Debug)]
+pub(crate) struct CliTimedOut {
+    pub limit: Duration,
+}
+
+impl std::fmt::Display for CliTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "kicad-cli did not finish within {} s and was stopped",
+            self.limit.as_secs_f64()
+        )
+    }
+}
+
+impl std::error::Error for CliTimedOut {}
+
+/// [`run_cli_captured`], optionally killing the child on timeout. Only callers
+/// running on a private copy may ask for that: a killed `kicad-cli` strands its
+/// project lock, so killing one on a live project would leave the lock there.
+async fn run_cli_owned(
+    cli: &str,
+    args: &[&str],
+    timeout_dur: Duration,
+    kill_on_timeout: bool,
+) -> Result<CliOutput> {
     info!("[BETA] kicad-cli {} {}", cli, args.join(" "));
 
     let exe = resolve_cli_executable(cli);
     let mut cmd = Command::new(&exe);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Stdin is the MCP pipe in stdio mode; a child must not hold it.
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Killed on timeout only on a private copy (see above). Merge note
+        // (step 4): step 2b had set this for every call; a killed kicad-cli on
+        // a live project leaves its lock behind, so the contributor's rule wins.
+        .kill_on_drop(kill_on_timeout);
 
     #[cfg(test)]
-    let child = test_support::spawn_cli(&mut cmd)
+    let mut child = test_support::spawn_cli(&mut cmd)
         .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
     #[cfg(not(test))]
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
 
-    let output = timeout(timeout_dur, child.wait_with_output())
-        .await
-        .with_context(|| format!("kicad-cli timed out after {:?}", timeout_dur))?
-        .with_context(|| "kicad-cli process failed")?;
+    let output = if kill_on_timeout {
+        // Read the pipes here rather than through `wait_with_output`, which
+        // takes the child: on timeout it must be killed and waited for before
+        // the caller removes the private copy. On Windows a process still
+        // running in that folder makes the removal fail, and `TempDir` ignores
+        // the failure. The wait has its own limit, so a kicad-cli that cannot
+        // be ended leaves the folder behind rather than holding the call.
+        let mut stdout = child.stdout.take().context("kicad-cli has no stdout")?;
+        let mut stderr = child.stderr.take().context("kicad-cli has no stderr")?;
+        let finished = timeout(timeout_dur, async {
+            use tokio::io::AsyncReadExt;
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let (read_out, read_err) =
+                tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+            read_out?;
+            read_err?;
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>(std::process::Output {
+                status,
+                stdout: out,
+                stderr: err,
+            })
+        })
+        .await;
+        match finished {
+            Ok(output) => output.with_context(|| "kicad-cli process failed")?,
+            Err(_) => {
+                let _ = timeout(KILL_WAIT, child.kill()).await;
+                return Err(CliTimedOut { limit: timeout_dur }.into());
+            }
+        }
+    } else {
+        timeout(timeout_dur, child.wait_with_output())
+            .await
+            .with_context(|| format!("kicad-cli timed out after {:?}", timeout_dur))?
+            .with_context(|| "kicad-cli process failed")?
+    };
 
     if !output.stderr.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -635,6 +711,70 @@ pub(crate) mod test_support {
             "#!/bin/sh\nif [ \"$1\" = \"sch\" ]; then\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"--output\" ]; then\n      shift\n      printf '%s' 'PDF-test' > \"$1\"\n      break\n    fi\n    shift\n  done\nfi\nexit 0\n",
             "@echo off\r\nif not \"%1\"==\"sch\" exit /b 0\r\n:loop\r\nif \"%1\"==\"\" goto done\r\nif not \"%1\"==\"--output\" goto next\r\nshift\r\necho PDF-test>\"%1\"\r\ngoto done\r\n:next\r\nshift\r\ngoto loop\r\n:done\r\nexit /b 0\r\n",
         )
+    }
+
+    /// On a live project, a kicad-cli that outlives its timeout is left
+    /// running. Not killing it is correct because a killed kicad-cli leaves
+    /// the project's lock file behind, and the project then stays locked. It
+    /// would be wrong on a private copy the caller is about to delete, which
+    /// the next test covers. It is also wrong for a kicad-cli that never exits:
+    /// that process then runs with nothing reporting it after the timeout
+    /// error. Recorded as deferred work in docs/BACKLOG.md.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timed_out_kicad_cli_on_a_live_project_is_not_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let cli = write_script(
+            dir.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 3\n",
+                pid_file.display()
+            ),
+            "@exit /b 0\r\n",
+        );
+        let result = run_cli_captured(cli.to_str().unwrap(), &[], Duration::from_millis(300)).await;
+        assert!(
+            result.is_err(),
+            "the fake kicad-cli sleeps past the timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).unwrap();
+        assert_ne!(stat.split_whitespace().nth(2), Some("Z"), "still running");
+    }
+
+    /// On a private copy, a kicad-cli that outlives its timeout must be
+    /// killed, not left running while the caller deletes the copy.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timed_out_kicad_cli_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let cli = write_script(
+            dir.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 30\n",
+                pid_file.display()
+            ),
+            "@exit /b 0\r\n",
+        );
+        let result =
+            run_cli_owned(cli.to_str().unwrap(), &[], Duration::from_millis(500), true).await;
+        let Err(error) = result else {
+            panic!("the fake kicad-cli sleeps past the timeout");
+        };
+        assert!(error.downcast_ref::<CliTimedOut>().is_some(), "{error:#}");
+        // Waited for before returning, so the caller can remove its copy at
+        // once: the process has already been reaped.
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "kicad-cli (pid {}) still exists when the call returns",
+            pid.trim()
+        );
     }
 
     #[test]
@@ -1002,13 +1142,33 @@ fn parse_item_pos(item: &serde_json::Value) -> Option<ReportPos> {
 /// KiCAD 10: `pcb drc --output <path> --format json --schematic-parity
 /// [--refill-zones] <input>`
 pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcReport> {
+    run_drc_with(cli, pcb, refill_zones, false).await
+}
+
+/// [`run_drc`] on a private copy of a board: kicad-cli is killed if it runs
+/// past its timeout. Only for copies no user project depends on, because a
+/// killed kicad-cli leaves its project lock behind (see [`run_cli_owned`]).
+pub(crate) async fn run_drc_on_private_copy(
+    cli: &str,
+    pcb: &Path,
+    refill_zones: bool,
+) -> Result<DrcReport> {
+    run_drc_with(cli, pcb, refill_zones, true).await
+}
+
+async fn run_drc_with(
+    cli: &str,
+    pcb: &Path,
+    refill_zones: bool,
+    kill_on_timeout: bool,
+) -> Result<DrcReport> {
     let out_path = pcb.with_extension("drc.json");
     let args = drc_args(
         out_path.to_str().unwrap(),
         refill_zones,
         pcb.to_str().unwrap(),
     );
-    let output = run_cli_captured(cli, &args, LONG_TIMEOUT).await?;
+    let output = run_cli_owned(cli, &args, LONG_TIMEOUT, kill_on_timeout).await?;
 
     let json_str = tokio::fs::read_to_string(&out_path)
         .await
@@ -1017,7 +1177,9 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
     let _ = tokio::fs::remove_file(&out_path).await;
 
     let mut report = parse_drc_report(&raw)?;
-    apply_parity_evidence(&mut report, &output.stderr, pcb);
+    // KiCad's reporter may write the not-run message to either stream.
+    let kicad_output = format!("{}\n{}", output.stderr, output.stdout);
+    apply_parity_evidence(&mut report, &kicad_output, pcb);
 
     // Ownership comes from the exact board this DRC ran on, and it is attached
     // here — the one path `run_drc` and `get_drc_violations` share — so the two
@@ -1064,9 +1226,12 @@ fn drc_args<'a>(out_path: &'a str, refill_zones: bool, pcb: &'a str) -> Vec<&'a 
     args
 }
 
-/// KiCad's own statement that the parity test compared nothing. Written to
-/// stderr, with exit 0 and an empty `schematic_parity` array, whenever the
-/// board's project has no root schematic to read.
+/// KiCad's own statement that the parity test compared nothing, written to
+/// stderr with exit 0 and an empty `schematic_parity` array when the board's
+/// project has no root schematic to read. Not every KiCad release prints it:
+/// measured on kicad-cli 10.0.7 (scripts/measure_parity_stderr.sh), a board
+/// with no root schematic beside it gives exit 0, an empty array and no
+/// message. [`apply_parity_evidence`] therefore also checks for the file.
 const PARITY_NOT_RUN: &str = "Failed to fetch schematic netlist for parity tests";
 
 /// The schematic kicad-cli's parity test reads: the root of the board's own
@@ -1085,29 +1250,56 @@ fn parity_root_schematic(pcb: &Path) -> std::path::PathBuf {
 /// Turn kicad-cli's "nothing to compare" back into "not checked".
 ///
 /// With `--schematic-parity` and no root schematic for the board's project,
-/// kicad-cli exits 0, prints [`PARITY_NOT_RUN`] to stderr, and writes
-/// `"schematic_parity": []` — the same silent zero #245 removed from Konnect's
-/// side, now produced by KiCad. KiCad's own statement is the signal, not a
-/// filesystem guess; the expected root path only names what was missing.
+/// kicad-cli exits 0, writes `"schematic_parity": []` and, in some releases,
+/// prints [`PARITY_NOT_RUN`] — the same unchecked result reported as zero that
+/// #245 removed from Copperpour's side (then Konnect), now produced by KiCad. KiCad's own statement is the signal, not a
+/// filesystem guess when KiCad reports failure; an absent exact root is also
+/// sufficient to withhold an empty result when KiCad stays silent.
 ///
 /// A **non-empty** array is KiCad's evidence and is kept whatever stderr or
 /// the filesystem say: findings cannot be un-found by a lookup failing.
-fn apply_parity_evidence(report: &mut DrcReport, stderr: &str, pcb: &Path) {
+///
+/// `kicad_output` is kicad-cli's stderr and stdout together.
+///
+/// Measured on kicad-cli 10.0.7 (scripts/measure_parity_stderr.sh): a board
+/// with no root schematic beside it gives exit 0, an empty array and no
+/// message, so the file check below is what catches it. A root that exists
+/// but cannot be used (empty, unparsable, truncated, unreadable, or a
+/// directory) makes kicad-cli exit 255 with no report at all, so that state
+/// never reaches this function on 10.0.7.
+///
+/// Only `<board stem>.kicad_sch` counts as the root. A project whose root is
+/// a legacy `.sch` file is reported as not checked even if KiCad compared it:
+/// the result is withheld, never invented.
+///
+/// The file is checked once. A root created after kicad-cli finished but
+/// before this check would turn KiCad's silent "not compared" into a checked
+/// zero; that cannot be closed without KiCad stating what it compared.
+fn apply_parity_evidence(report: &mut DrcReport, kicad_output: &str, pcb: &Path) {
     let Some(parity) = report.schematic_parity.as_ref() else {
         return;
     };
-    if !parity.is_empty() || !stderr.contains(PARITY_NOT_RUN) {
+    let expected = parity_root_schematic(pcb);
+    let root_present = expected.is_file();
+    let native_not_run = kicad_output.contains(PARITY_NOT_RUN);
+    // A missing root cannot be positive parity evidence, even when KiCad
+    // prints nothing.
+    if !parity.is_empty() || (!native_not_run && root_present) {
         return;
     }
-    let expected = parity_root_schematic(pcb);
-    let root_state = if expected.is_file() {
+    let root_state = if root_present {
         "which exists but could not be read for parity"
     } else {
         "which does not exist"
     };
     report.schematic_parity = None;
+    let reason = if native_not_run {
+        format!("kicad-cli reported \"{PARITY_NOT_RUN}\"")
+    } else {
+        "the expected root schematic is unavailable".to_string()
+    };
     report.schematic_parity_diagnostic = Some(format!(
-        "kicad-cli reported \"{PARITY_NOT_RUN}\" for {}: the parity test reads the project's root \
+        "{reason} for {}: the parity test reads the project's root \
          schematic {} ({root_state}), so the empty parity result it wrote is not a checked zero",
         pcb.display(),
         expected.display()
@@ -1438,6 +1630,47 @@ pub async fn export_netlist(
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
+}
+
+/// Both netlists of one schematic, as `kicad-cli` wrote them.
+pub(crate) struct SimulationNetlists {
+    pub spice: String,
+    pub kicad: String,
+}
+
+/// Export a snapshot's KiCad-format and SPICE netlists into `directory`.
+///
+/// Any nonzero exit fails: KiCad exits 2 after a library problem but still
+/// writes a file. The SPICE export runs last, and its caller must read any
+/// includes at once, because it can wipe KiCad's per-user IBIS cache.
+pub(crate) async fn export_simulation_netlists(
+    cli: &str,
+    schematic: &Path,
+    directory: &Path,
+    timeout_dur: Duration,
+) -> Result<SimulationNetlists> {
+    let kicad = directory.join("netlist.net");
+    let spice = directory.join("netlist.cir");
+    for (format, output) in [("kicadsexpr", &kicad), ("spice", &spice)] {
+        let output_arg = output.to_string_lossy();
+        let schematic_arg = schematic.to_string_lossy();
+        let args = [
+            "sch",
+            "export",
+            "netlist",
+            "--output",
+            &output_arg,
+            "--format",
+            format,
+            &schematic_arg,
+        ];
+        run_cli_owned(cli, &args, timeout_dur, true).await?;
+        verify_nonempty_file(output, "Netlist").await?;
+    }
+    Ok(SimulationNetlists {
+        spice: tokio::fs::read_to_string(&spice).await?,
+        kicad: tokio::fs::read_to_string(&kicad).await?,
+    })
 }
 
 // ─── PCB Export ──────────────────────────────────────────────────────────────
@@ -1871,6 +2104,31 @@ pub(crate) async fn upgrade_legacy_footprint(
     }
     Ok(text)
 }
+
+/// KiCAD 10: `pcb upgrade --force <board>`, which loads the board and saves it
+/// in place through KiCad's own reader and writer, whatever its version
+/// (`PCBNEW_JOBS_HANDLER::JobUpgrade`).
+pub(crate) async fn resave_board(cli: &str, board: &Path) -> Result<()> {
+    let board = board.to_str().context("board path is not UTF-8")?;
+    // The callers pass a private copy, so kicad-cli may be killed on timeout;
+    // otherwise it keeps the copy open, and on Windows its temporary folder
+    // cannot be removed. 120 s: the 85 MB jetson-agx-thor-baseboard demo
+    // re-saves in 6.2 s and 6.9 s in two runs (KiCad 10.0.7, measured 2026-11-01).
+    run_cli_owned(
+        cli,
+        &["pcb", "upgrade", "--force", board],
+        RESAVE_TIMEOUT,
+        true,
+    )
+    .await?;
+    Ok(())
+}
+
+/// [`RESAVE_TIMEOUT`] in seconds, for messages.
+pub(crate) const RESAVE_TIMEOUT_SECS: u64 = RESAVE_TIMEOUT.as_secs();
+
+/// Limit for [`resave_board`].
+const RESAVE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// KiCAD 10: `pcb export dxf --output <dir> [--layers <csv>] --mode-multi <input>`
 ///
@@ -2377,15 +2635,110 @@ mod drc_parse_tests {
         assert!(!report.missing_categories().contains(&"schematic_parity"));
     }
 
-    /// No statement from KiCad and an empty array is a real checked zero.
+    /// Silence only permits a checked zero when the exact root is present.
     #[test]
-    fn a_silent_empty_parity_array_is_a_checked_zero() {
+    fn a_silent_empty_parity_array_with_its_root_present_is_a_checked_zero() {
         let mut report = parse_drc_report(&real_report()).unwrap();
 
-        apply_parity_evidence(&mut report, "", Path::new("/somewhere/board.kicad_pcb"));
+        let tmp = tempfile::tempdir().unwrap();
+        let pcb = tmp.path().join("board.kicad_pcb");
+        std::fs::write(pcb.with_extension("kicad_sch"), "(kicad_sch)").unwrap();
+        apply_parity_evidence(&mut report, "", &pcb);
 
         assert_eq!(report.schematic_parity.as_ref().map(Vec::len), Some(0));
         assert!(report.schematic_parity_diagnostic.is_none());
+    }
+
+    /// KiCad's reporter may write the not-run message to stdout instead of
+    /// stderr. `run_drc` must recognise it there too, even with a root
+    /// schematic beside the board (where the file check alone would accept
+    /// the empty array as a checked zero).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_not_run_message_on_stdout_also_withholds_parity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pcb = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&pcb, "(kicad_pcb)").unwrap();
+        std::fs::write(pcb.with_extension("kicad_sch"), "(kicad_sch)").unwrap();
+        let prepared = tmp.path().join("prepared.json");
+        std::fs::write(&prepared, real_report().to_string()).unwrap();
+        let cli = test_support::write_script(
+            tmp.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    \
+                 shift\n    cp \"{}\" \"$1\"\n  fi\n  shift\ndone\nprintf '%s\\n' \"{PARITY_NOT_RUN}\"\nexit 0\n",
+                prepared.display()
+            ),
+            "@echo off\r\nexit /b 1\r\n",
+        );
+
+        let report = run_drc(cli.to_str().unwrap(), &pcb, false).await.unwrap();
+
+        assert!(report.schematic_parity.is_none(), "{report:?}");
+        let reason = report.schematic_parity_diagnostic.as_deref().unwrap();
+        assert!(reason.contains(PARITY_NOT_RUN), "{reason}");
+    }
+
+    /// Native 10.0.7 also emits [] without a diagnostic for a missing root.
+    #[test]
+    fn a_silent_empty_parity_array_without_root_stays_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pcb = tmp.path().join("board.kicad_pcb");
+        let mut report = parse_drc_report(&real_report()).unwrap();
+        apply_parity_evidence(&mut report, "", &pcb);
+        assert!(report.schematic_parity.is_none());
+        let reason = report.schematic_parity_diagnostic.as_deref().unwrap();
+        assert!(reason.contains("root schematic is unavailable"), "{reason}");
+        assert!(reason.contains("does not exist"), "{reason}");
+        assert_eq!(report.unconnected_items.as_ref().map(Vec::len), Some(2));
+        assert_eq!(report.violations.len(), 2);
+    }
+
+    /// Bounded live CLI acceptance. Does not exercise SES import/undo or IPC.
+    ///
+    /// The fixture boards are not in this repository: they were made by the
+    /// contributor (halthinks, 2026-10-20) and kept outside it. To run, set
+    /// `KONNECT_NATIVE_FIXTURES` to a directory holding the subdirectories
+    /// named below, each with a `fixture.kicad_pcb`, and `KONNECT_NATIVE_CLI`
+    /// to kicad-cli 10.0.7. The `KONNECT_` prefix matches the other live-test
+    /// variables (`KONNECT_LIVE_*`).
+    #[tokio::test]
+    #[ignore = "requires KiCad 10.0.7 and retained independent native fixtures"]
+    async fn native_independent_drc_controls() {
+        let root = PathBuf::from(
+            std::env::var("KONNECT_NATIVE_FIXTURES")
+                .expect("set KONNECT_NATIVE_FIXTURES to the native fixture directory"),
+        );
+        let cli = std::env::var("KONNECT_NATIVE_CLI")
+            .expect("set KONNECT_NATIVE_CLI to a kicad-cli 10.0.7 executable");
+        for case in ["mechanical-positive", "routed-probes"] {
+            let report = run_drc(&cli, &root.join(case).join("fixture.kicad_pcb"), false)
+                .await
+                .unwrap();
+            assert!(report.missing_categories().is_empty(), "{case}: {report:?}");
+            assert!(report.all().next().is_none(), "{case}: {report:?}");
+        }
+        let report = run_drc(
+            &cli,
+            &root.join("unconnected-probes/fixture.kicad_pcb"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.unconnected_items.as_ref().map(Vec::len), Some(1));
+        assert!(report.violations.is_empty());
+        let report = run_drc(&cli, &root.join("parity-mismatch/fixture.kicad_pcb"), false)
+            .await
+            .unwrap();
+        assert!(!report.schematic_parity.as_ref().unwrap().is_empty());
+        for case in ["missing-schematic", "missing-project-and-schematic"] {
+            let report = run_drc(&cli, &root.join(case).join("fixture.kicad_pcb"), false)
+                .await
+                .unwrap();
+            assert!(report.schematic_parity.is_none(), "{case}: {report:?}");
+            assert!(report.schematic_parity_diagnostic.is_some());
+        }
     }
 
     /// A kicad-cli that never reported the category stays "not reported" and
@@ -2474,10 +2827,14 @@ mod drc_parse_tests {
             .expect("kicad-cli pcb drc on the lone board");
         assert!(report.schematic_parity.is_none());
         assert!(report.missing_categories().contains(&"schematic_parity"));
+        // KiCad 10.0.7 gives no message for a lone board (exit 0, empty
+        // array); earlier releases print PARITY_NOT_RUN. Either way the
+        // parity result must be withheld with a diagnostic.
         assert!(report
             .schematic_parity_diagnostic
             .as_deref()
-            .is_some_and(|reason| reason.contains(PARITY_NOT_RUN)));
+            .is_some_and(|reason| reason.contains(PARITY_NOT_RUN)
+                || reason.contains("root schematic is unavailable")));
 
         // A project of another name beside the board is not consulted.
         let renamed = tmp.path().join("renamed");

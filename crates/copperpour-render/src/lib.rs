@@ -282,3 +282,11 @@ mod tests {
         assert!(diff.changed_bbox.is_none());
     }
 }
+
+/// Keep this crate's unit tests out of the developer's home (see
+/// `copperpour-test-home`).
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

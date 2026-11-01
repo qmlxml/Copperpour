@@ -5,15 +5,26 @@ pub(crate) mod freerouting_mcp;
 pub mod gates;
 pub mod guidance;
 pub(crate) mod hex;
+pub(crate) mod java_runtime;
 pub mod kicad_install;
 pub mod mcp;
 pub(crate) mod native_specctra_bridge;
 pub mod observability;
 pub mod outcome;
+pub mod progress;
 pub mod router;
 pub(crate) mod runtime_info;
+pub mod simulation;
 pub(crate) mod specctra;
 pub(crate) mod specctra_ses;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
+
+/// Keep this crate's unit tests out of the developer's home (see
+/// `copperpour-test-home`).
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

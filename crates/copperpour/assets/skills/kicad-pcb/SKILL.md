@@ -64,6 +64,12 @@ load_toolset('pcb_routing')      # traces, vias, differential pairs
 load_toolset('sch_export')       # update PCB from the saved schematic hierarchy
 ```
 
+For silkscreen cleanup, also:
+
+```
+load_toolset('pcb_footprint_text')  # list_board_footprint_texts, move_footprint_texts
+```
+
 Zones (`pcb_board`: add_zone; `pcb_routing`: add_copper_pour), component/net queries (`pcb_components`: find_component, get_component_list; `pcb_board`: get_board_info), and bulk placement (`pcb_components`: place_component_array, align_components, duplicate_component) are already covered by the toolsets loaded above.
 
 Load additional toolsets as needed:
@@ -109,7 +115,9 @@ Follow this sequence for a clean PCB workflow:
    cannot be placed (custom-shape pads are not supported), assign those parts a
    footprint without them; when the schematic connects a pad the footprint does not
    have, fix the symbol or the footprint choice. A successful apply is one KiCad
-   undo entry, so Ctrl-Z reverses the whole update.
+   undo entry, so Ctrl-Z reverses the whole update. When the response lists
+   `zones_to_refill` (a `zones_need_refill` warning), pads changed net under those pours:
+   run `refill_zones`, then `save_project`, before any DRC, plot or export.
 3. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
    Footprints from Library**. This is distinct from `update_pcb_from_schematic`:
@@ -239,6 +247,12 @@ an unproved outline is not completion evidence.
 - Standard grid: 0.5mm for placement, 0.25mm for fine adjustment
 - Check component courtyard overlaps after placement
 - Reference designator text: F.SilkS layer, 1mm height default
+- Silkscreen cleanup after placement (`load_toolset('pcb_footprint_text')` first):
+  `run_drc` reports `silk_overlap` and
+  `silk_over_copper` at board coordinates; `list_board_footprint_texts` gives
+  each reference's position and size; `move_footprint_texts` moves them in one
+  batch (`local_x`/`local_y` follow the part's rotation, `layer: "F.Fab"` or
+  `visible: false` takes a text off the silkscreen). Save, then re-run DRC.
 
 ---
 
@@ -372,6 +386,7 @@ add_zone(board, net_name, layer, points, clearance?, min_width?,
 
 **Must call `refill_zones` after any change that affects copper pour:**
 - After adding/moving components
+- After `update_pcb_from_schematic` reports `zones_to_refill`
 - After routing new traces
 - After modifying zone outlines
 - After changing design rules

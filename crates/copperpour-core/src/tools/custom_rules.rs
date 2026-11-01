@@ -521,7 +521,9 @@ async fn kicad_verdict(
         ),
     )
     .await?;
-    let report = match crate::tools::cli::run_drc(cli, &copy, false).await {
+    // The copy is private (a temporary directory), so kicad-cli is killed if
+    // it runs past its timeout.
+    let report = match crate::tools::cli::run_drc_on_private_copy(cli, &copy, false).await {
         Ok(report) => report,
         Err(error) => {
             return Ok(Some(format!(

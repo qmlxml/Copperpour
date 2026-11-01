@@ -20,7 +20,9 @@ Stop automatic retries. Copperpour sent a request but could not establish its
 outcome, or a transaction's attempted rollback failed. The live board may
 contain some or all of the requested changes; this is not proof that nothing
 happened. The structured error reports `board_state: unknown` and
-`retry_safe: false`.
+`retry_safe: false`. (`set_active_layer` is the exception: its uncertain outcome reports
+`board_state: editor_state_only` and `retry_safe: true`, because the active layer is editor state
+with no undo entry and setting it again is harmless.)
 
 Inspect the requested board in KiCad and reconcile what was actually applied
 before repeating any mutation. Do not edit the saved file as a workaround:
@@ -85,8 +87,17 @@ client uses. Each file and hook is compared with that binary's bundle:
 | `unreadable` | Present but could not be read, or `settings.json` is not valid JSON or not the shape Claude expects |
 
 A `different` hook carries a reason: `legacy_handler` is the pre-hook-JSON
-`… skill <name>` form, which Claude ignores, and `other_executable` is a hook
-that runs another Copperpour binary, written exactly as `copperpour init` writes it.
+`… skill <name>` form, which Claude ignores; `alias_handler` is a hook for the
+`konnect` alias beside this binary, which runs this binary and which `init`
+replaces; `duplicate_handler` is the current hook with another handler of
+ours beside it, or a second entry for it, which `init` removes;
+`stale_matcher` is our entry under a tool matcher from an older release,
+which `init` rewrites; `shared_entry` is the current hook only inside an entry
+that also holds your handlers under your matcher, which `init` moves into an
+entry of its own; and `other_executable` is a hook that runs another
+Copperpour binary, written exactly as `copperpour init` writes it. A hook is
+`current` exactly when `copperpour init` would leave our handler for it
+unchanged.
 
 The serving process makes the same comparison for both clients once per
 installed guidance version, meaning each install marker. The first start
@@ -474,6 +485,22 @@ back to project-local sidecars, and so is a relative default (a relative
 `HOME`, say): edits then refuse until `HOME`, `XDG_DATA_HOME` or
 `COPPERPOUR_STATE_DIR` is an absolute path.
 
+## `run_simulation` times out, or the client stops waiting
+
+`timeout_seconds` is a budget for the whole call, export included. At the budget the
+run halts softly and keeps its data, which reads as `partial` with
+`stopped.reason: timeout`. With no data it fails with reason `timed_out`.
+
+Many MCP clients stop waiting at 60 seconds, and Copperpour sends no progress during a
+run, so the default budget is 40. Raise it only as far as the client allows. If the
+client gave up first, the run still finished and its files are in `simulation/` under
+the state folder: `COPPERPOUR_STATE_DIR` if set, otherwise the platform's local data
+folder followed by `konnect` (for example `~/.local/share/konnect` on Linux).
+
+A run also stops at `max_raw_bytes`, 256 MiB by default, which reads as `partial` with
+`stopped.reason: size_limit` and keeps its data. A very small `max_step_seconds` is the
+usual cause. Shorten the run or raise the step before raising the limit.
+
 ## Tools don't appear after `load_toolset`
 
 After a successful `load_toolset` call the server sends a
@@ -590,7 +617,7 @@ active layer belongs to the editor session, not the `.kicad_pcb` document.
 
 Close the board in KiCad, make a backup copy, remove only the injected
 `(active_layer "...")` line from the board file, and reopen the board. Do not
-remove the surrounding `(setup ...)` block. Later versions, including every
-Copperpour release, refuse `set_active_layer` with `unsupported_capability` and
-leave the file byte-identical until stable KiCad IPC exposes a native operation with
-readback.
+remove the surrounding `(setup ...)` block. Later versions never write the token. Copperpour releases before the
+2026-11-01 change refused `set_active_layer` with `unsupported_capability`; since then it changes
+the active layer of a board open in KiCad over IPC (KiCad 10.0.7 handles `SetActiveLayer` and a
+change reads back) and still never writes the board file.

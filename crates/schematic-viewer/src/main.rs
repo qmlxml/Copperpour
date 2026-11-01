@@ -1268,3 +1268,11 @@ mod tests {
         assert!(files_needing_render(&entries, &changed, &cached).is_empty());
     }
 }
+
+/// Keep this binary's unit tests out of the developer's home (see
+/// `copperpour-test-home`).
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn isolate_test_home() {
+    copperpour_test_home::isolate();
+}

@@ -1284,7 +1284,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "set_active_layer",
-            "Request an editor active-layer change. The bundled stable KiCad IPC protocol does not expose this editor-session operation, so this tool currently returns unsupported_capability without modifying the board file. It never writes an (active_layer ...) token because KiCad 10 board files do not support one.",
+            "Make a layer the PCB editor's active layer, as clicking it in the Appearance panel does, on a board open in KiCad. Reads the active layer back and reports it with the previous one. No Copperpour tool uses the active layer: pass `layer` explicitly to tools that draw or route. Its only effect is where the person's next item drawn by hand in KiCad goes, so tell the user you changed it (and restore `previous` when done). Editor state only: it never writes the board file and never writes an (active_layer ...) token, which KiCad 10 board files do not support. Returns editor_unavailable when the board is not open in KiCad, and unsupported_capability when KiCad does not handle the command.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1294,7 +1294,10 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "layer"]
             }),
             |args, ctx| async move { handle_set_active_layer(args, ctx).await }
-        ),
+        )
+        // Editor state on a board open in KiCad: the hooks give the
+        // "open the board in KiCad" guidance (review 1).
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "add_board_outline",
             "Add a rectangular board outline on Edge.Cuts, optionally using circular rounded \
@@ -1430,6 +1433,7 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         super::board_stackup::tool(),
+        super::board_stackup_set::tool(),
         super::footprint_fields::tool(),
     ];
     tools.extend(super::pcb_board_zones::tools());
@@ -2329,26 +2333,245 @@ async fn handle_add_layer(
     })))
 }
 
+/// What the IPC part of `set_active_layer` found.
+enum ActiveLayerChange {
+    /// `SetActiveLayer` was accepted. `before` is `None` when the layer read
+    /// first was not a known layer; `after` is the read-back, or why it failed.
+    Changed {
+        before: Option<copperpour_ipc::gen::kiapi::board::types::BoardLayer>,
+        after: Result<copperpour_ipc::gen::kiapi::board::types::BoardLayer, String>,
+    },
+    /// KiCad answered `AS_UNHANDLED` or `AS_UNIMPLEMENTED`.
+    Unsupported(String),
+    /// KiCad answered `AS_BAD_REQUEST` to `SetActiveLayer`: a layer the board
+    /// does not enable (measured: In5.Cu on a two-layer board).
+    NotOnBoard(String),
+    /// KiCad answered `AS_BUSY`: it did nothing, and the call can be repeated.
+    Busy(String),
+}
+
+/// The cause of an uncertain outcome, without the generic "do not retry"
+/// instruction the transport adds for design mutations, which would
+/// contradict this tool's `retry_safe: true` (review 2).
+fn uncertain_cause(message: &str) -> &str {
+    message
+        .split(". Do not retry")
+        .next()
+        .unwrap_or(message)
+        .trim_end_matches('.')
+}
+
+fn layer_label(layer: copperpour_ipc::gen::kiapi::board::types::BoardLayer) -> String {
+    copperpour_ipc::builders::layer_name(layer)
+        .map(str::to_string)
+        .unwrap_or_else(|| layer.as_str_name().to_string())
+}
+
+/// A layer read from KiCad, or `None` for a value that is not a board layer.
+fn known_layer(
+    layer: copperpour_ipc::gen::kiapi::board::types::BoardLayer,
+) -> Option<copperpour_ipc::gen::kiapi::board::types::BoardLayer> {
+    use copperpour_ipc::gen::kiapi::board::types::BoardLayer;
+    (!matches!(layer, BoardLayer::BlUndefined | BoardLayer::BlUnknown)).then_some(layer)
+}
+
+/// Change the PCB editor's active layer on a board open in KiCad and read it
+/// back. Measured on stock KiCad 10.0.7 (2026-11-01): `GetActiveLayer` and
+/// `SetActiveLayer` are handled and a change reads back, so the earlier
+/// refusal, which said the stable protocol had no such operation, was wrong.
+/// (Behaviour from the wilfredo-a14 fork's `f517fd8`.)
+///
+/// The active layer is editor state: no design data, no undo entry, never
+/// written to the file, and setting it twice gives the same result. So this
+/// tool does not use the file-write path and its messages: a timeout is
+/// reported as safe to repeat, and a board not open in KiCad is
+/// `editor_unavailable` (reviews 1 and 3 of this change); only a KiCad that
+/// does not handle the command is `unsupported_capability`.
 async fn handle_set_active_layer(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    use super::live_board::LiveBoard;
     let board_path = get_path(args, "board")?;
-    let layer = match require_str(args, "layer") {
+    let name = match require_str(args, "layer") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    let layer = match copperpour_ipc::builders::try_layer_from_name(&name) {
+        Ok(layer) => layer,
+        Err(_) => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "layer".to_string(),
+                    reason: format!("'{name}' is not a KiCad board layer name"),
+                },
+                format!(
+                    "'{name}' is not a KiCad board layer name. Use KiCad's canonical names (for \
+                     example F.Cu, B.Cu, In1.Cu, F.SilkS, Edge.Cuts, User.1), not a name the \
+                     board gives a layer."
+                ),
+            ))
+        }
+    };
+    let unsupported = |reason: String| {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::UnsupportedCapability {
+                capability: "set_active_layer".to_string(),
+                kicad_version: None,
+            },
+            format!(
+                "Cannot set active layer '{name}' for '{}': {reason}. The board file is never \
+                 written by this tool.",
+                board_path.display()
+            ),
+        )
+    };
+    // Board-state refusals are `editor_unavailable`, as for the other
+    // live-only tools: opening the board fixes them. `unsupported_capability`
+    // is kept for a KiCad that does not handle the command (review 3).
+    let unavailable = |reason: String| {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::EditorUnavailable {
+                editor: "pcb".to_string(),
+                reason: reason.clone(),
+            },
+            format!(
+                "Cannot set active layer '{name}' for '{}': {reason}. The board file is never \
+                 written by this tool.",
+                board_path.display()
+            ),
+        )
+    };
+    let not_open = |answer: String| {
+        unavailable(format!(
+            "the active layer is PCB editor state, and KiCad does not hold this board open \
+             ({answer}); open it in KiCad first"
+        ))
+    };
 
-    Ok(CallToolResult::error_kind(
-        crate::mcp::error::ToolErrorKind::UnsupportedCapability {
-            capability: "set_active_layer".to_string(),
-            kicad_version: None,
-        },
-        format!(
-            "Cannot set active layer '{layer}' for '{}': active layer is editor-session state, and the bundled stable KiCad IPC protocol does not expose a supported mutation or readback. The board file was not changed.",
-            board_path.display()
+    let outcome = super::live_board::observe(ctx, &board_path, move |client, document| {
+        use copperpour_ipc::client::ApiStatusError;
+        use copperpour_ipc::gen::kiapi::common::ApiStatusCode;
+        // `on_set`: only `SetActiveLayer` carries the layer, so only its
+        // AS_BAD_REQUEST means "not a layer this board enables" (review 2).
+        let classify = |error: anyhow::Error, on_set: bool| match ApiStatusError::from_error(&error)
+        {
+            Some(status) if status.is_unsupported() => {
+                Ok(ActiveLayerChange::Unsupported(status.to_string()))
+            }
+            Some(status) if status.code == ApiStatusCode::AsBusy as i32 => {
+                Ok(ActiveLayerChange::Busy(status.to_string()))
+            }
+            Some(status) if on_set && status.code == ApiStatusCode::AsBadRequest as i32 => {
+                Ok(ActiveLayerChange::NotOnBoard(status.to_string()))
+            }
+            _ => Err(error),
+        };
+        let before = match client.get_active_layer_in(document.clone()) {
+            Ok(layer) => known_layer(layer),
+            Err(error) => return classify(error, false),
+        };
+        if let Err(error) = client.set_active_layer_in(document.clone(), layer) {
+            return classify(error, true);
+        }
+        // The change was accepted: a read-back that fails is reported as such,
+        // never as a refusal of a change that took effect.
+        let after = client
+            .get_active_layer_in(document)
+            .map_err(|error| format!("{error:#}"));
+        Ok(ActiveLayerChange::Changed { before, after })
+    })
+    .await?;
+
+    Ok(match outcome {
+        LiveBoard::Answered(ActiveLayerChange::Changed {
+            before,
+            after: Ok(after),
+        }) if after == layer => CallToolResult::json(&json!({
+            "active_layer": layer_label(after),
+            "previous": before.map(layer_label),
+            "changed": before.map(|before| before != after),
+            "source": "ipc_readback",
+        })),
+        LiveBoard::Answered(ActiveLayerChange::Changed {
+            after: Ok(after), ..
+        }) => CallToolResult::error(format!(
+            "KiCad accepted the change, but its active layer reads back as {}, not {name}. \
+                 Repeating the same layer is unlikely to help; check the board's layers with \
+                 get_layer_list. The board file is never written by this tool.",
+            layer_label(after)
+        )),
+        LiveBoard::Answered(ActiveLayerChange::Changed {
+            after: Err(reason), ..
+        }) => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::IpcOutcomeUnknown {
+                board_state: "editor_state_only".to_string(),
+                retry_safe: true,
+                reason: reason.clone(),
+            },
+            format!(
+                "KiCad accepted the active-layer change to {name}, but reading it back failed \
+                     ({reason}). Calling set_active_layer again is safe and reads the layer back."
+            ),
         ),
-    ))
+        LiveBoard::Answered(ActiveLayerChange::NotOnBoard(status)) => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "layer".to_string(),
+                reason: format!("not a layer this board enables ({status})"),
+            },
+            format!(
+                "KiCad refused '{name}': it is not a layer this board enables ({status}). Choose \
+                 one of the board's layers (get_layer_list lists them)."
+            ),
+        ),
+        LiveBoard::Answered(ActiveLayerChange::Unsupported(status)) => unsupported(format!(
+            "KiCad did not handle the active-layer command ({status})"
+        )),
+        LiveBoard::Answered(ActiveLayerChange::Busy(status)) => CallToolResult::error(format!(
+            "KiCad is busy with another operation ({status}) and changed nothing. Calling \
+             set_active_layer again once is safe. If KiCad stays busy, a dialog in KiCad is \
+             usually waiting for a person: report that to the user instead of repeating. The \
+             board file is never written by this tool."
+        )),
+        // Each refusal says only what KiCad's answer established (review 2).
+        LiveBoard::NotOpen { message, .. } => not_open(message),
+        LiveBoard::Unserved { absence, .. } => unavailable(format!(
+            "the active layer is PCB editor state, and KiCad is running but {}{}",
+            absence.observed(),
+            match absence {
+                crate::tools::BoardEditorAbsence::NoPcbEditor => "; open the board in KiCad first",
+                crate::tools::BoardEditorAbsence::OpenDocumentsUnimplemented => "",
+            }
+        )),
+        LiveBoard::NeverReached(message) => unavailable(format!(
+            "KiCad could not be reached over IPC ({message}); start KiCad with the API enabled \
+             and open the board"
+        )),
+        LiveBoard::LostAfterObservation { situation, .. } => unavailable(format!(
+            "{situation} ({}); reopen the board in KiCad and call again",
+            super::live_board::PREVIOUSLY_OBSERVED_LIVE
+        )),
+        LiveBoard::Unresolved(error) => crate::tools::ipc_target_error_result(&error),
+        LiveBoard::Rejected(message) => CallToolResult::error(format!(
+            "KiCad refused the active-layer request: {message}. The board file is never written \
+             by this tool."
+        )),
+        LiveBoard::Uncertain(message) | LiveBoard::Recovered(message) => {
+            let message = uncertain_cause(&message).to_string();
+            CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::IpcOutcomeUnknown {
+                    board_state: "editor_state_only".to_string(),
+                    retry_safe: true,
+                    reason: message.clone(),
+                },
+                format!(
+                    "KiCad did not answer the active-layer request in time ({message}); the active \
+                     layer may or may not have changed. Calling set_active_layer again is safe and \
+                     reads the layer back. The board file is never written by this tool."
+                ),
+            )
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2381,8 +2604,15 @@ mod active_layer_refusal_tests {
         serde_json::from_str(text).expect("structured tool result")
     }
 
+    /// With no KiCad holding the board, the tool refuses and writes nothing.
+    /// (a) Not acting is right: the active layer is editor state, and KiCad 10
+    /// board files have no place for it (Konnect v0.12.0 wrote an
+    /// `(active_layer ...)` token that KiCad 10.0.6 could not load). (b) Not
+    /// acting would be wrong with the board open in a KiCad that handles the
+    /// command, which `a_live_board_changes_its_active_layer_and_reads_it_back`
+    /// asserts.
     #[tokio::test]
-    async fn set_active_layer_is_typed_unsupported_and_writes_nothing() {
+    async fn set_active_layer_without_kicad_is_editor_unavailable_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("safe.kicad_pcb");
         let original = b"(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(setup\n\t\t(pad_to_mask_clearance 0)\n\t)\n)\n";
@@ -2397,10 +2627,315 @@ mod active_layer_refusal_tests {
 
         assert!(result.is_error);
         let body = body(&result);
-        assert_eq!(body["error"]["kind"], "unsupported_capability");
-        assert_eq!(body["error"]["capability"], "set_active_layer");
-        assert!(body["message"].as_str().unwrap().contains("not changed"));
+        assert_eq!(body["error"]["kind"], "editor_unavailable");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("never written by this tool"));
         assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    /// A rep0 endpoint playing a KiCad that holds `board` open with an active
+    /// layer it keeps, answering `SetActiveLayer` per `set_answer`.
+    /// How the mock answers. `get_calls_unhandled_from` makes the n-th and
+    /// later GetActiveLayer answer AS_UNHANDLED (1-based).
+    #[derive(Clone, Copy, Default)]
+    struct Mode {
+        unhandled: bool,
+        ignore_set: bool,
+        set_unhandled: bool,
+        set_bad_request: bool,
+        set_busy: bool,
+        get_calls_unhandled_from: Option<usize>,
+    }
+
+    fn kicad_with_active_layer(
+        board: &std::path::Path,
+        mode: Mode,
+    ) -> crate::test_support::MockIpcServer {
+        let Mode {
+            unhandled,
+            ignore_set,
+            set_unhandled,
+            set_bad_request,
+            set_busy,
+            get_calls_unhandled_from,
+        } = mode;
+        let gets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        use copperpour_ipc::builders::pack_any;
+        use copperpour_ipc::gen::kiapi;
+        use prost::Message;
+        // KiCad 10's own shape: a bare file name plus the project directory
+        // (review 2: the shared helper sends an absolute path, no project).
+        let document = kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    board.file_name().unwrap().to_string_lossy().into_owned(),
+                ),
+            ),
+            project: Some(kiapi::common::types::ProjectSpecifier {
+                name: "live".into(),
+                path: board.parent().unwrap().display().to_string(),
+            }),
+        };
+        let documents = vec![document.clone()];
+        let active = std::sync::Arc::new(std::sync::Mutex::new(
+            kiapi::board::types::BoardLayer::BlFCu as i32,
+        ));
+        crate::test_support::MockIpcServer::spawn("active-layer", move |request| {
+            let command = request.message.expect("a command");
+            let reply =
+                |status: kiapi::common::ApiStatusCode, message| kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: status as i32,
+                        error_message: if status == kiapi::common::ApiStatusCode::AsOk {
+                            String::new()
+                        } else {
+                            "no handler available for request".into()
+                        },
+                    }),
+                    header: None,
+                    message,
+                };
+            let name = command
+                .type_url
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            match name.as_str() {
+                "GetOpenDocuments" => reply(
+                    kiapi::common::ApiStatusCode::AsOk,
+                    Some(pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: documents.clone(),
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )),
+                ),
+                _ if unhandled && name.ends_with("ActiveLayer") => {
+                    reply(kiapi::common::ApiStatusCode::AsUnhandled, None)
+                }
+                "GetActiveLayer"
+                    if get_calls_unhandled_from.is_some_and(|from| {
+                        gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= from
+                    }) =>
+                {
+                    reply(kiapi::common::ApiStatusCode::AsUnhandled, None)
+                }
+                "SetActiveLayer" if set_unhandled => {
+                    reply(kiapi::common::ApiStatusCode::AsUnhandled, None)
+                }
+                "SetActiveLayer" if set_busy => reply(kiapi::common::ApiStatusCode::AsBusy, None),
+                "SetActiveLayer" if set_bad_request => {
+                    reply(kiapi::common::ApiStatusCode::AsBadRequest, None)
+                }
+                "GetActiveLayer" => {
+                    // The command must name the board KiCad listed (review 2).
+                    let asked =
+                        kiapi::board::commands::GetActiveLayer::decode(command.value.as_slice())
+                            .unwrap();
+                    assert_eq!(asked.board.as_ref(), Some(&document));
+                    reply(
+                        kiapi::common::ApiStatusCode::AsOk,
+                        Some(pack_any(
+                            &kiapi::board::commands::BoardLayerResponse {
+                                layer: *active.lock().unwrap(),
+                            },
+                            "kiapi.board.commands.BoardLayerResponse",
+                        )),
+                    )
+                }
+                "SetActiveLayer" => {
+                    let asked =
+                        kiapi::board::commands::SetActiveLayer::decode(command.value.as_slice())
+                            .unwrap();
+                    assert_eq!(asked.board.as_ref(), Some(&document));
+                    if !ignore_set {
+                        *active.lock().unwrap() = asked.layer;
+                    }
+                    reply(kiapi::common::ApiStatusCode::AsOk, None)
+                }
+                _ => reply(kiapi::common::ApiStatusCode::AsOk, None),
+            }
+        })
+    }
+
+    fn ctx_for(server: &crate::test_support::MockIpcServer) -> ToolContext {
+        super::board_mock::ctx_talking_to(server.address().to_string())
+    }
+
+    fn board_file(dir: &tempfile::TempDir) -> (std::path::PathBuf, Vec<u8>) {
+        let board = dir.path().join("live.kicad_pcb");
+        let original = b"(kicad_pcb (version 20260206) (generator \"pcbnew\"))\n".to_vec();
+        std::fs::write(&board, &original).unwrap();
+        (board, original)
+    }
+
+    /// Measured on stock KiCad 10.0.7 (2026-11-01): the command is handled and
+    /// a change reads back. The tool reports the previous and new layer and
+    /// leaves the file alone.
+    #[tokio::test]
+    async fn a_live_board_changes_its_active_layer_and_reads_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, original) = board_file(&dir);
+        let server = kicad_with_active_layer(&board, Mode::default());
+        let result = handle_set_active_layer(
+            &json!({"board": board.to_str().unwrap(), "layer": "B.Cu"}),
+            &ctx_for(&server),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = body(&result);
+        assert_eq!(body["active_layer"], "B.Cu", "{body}");
+        assert_eq!(body["previous"], "F.Cu", "{body}");
+        assert_eq!(body["changed"], true, "{body}");
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    /// (a) Not acting is right when KiCad answers the command as unhandled:
+    /// the change cannot be made, so the typed refusal is kept. (b) It would
+    /// be wrong when KiCad handles it, asserted above.
+    #[tokio::test]
+    async fn a_kicad_that_does_not_handle_the_command_is_refused_as_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, original) = board_file(&dir);
+        let server = kicad_with_active_layer(
+            &board,
+            Mode {
+                unhandled: true,
+                ..Mode::default()
+            },
+        );
+        let result = handle_set_active_layer(
+            &json!({"board": board.to_str().unwrap(), "layer": "B.Cu"}),
+            &ctx_for(&server),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "unsupported_capability", "{body}");
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    /// A KiCad that accepts the command but keeps another layer is reported,
+    /// not described as changed.
+    #[tokio::test]
+    async fn a_read_back_that_differs_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, _) = board_file(&dir);
+        let server = kicad_with_active_layer(
+            &board,
+            Mode {
+                ignore_set: true,
+                ..Mode::default()
+            },
+        );
+        let result = handle_set_active_layer(
+            &json!({"board": board.to_str().unwrap(), "layer": "B.Cu"}),
+            &ctx_for(&server),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("reads back as F.Cu"), "{text}");
+    }
+
+    async fn call(mode: Mode, layer: &str) -> (CallToolResult, Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, original) = board_file(&dir);
+        let server = kicad_with_active_layer(&board, mode);
+        let result = handle_set_active_layer(
+            &json!({"board": board.to_str().unwrap(), "layer": layer}),
+            &ctx_for(&server),
+        )
+        .await
+        .unwrap();
+        let after = std::fs::read(&board).unwrap();
+        (result, original, after)
+    }
+
+    /// GetActiveLayer handled but SetActiveLayer unhandled: the typed refusal.
+    /// (a) Not acting is right: KiCad cannot make the change. (b) Wrong if it
+    /// can, asserted by `a_live_board_changes_its_active_layer_and_reads_it_back`.
+    #[tokio::test]
+    async fn only_set_unhandled_is_refused_as_unsupported() {
+        let (result, original, after) = call(
+            Mode {
+                set_unhandled: true,
+                ..Mode::default()
+            },
+            "B.Cu",
+        )
+        .await;
+        assert_eq!(body(&result)["error"]["kind"], "unsupported_capability");
+        assert_eq!(after, original);
+    }
+
+    /// The change was accepted and the read-back failed: reported as an
+    /// uncertain outcome that is safe to repeat, never as a refusal.
+    #[tokio::test]
+    async fn a_failed_read_back_after_an_accepted_change_is_safe_to_repeat() {
+        let (result, _, _) = call(
+            Mode {
+                get_calls_unhandled_from: Some(2),
+                ..Mode::default()
+            },
+            "B.Cu",
+        )
+        .await;
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "ipc_outcome_unknown", "{body}");
+        assert_eq!(body["error"]["retry_safe"], true, "{body}");
+        assert!(
+            !body["message"].as_str().unwrap().contains("rejected"),
+            "{body}"
+        );
+    }
+
+    /// A layer the board does not enable (KiCad: AS_BAD_REQUEST, measured with
+    /// In5.Cu on a two-layer board) is an invalid argument naming the layer list.
+    #[tokio::test]
+    async fn a_layer_the_board_does_not_enable_is_an_invalid_argument() {
+        let (result, _, _) = call(
+            Mode {
+                set_bad_request: true,
+                ..Mode::default()
+            },
+            "In5.Cu",
+        )
+        .await;
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "layer", "{body}");
+        assert!(
+            body["message"].as_str().unwrap().contains("get_layer_list"),
+            "{body}"
+        );
+    }
+
+    /// KiCad busy: nothing was done, so the refusal says repeating is safe.
+    #[tokio::test]
+    async fn a_busy_kicad_changed_nothing_and_the_call_can_be_repeated() {
+        let (result, original, after) = call(
+            Mode {
+                set_busy: true,
+                ..Mode::default()
+            },
+            "B.Cu",
+        )
+        .await;
+        assert!(result.is_error);
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("changed nothing") && text.contains("again"),
+            "{text}"
+        );
+        assert_eq!(after, original);
     }
 
     #[test]
@@ -2410,9 +2945,11 @@ mod active_layer_refusal_tests {
             .find(|tool| tool.name == "set_active_layer")
             .expect("registered tool");
 
-        assert_eq!(tool.board_access, BoardAccess::None);
+        assert_eq!(tool.board_access, BoardAccess::LiveOnly);
         assert!(tool.description.contains("unsupported_capability"));
         assert!(tool.description.contains("never writes"));
+        // No other tool reads the active layer; the caller is told (review 3).
+        assert!(tool.description.contains("pass `layer` explicitly"));
         assert!(!tool.description.contains("recorded in the board file"));
     }
 }

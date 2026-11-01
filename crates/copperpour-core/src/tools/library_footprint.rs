@@ -46,6 +46,115 @@ pub(crate) fn attributes(root: &SexpNode) -> Result<kiapi::board::types::Footpri
     Ok(attributes)
 }
 
+/// The pad groups a footprint's `(net_tie_pad_groups "1, 2" "3, 4")` declares:
+/// pads KiCad may join with copper without reporting a short. KiCad's solder
+/// jumpers and net ties carry one; without it on the board, DRC reads the
+/// bridge as `shorting_items` and the jumper's pads as a clearance error.
+/// (From the `marju212/Konnect` fork, commit `a7886a9`.)
+pub(crate) fn net_ties(root: &SexpNode) -> Result<Vec<kiapi::board::types::NetTieDefinition>> {
+    let groups = root.find_all("net_tie_pad_groups");
+    let Some(groups) = groups.first() else {
+        return Ok(Vec::new());
+    };
+    // KiCad's parser appends the groups of a repeated clause; one clause is
+    // what KiCad writes, so a second is refused rather than guessed.
+    if root.find_all("net_tie_pad_groups").len() > 1 {
+        bail!("footprint has more than one net_tie_pad_groups clause");
+    }
+    let mut ties = Vec::new();
+    for group in groups.children().unwrap_or_default().iter().skip(1) {
+        let group = group
+            .as_str()
+            .context("footprint net_tie_pad_groups contains a non-atom")?;
+        let pad_number = net_tie_pads(group);
+        if pad_number.is_empty() {
+            bail!("footprint net_tie_pad_groups contains an empty group");
+        }
+        ties.push(kiapi::board::types::NetTieDefinition { pad_number });
+    }
+    Ok(ties)
+}
+
+/// The pads of one net-tie group, read as KiCad's DRC reads them
+/// (`FOOTPRINT::MapPadNumbersToNetTieGroups`, KiCad 10.0.7): split on commas
+/// not escaped by a backslash, each name trimmed, empty names dropped. White
+/// space inside a name is part of it. (Review 2 of plan step 7: splitting on
+/// white space as well, as KiCad's IPC writer does, would tie pads `1` and
+/// `2` for a library that names one pad `1 2`.)
+fn net_tie_pads(group: &str) -> Vec<String> {
+    let mut pads = Vec::new();
+    let mut pad = String::new();
+    let mut escaped = false;
+    for ch in group.chars() {
+        match ch {
+            _ if escaped => {
+                escaped = false;
+                pad.push(ch);
+            }
+            '\\' => escaped = true,
+            ',' => pads.push(std::mem::take(&mut pad)),
+            _ => pad.push(ch),
+        }
+    }
+    pads.push(pad);
+    pads.into_iter()
+        .map(|pad| pad.trim().to_string())
+        .filter(|pad| !pad.is_empty())
+        .collect()
+}
+
+/// The footprint-level `(zone_connect N)` override, when the library sets one.
+/// The numbers are KiCad's file values for `ZONE_CONNECTION`, which differ
+/// from the API enum's; an absent clause means the connection is inherited
+/// from the zone. A pad's own `(zone_connect …)` sits inside the pad and is
+/// not this (`find` reads direct children only). (From `marju212` `a7886a9`.)
+pub(crate) fn zone_connection(
+    root: &SexpNode,
+) -> Result<Option<kiapi::board::types::ZoneConnectionStyle>> {
+    use kiapi::board::types::ZoneConnectionStyle;
+
+    let clauses = root.find_all("zone_connect");
+    if clauses.len() > 1 {
+        bail!("footprint has more than one zone_connect clause");
+    }
+    let Some(clause) = clauses.first() else {
+        return Ok(None);
+    };
+    let value = clause
+        .get(1)
+        .and_then(SexpNode::as_str)
+        .context("footprint zone_connect is missing its value")?;
+    Ok(Some(match value {
+        "0" => ZoneConnectionStyle::ZcsNone,
+        "1" => ZoneConnectionStyle::ZcsThermal,
+        "2" => ZoneConnectionStyle::ZcsFull,
+        "3" => ZoneConnectionStyle::ZcsPthThermal,
+        other => bail!("footprint zone_connect value '{other}' is not supported"),
+    }))
+}
+
+/// Put a library's net-tie pad groups and footprint-level zone connection on
+/// a built footprint. Every path that places a footprint from its library
+/// calls this, so a solder jumper does not reach the board as a short.
+pub(crate) fn apply_net_ties_and_zone_connection(
+    footprint: &mut kiapi::board::types::FootprintInstance,
+    net_ties: &[kiapi::board::types::NetTieDefinition],
+    zone_connection: Option<kiapi::board::types::ZoneConnectionStyle>,
+) -> Result<()> {
+    if let Some(zone_connection) = zone_connection {
+        footprint
+            .overrides
+            .get_or_insert_with(Default::default)
+            .zone_connection = zone_connection as i32;
+    }
+    footprint
+        .definition
+        .as_mut()
+        .context("built footprint has no definition")?
+        .net_ties = net_ties.to_vec();
+    Ok(())
+}
+
 /// The library description and keywords. KiCad keeps these on the footprint
 /// definition, not the instance, in the same message type as the attributes.
 pub(crate) fn description_and_keywords(
@@ -754,6 +863,48 @@ mod tests {
         assert!(
             format!("{refusal:#}").contains("clause 'locked' is not supported"),
             "{refusal:#}"
+        );
+    }
+
+    /// KiCad's bridged solder jumper: one net-tie group of its two pads and a
+    /// footprint-level thermal zone connection. A footprint without either
+    /// reads as no ties and an inherited connection. (From `marju212`.)
+    #[test]
+    fn net_ties_and_zone_connection_read_from_a_solder_jumper() {
+        let jumper = root(
+            "(footprint \"SolderJumper-2_P1.3mm_Bridged_Pad1.0x1.5mm\" (layer \"F.Cu\") \
+             (zone_connect 1) (net_tie_pad_groups \"1, 2\") \
+             (pad \"1\" smd rect (at -0.65 0) (size 1 1.5) (layers \"F.Cu\" \"F.Mask\") (zone_connect 2)) \
+             (pad \"2\" smd rect (at 0.65 0) (size 1 1.5) (layers \"F.Cu\" \"F.Mask\")))",
+        );
+        let ties = net_ties(&jumper).unwrap();
+        assert_eq!(ties.len(), 1);
+        assert_eq!(ties[0].pad_number, vec!["1".to_string(), "2".to_string()]);
+        assert_eq!(
+            zone_connection(&jumper).unwrap(),
+            Some(kiapi::board::types::ZoneConnectionStyle::ZcsThermal),
+            "the footprint-level clause, not the pad's own"
+        );
+
+        let plain = root(C_0603);
+        assert!(net_ties(&plain).unwrap().is_empty());
+        assert_eq!(zone_connection(&plain).unwrap(), None);
+
+        let bad = root("(footprint \"X\" (zone_connect 9))");
+        assert!(zone_connection(&bad).is_err());
+        let empty = root("(footprint \"X\" (net_tie_pad_groups \" , \"))");
+        assert!(net_ties(&empty).is_err());
+        // As KiCad's DRC reads a group: commas only, trimmed, `\,` escaped.
+        let spaced = root("(footprint \"X\" (net_tie_pad_groups \" 1 2 ,3, a\\\\,b\"))");
+        assert_eq!(
+            net_ties(&spaced).unwrap()[0].pad_number,
+            ["1 2", "3", "a,b"]
+        );
+        let twice =
+            root("(footprint \"X\" (net_tie_pad_groups \"1, 2\") (net_tie_pad_groups \"3, 4\"))");
+        assert!(net_ties(&twice).is_err());
+        assert!(
+            zone_connection(&root("(footprint \"X\" (zone_connect 1) (zone_connect 2))")).is_err()
         );
     }
 

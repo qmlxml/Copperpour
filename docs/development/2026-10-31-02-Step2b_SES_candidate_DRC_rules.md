@@ -1,0 +1,276 @@
+# Step 2b — `apply_specctra_ses`: check the candidate with the project's DRC rules
+
+Plan: `2026-10-31-00-Fork_Survey.md`, section 7. Added by owner ruling during step 2 review 3
+(`2026-10-31-01-Step2_halthinks_DRC_evidence.md`). This step changes Copperpour's own code; it
+is not a contribution from another fork.
+
+## Defect
+
+`apply_specctra_ses` writes the routed board to a new candidate `.kicad_pcb` and ran kicad-cli
+DRC on it where it was written. kicad-cli reads rule severities, clearances and net classes from
+`<board stem>.kicad_pro` and custom rules from `<board stem>.kicad_dru`. The candidate has its
+own stem and no such files, so it was checked with KiCad's defaults. Measured with
+`scripts/measure_candidate_drc_rules.sh` on kicad-cli 10.0.7 (project severity
+`invalid_outline: ignore`): source board 0 violations, candidate alone 1, candidate with the
+project file copied under its stem 0.
+
+## Implementation (commit `e1199ea`)
+
+- New `candidate_drc` (crates/copperpour-core/src/tools/pcb_routing.rs): copies the candidate
+  into a temporary directory together with the source's `.kicad_pro` and `.kicad_dru`, renamed to
+  the candidate's stem, and runs DRC there. The candidate's directory gains no files; the
+  temporary directory is removed afterwards. Diagnostics naming the temporary copy are rewritten
+  to name the candidate's directory.
+- Schematic parity stays unchecked for the candidate: a root schematic copied alone would lose
+  its hierarchical sheets.
+- Evidence fields: `rules_source` (`"project"` when a rule file was applied, `"kicad_defaults"`
+  when the source project has none) and `rules_applied` (the source files used). The step 2 label
+  (`project_rules` as a missing category, `rules_diagnostic`) is removed: the rules are now
+  applied, so nothing is missing.
+- Tests: `applied_project_rules_are_named_in_the_evidence`,
+  `a_source_without_rule_files_is_checked_with_kicads_defaults`,
+  `the_candidates_drc_runs_beside_the_source_projects_rule_files` (Unix; a fake kicad-cli
+  records what sits beside the board it is given), and the ignored live test
+  `candidate_drc_live_applies_the_project_severity`, which passes on kicad-cli 10.0.7 here,
+  including its control (the candidate checked alone does report `invalid_outline`).
+- Gate (`logs/gate-step2b-impl.summary`): 3,145 passed, 1 failed (the known baseline failure),
+  59 ignored (+1: the live test).
+
+## Routing verdict (owner ruling 2026-10-31)
+
+`clean` requires every category and is therefore false for every import. Options put to the
+owner: A, a narrower `routing_clean`; B, report parity as not applicable and leave it out of
+`clean`; C, no verdict. Both models recommended A; the owner chose A. B was rejected because a
+source board that already fails parity would then be reported clean.
+
+Implemented: `routing_clean` is true when design-rule violations and unconnected items were both
+checked and are zero, and false when the unconnected-items category is missing.
+`routing_clean_excludes` is `["schematic_parity"]`. The tool description, tool directory and
+migration note say it is not design acceptance. Tests:
+`routing_is_clean_when_rules_and_connectivity_were_checked_and_pass`,
+`routing_is_not_clean_when_connectivity_was_not_checked` (states why not acting is correct and
+when it would be wrong), `routing_is_not_clean_with_a_violation_or_an_unconnected_item`.
+
+Routing verdict committed as `0d2cde0`. Gate (`logs/gate-step2b-verdict.summary`): 3,148 passed
+(+3 routing tests), 1 failed (the known baseline failure), 59 ignored.
+
+## Review 1 (implementation) and fix pass 1
+
+1. **Project-local footprint libraries were not found by the candidate's DRC** (defect). Moving
+   the board into a temporary directory also moved `${KIPRJMOD}` and dropped the project's
+   `fp-lib-table`. Measured by the reviewer and reproduced here on kicad-cli 10.0.7: source in
+   place, 4 `copper_edge_clearance`; temporary copy, the same plus `lib_footprint_issues`;
+   copy with the table copied unchanged, still `lib_footprint_issues` ("not enabled"); copy
+   with `${KIPRJMOD}` expanded to the source directory, the same 4 as the source. Fixed:
+   `candidate_drc` writes the table with `${KIPRJMOD}` (and the legacy `$(KIPRJMOD)`) expanded
+   and lists it in `rules_applied`; `rules_source` stays `"project"` only when a `.kicad_pro`
+   or `.kicad_dru` was applied. New fixture `crates/copperpour-core/tests/fixtures/candidate_drc_project_lib/` (its README,
+   recording the measurement, is the sibling file `candidate_drc_project_lib.README.md`) and ignored live test
+   `candidate_drc_live_finds_project_local_footprint_libraries`, which passes here. Control:
+   with the table copy disabled, the live test fails.
+2. **The parity diagnostic described a file in the temporary directory** under the candidate's
+   name, and contradicted the earlier advice to place a schematic beside the candidate.
+   Replaced with a fixed statement that parity is not checked for an SES candidate and why.
+3. **A relative candidate path rewrote diagnostics to the filesystem root.** The rewrite now
+   uses the candidate's canonical path. Not covered by a test: a relative path would require
+   changing the working directory of the test process, which other tests share.
+4. **`<candidate>.drc.json` was still checked for and deleted on rollback**, although DRC no
+   longer writes it. Both removed: an unrelated file of that name no longer blocks an import
+   and is never deleted by this tool.
+5. **The fake-cli test checked file names only.** It now checks the copied contents, that
+   `${KIPRJMOD}` was expanded, that the temporary directory was removed, and the exact parity
+   diagnostic.
+
+Checked by the reviewer and found correct: `runtime.block_on` of the async `candidate_drc`
+inside `spawn_blocking`; the temporary directory is dropped on every early return; ownership
+enrichment reads a byte-identical copy; `routing_clean` matches its documentation.
+
+Gate after fix pass 1 (`logs/gate-step2b-fix1.summary`): 3,148 passed, 1 failed (the known
+baseline failure), 60 ignored (+1: the library live test).
+Committed as `9d09939`.
+
+## Review 2 (robustness) and fix pass 2
+
+The reviewer measured on kicad-cli 10.0.7 with copies of `candidate_drc_project_lib`.
+
+1. **A double quote in the project directory** made the expanded table unreadable, giving a
+   `lib_footprint_issues` the source does not have, with no warning (measured). KiCad reads a
+   backslash literally, so the quote cannot be escaped. The table is now not applied in that
+   case, and the new evidence field `library_diagnostic` says why. Spaces, parentheses,
+   non-ASCII and backslash sequences were measured to work. Test
+   `a_library_table_that_cannot_be_expanded_is_reported_not_applied`.
+2. **`$KIPRJMOD` without braces** is accepted by KiCad (measured) and was not replaced. All
+   three forms are now replaced. The fake-cli test covers it.
+3. **Windows paths**: `canonicalize` gives `\\?\C:\...`, and KiCad URIs use forward slashes
+   (inferred; not testable here). The directory is now written through the existing
+   `portable_uri` (crates/copperpour-core/src/tools/library.rs, made `pub(crate)`).
+4. **Any failure in the DRC setup undoes a correct routing import.** This was Copperpour's
+   policy for DRC failures before this step; the step added causes. The avoidable new cause is
+   removed: the table is read and expanded as bytes (new `replace_bytes`), so a table that is
+   not UTF-8 no longer fails (test `a_library_table_that_is_not_utf8_is_still_applied`). Whether
+   a DRC failure should undo the import is a policy question passed to review 3.
+5. **kicad-cli was not stopped on timeout**, so it could keep running while the temporary copy
+   was deleted. `run_cli_captured` (crates/copperpour-core/src/tools/cli.rs) now sets
+   `kill_on_drop`; this applies to every kicad-cli call. (Superseded in step 4: yuvaltal912-sys's contribution kills kicad-cli on timeout only on a private copy, because a killed kicad-cli on a live project leaves its lock file behind; the SES candidate check now uses `run_drc_on_private_copy`. See `2026-10-31-04-Step4_yuvaltal912_simulation.md`.) Test `a_timed_out_kicad_cli_is_killed`
+   (Linux). Control: with `kill_on_drop` removed, it fails. A server killed by SIGKILL still
+   leaves its temporary copy behind, as any temporary file would.
+
+Measured and found correct by the reviewer: kicad-cli run on the copy writes nothing into the
+source project (it writes `.kicad_prl` beside the copy only); the renamed `.kicad_pro` gives the
+same results; `.kicad_dru` without `.kicad_pro` is applied (rules raised a count from 5 to 10),
+so `rules_source: "project"` is right; with only `fp-lib-table`, `"kicad_defaults"` with the
+table in `rules_applied` is correct because the table carries no rules.
+
+Gate after fix pass 2 (`logs/gate-step2b-fix2.summary`): 3,152 passed (+4), 1 failed (the known
+baseline failure), 60 ignored.
+Committed as `2846b92`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+Fixed in this pass:
+
+- **Finding 2: `routing_clean` could be true with nothing routed.** With the project's
+  `.kicad_pro` applied, a project severity `unconnected_items: "ignore"` makes kicad-cli report
+  an empty unconnected list (measured by the reviewer: 14 unconnected items with default
+  severities, `[]` with "ignore"). `candidate_drc` now reads that severity from the source
+  `.kicad_pro`; when it is "ignore" the category is reported as missing, with
+  `connectivity_diagnostic`, so `routing_clean` is false. Tests
+  `an_ignored_unconnected_check_is_recognised_in_the_project_file` and
+  `an_ignored_connectivity_check_is_not_evidence_of_routing` (states why not acting is correct
+  and when it would be wrong). Plain `run_drc` likewise reports zero unconnected items, without saying the check was ignored, for a project that
+  ignores unconnected items; that predates this work and is recorded here as deferred.
+- **Finding 5: a library table that was not applied left the evidence complete.**
+  `footprint_library` is now a missing category in that case. Test
+  `a_library_table_not_applied_makes_the_evidence_incomplete`.
+- **Finding 6: `rules_source: "project"` does not prove the rules were parsed** (a `.kicad_dru`
+  with a syntax error gives exit 0 and no message, measured by the reviewer; the source board is
+  affected in the same way). Documented in the migration note.
+
+Not adopted, after measuring:
+
+- **Finding 4: relative library URIs.** The reviewer reported that `(uri "mylib.pretty")`
+  resolves for the board in place and not for the copy. Re-measured here on kicad-cli 10.0.7 in
+  the reviewer's own directories: the board in place also reports `lib_footprint_issues` ("The
+  footprint library 'mylib' is not enabled"). A first fix that made relative URIs absolute was
+  written and then removed, because it made the copy report less than the source. Relative URIs
+  are copied unchanged; the live test `candidate_drc_live_finds_project_local_footprint_libraries`
+  now also checks that the copy and the source report the same findings with a relative URI.
+
+Put to the owner (see the rulings below):
+
+- **Finding 1:** any failure in the DRC setup or run undoes a routing import that was committed
+  and verified, and a failure that repeats (e.g. kicad-cli exceeding its 600 s limit on a large
+  board) makes that board impossible to import.
+- **Finding 3:** findings already on the source board (e.g. 4 `copper_edge_clearance` on the
+  fixture, 17 warnings on KiCad's ecc83-pp demo) are inherited by every candidate, so on such
+  boards `routing_clean` can never be true.
+
+Gate after fix pass 3 (`logs/gate-step2b-fix3.summary`): 3,155 passed (+3), 1 failed (the known
+baseline failure), 60 ignored. Committed as `275a59f`.
+
+### Ruling on finding 1 (owner, 2026-10-31): keep the import when only the check failed, and add a re-check
+
+Recorded in commit `481b027`.
+
+Both models recommended option C; the owner chose it. To implement:
+- Roll back only for failures that say something about the import: IPC read-back mismatch and
+  candidate write failure. A failure of the DRC setup or run (temporary directory, copy,
+  kicad-cli crash or timeout, kicad-cli unable to load the candidate) keeps the import and the
+  candidate. The candidate is KiCad's own saved output, verified by read-back, so a load failure
+  is treated as a check failure.
+- Report such a failure as `drc.status: "not_run"` with the reason, `clean` and `routing_clean`
+  false and every category missing, and show the not-run state at the top level of the response
+  so a caller reading only `success` sees it.
+- The distinction must be typed (which step failed), not inferred from error text.
+- Add a way to re-check an existing candidate with the source project's rules (reusing
+  `candidate_drc`). The tool description must say that a board on which kicad-cli always
+  exceeds its 600 s limit will time out again.
+
+### Ruling on finding 3 (owner, 2026-10-31): classify findings by the items they name
+
+Recorded in commit `d3be7b1`.
+
+Both models recommended this (the second reviewer proposed it; the first had listed only a second DRC run and
+agreed after checking the code). To implement: a finding is `introduced` if any item it names
+is one the import created (`created_ids`), otherwise `preexisting`. Add `import_clean` (no
+introduced findings, and unconnected items checked and zero); keep `routing_clean` as the
+whole-board verdict. No second DRC run. Assumption to verify in a live run with the KiCad
+editor: the item IDs KiCad returns over IPC are the UUIDs it writes into the saved candidate.
+
+### Implementation of the two rulings
+
+- **Finding 1 ruling.** `ApplyEvidence.drc` is now a `Result` whose error is the reason the check
+  did not run (a `String` at first; `DrcNotRun`, with `reason` and `timed_out`, after the review
+  of this implementation):
+  everything up to and including writing the candidate is still inside the closure whose error
+  rolls the import back; the `candidate_drc` result is captured instead of propagated. The
+  response gains `drc_status` (`"checked"` or `"not_run"`) and a top-level `warning` when the
+  check did not run; the `drc` object is then `drc_not_run_evidence` (status, reason, every
+  verdict false, every category missing). New tool `check_specctra_candidate` re-checks an
+  existing candidate with the source project's rules. It is registered in the `verification`
+  toolset, not `pcb_routing`: `pcb_routing` already had 20 tools, and Copperpour's test
+  `no_toolset_exceeds_max_size` (limit 20) says to split a toolset rather than raise the limit.
+  Migration notes updated and `docs/api-migrations/check-specctra-candidate.md` added.
+- **Finding 3 ruling.** `specctra_drc_evidence` takes the created item IDs; a finding is
+  introduced when any item it names has one of those IDs (compared without regard to case).
+  New fields `introduced_violations`, `preexisting_violations`, `import_clean`; they are
+  `null` from `check_specctra_candidate`, which does not know the created items.
+- **Not testable here:** the keep-the-import path inside `apply_specctra_ses`, and the
+  assumption that IPC KIIDs equal the saved UUIDs, need a running KiCad editor. Copperpour's
+  existing live test (`specctra_live_undo_test`, needs KiCad and Freerouting) now asserts the
+  second (each created item ID appears in the saved candidate; added during the documentation
+  review) and that the DRC ran with the classification. Nothing asserts the keep-the-import
+  path. Unit tests added: `findings_are_split_by_whether_they_name_an_item_the_import_created`,
+  `import_clean_requires_connectivity_to_have_been_checked`,
+  `without_the_created_items_the_split_is_unknown_not_zero`,
+  `a_check_that_did_not_run_passes_nothing`,
+  `check_specctra_candidate_reports_the_candidates_drc_or_why_it_did_not_run`.
+- Gate (`logs/gate-step2b-rulings.summary`): 3,160 passed (+5), 1 failed (the known baseline
+  failure), 60 ignored. A first run failed `no_toolset_exceeds_max_size` until the tool moved.
+Committed as `ddf96fa`.
+
+### Review of the ruling implementation, and fixes
+
+An extra independent review of commit `ddf96fa` (all three stances) confirmed that rollback now
+happens exactly for the import-side failures (the post-commit `get_items_in` calls, the count
+mismatch, `save_document_to_string_in`, `write_new_atomic`) and that every DRC failure keeps the
+import. Its findings and the fixes:
+
+1. **After a check that did not run, the import verdict could never be obtained** (likely
+   defect, liveness): the re-check did not know the created items. The apply response now
+   returns `created_item_ids`, and `check_specctra_candidate` accepts them.
+2. **A timeout warning advised a re-check that would time out again.** Whether the failure was a
+   timeout is now read from the error chain (tokio's `Elapsed`, function `is_timeout`), and the
+   warning then names `run_drc` with `sync_live_board` (which saves over the source) or DRC in
+   the KiCad editor.
+3. **Nothing tied the candidate to the import.** Both tools report `candidate_sha256`; the
+   re-check refuses a candidate path that resolves to the source board.
+4. **`import_clean` could be true without the footprint library table.** It now also requires
+   the table to have been applied.
+5. **A rollback could delete a candidate another process created** between the conflict check
+   and the write. The candidate is now removed only if this call wrote it.
+6. **The migration note stated the behaviour change backwards.** Corrected: an error still means
+   nothing was imported; `success: true` no longer means a DRC ran.
+
+Tests added: `a_timeout_is_recognised_through_the_error_chain`,
+`the_not_run_warning_names_the_next_action_for_each_cause`,
+`import_clean_requires_the_library_table_to_have_been_applied`, and the re-check test now covers
+`created_item_ids`, `candidate_sha256` and the same-path refusal. Still not covered by a unit
+test: building the apply response when the check did not run; it needs the live test.
+
+Gate (`logs/gate-step2b-ruling-review.summary`): 3,163 passed (+3), 1 failed (the known baseline
+failure), 60 ignored. Committed as `7ec397b`.
+
+## Documentation review (sub-step 16)
+
+An independent check of this log, the plan entry, both migration notes, the tool descriptions
+and the tool directory against the code found eight errors, all corrected: wrong review and
+ruling counts in the plan; the live test was said to assert two properties it did not (it now
+asserts that every created item ID appears in the saved candidate; nothing asserts the
+keep-the-import path); an out-of-date type for `ApplyEvidence.drc`; missing commit hashes; the
+tool-directory row for `check_specctra_candidate` predating `created_item_ids`; a migration-note
+sentence saying rollback was unchanged; and a coined phrase replaced by a plain description.
+Also corrected: the `import_clean` definition everywhere now includes the library-table
+condition, the fixture README path, and the conflict message, which still mentioned a DRC
+output file. Gate (`logs/gate-step2b-docs.summary`): 3,163 passed, 1 failed (the known baseline
+failure), 60 ignored.

@@ -170,17 +170,25 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output.",
+            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. success is true only when Freerouting's log shows no unrouted connections and no clearance violations, the project's rules were found and applied, and the settings sent were verified; otherwise message says why, and the SES is still written. success is not a design-rule verdict: check the SES with plan_specctra_ses_import and DRC. With optimize_seconds, the board kept is the best by the optimizer's score, which is not DRC-clean or complete by construction.",
             json!({
                 "type": "object",
                 "properties": {
                     "dsn_path": { "type": "string", "description": "Existing Specctra .dsn input" },
                     "ses_output_path": { "type": "string", "description": "New .ses output path; existing files are never replaced" },
                     "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
-                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Routing passes (Freerouting's autorouter.max_passes). Unlimited by default: the router stops once every connection is routed or no pass makes progress." },
                     "optimizer_enabled": { "type": "boolean" },
-                    "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
-                    "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
+                    "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Freerouting's own job limit. A job that reaches it ends TIMED_OUT and Freerouting refuses its output: the routing is lost. To bound the optimizer, use optimize_seconds." },
+                    "optimizer_max_passes": { "type": "integer", "minimum": 1, "maximum": 100, "description": "At most this many optimizer passes (Freerouting's optimizer.max_passes, default 100). Each pass can take minutes on a dense board." },
+                    "optimizer_improvement_threshold": { "type": "number", "minimum": 0, "maximum": 100, "description": "Stop optimizing after a pass that improves the optimizer score by less than this many percent (Freerouting's default 2.5). Lower it to keep optimizing for smaller gains." },
+                    "plane_nets": { "type": "array", "items": { "type": "string" }, "description": "Net names Freerouting treats as power-plane nets (its plane_nets): plane routing mode and cheaper vias to the plane. A (plane ...) declared in the DSN already marks its net the same way." },
+                    "plane_as_obstacle": { "type": "boolean", "description": "Whether copper pours block foreign traces (Freerouting's plane_as_obstacle, default false)." },
+                    "project_path": { "type": "string", "description": "KiCad .kicad_pro whose design rules apply. By default, the only .kicad_pro next to the DSN, else in its parent folder. Its min_copper_edge_clearance, min_hole_to_hole and min_hole_clearance are sent as Freerouting's copper_to_edge_clearance_um, hole_to_hole_um and hole_clearance_um (rules at 0 are left to Freerouting's defaults), under router_settings and the named arguments, which win. The DSN carries none of them. A rule the JAR does not know is listed in project_rules.not_applied rather than refused." },
+                    "router_settings": { "type": "object", "additionalProperties": true, "description": "Any Freerouting router setting, in its JSON shape, passed through as given; the named arguments above are merged on top and win. Groups: autorouter.{max_passes, max_threads, max_items, ignore_net_classes}, fanout.{enabled, max_passes, ripup_allowed, min_escape_length_mm, max_escape_length_mm, start_via_diameter_mm, end_via_diameter_mm, pin_sorting_order, fallback_to_board_vias}, optimizer.{enabled, max_passes, max_threads, improvement_threshold, enable_preflight_guards, max_consecutive_failures, max_autoroute_passes, trace_ripup_cost_factor}, scoring.{via_costs, plane_via_costs, start_ripup_costs, default_preferred_direction_trace_cost, default_undesired_direction_trace_cost, bend_penalty}, router_scoring.*, optimizer_scoring.*, and top level copper_to_edge_clearance_um, hole_clearance_um, clearance_tolerance_um, neck_width_um, automatic_neckdown, strict_drc, trace_pull_tight_accuracy, allowed_via_types, plane_nets, plane_as_obstacle, max_threads, layers. A setting Freerouting does not apply (unknown key, typo, value it replaced) is refused before routing starts, and named in the error. So is any negative number: no Freerouting setting means anything below zero. A value below the project's rule for copper_to_edge_clearance_um, hole_to_hole_um or hole_clearance_um, strict_drc: false, or autorouter.ignore_net_classes: true is refused unless allow_below_project_rules is true." },
+                    "allow_below_project_rules": { "type": "boolean", "description": "Allow router_settings to relax the project's design rules or turn off checks. The result then never reports success: true." },
+                    "optimize_seconds": { "type": "integer", "minimum": 0, "maximum": 86400, "description": "Once routing is complete and the optimizer has started (optimizer_enabled), let it run this many seconds, then keep the best board found so far and stop the job (final_state OPTIMIZATION_STOPPED). Detection reads Freerouting's log; without it the optimizer runs to its end." },
+                    "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "description": "Hard limit on the whole call, routing and optimizer together; the job is killed and nothing is kept when it is reached. Default 900, plus optimize_seconds when that is given. Set explicitly, it must exceed optimize_seconds, since the optimizer window only opens once routing is done." }
                 },
                 "required": ["dsn_path", "ses_output_path"]
             }),
@@ -270,6 +278,7 @@ mod configured_db_path_tests {
                 .env(CHILD, "1")
                 .env("APPDATA", dir.path())
                 .env("HOME", dir.path())
+                .env(copperpour_test_home::UNCHANGED, "1")
                 .output()
                 .unwrap();
             assert!(
@@ -1957,11 +1966,13 @@ fn observe_datasheet_updates(
 }
 
 fn datasheet_commit_refusal(path: &Path, error: &SexpError) -> Option<CallToolResult> {
+    let lock_message;
     let reason = match error {
         SexpError::Conflict { .. } => "the schematic changed after enrichment was planned",
         SexpError::ItemConflict { reason, .. } => reason,
         SexpError::KiCadEditorLocked { .. } => {
-            "KiCad owns the schematic; use a live editor mutation or close the document"
+            lock_message = copperpour_sexp::writer::schematic_lock_message(path);
+            lock_message.as_str()
         }
         _ => return None,
     };
@@ -3033,7 +3044,8 @@ async fn handle_check_freerouting(
                      https://github.com/freerouting/freerouting/releases), or pass jar_path."
         }))),
         FreeroutingJar::Found(jar_path) => {
-            let mut java_command = tokio::process::Command::new("java");
+            let java_path = crate::java_runtime::java_executable();
+            let mut java_command = tokio::process::Command::new(&java_path);
             java_command.arg("-version");
             let java = match run_java_command(&mut java_command).await {
                 Ok(output) => output,
@@ -3044,6 +3056,7 @@ async fn handle_check_freerouting(
                         "native_mcp_available": false,
                         "bridge_available": false,
                         "jar_path": jar_path,
+                        "java_path": java_path,
                         "java_available": false,
                         "note": error
                     })));
@@ -3056,13 +3069,39 @@ async fn handle_check_freerouting(
                     "native_mcp_available": false,
                     "bridge_available": false,
                     "jar_path": jar_path,
+                    "java_path": java_path,
                     "java_available": false,
                     "java_output": command_output(&java),
                     "note": "Freerouting was found, but Java did not start successfully"
                 })));
             }
 
-            let mut freerouting_command = tokio::process::Command::new("java");
+            // An older Java only fails once the JAR is loaded, with
+            // UnsupportedClassVersionError: say so before anything else runs.
+            let java_release = crate::java_runtime::java_release(&command_output(&java));
+            let required_release = crate::java_runtime::required_java_release(&jar_path);
+            if let (Some(found), Some(required)) = (java_release, required_release) {
+                if found < required {
+                    return Ok(CallToolResult::json(&json!({
+                        "available": false,
+                        "engine_found": true,
+                        "native_mcp_available": false,
+                        "bridge_available": false,
+                        "jar_path": jar_path,
+                        "java_path": java_path,
+                        "java_available": true,
+                        "java_release": found,
+                        "required_java_release": required,
+                        "note": format!(
+                            "This Freerouting JAR needs Java {required} or later, but {} is Java {found}. \
+                             Install a newer JDK, or point JAVA_HOME at one.",
+                            java_path.display()
+                        )
+                    })));
+                }
+            }
+
+            let mut freerouting_command = tokio::process::Command::new(&java_path);
             freerouting_command.args([
                 crate::freerouting_mcp::JAVA_HEADLESS_ARG,
                 "-jar",
@@ -3076,13 +3115,18 @@ async fn handle_check_freerouting(
             };
 
             let bridge = crate::freerouting_mcp::probe_local(&jar_path).await;
+            // Available means the JAR actually ran here, not merely that a JAR
+            // and some `java` exist.
             Ok(CallToolResult::json(&json!({
-                "available": true,
+                "available": version_checked,
                 "engine_found": true,
                 "native_mcp_available": bridge.native_mcp_available,
                 "bridge_available": bridge.bridge_available,
                 "jar_path": jar_path,
+                "java_path": java_path,
                 "java_available": true,
+                "java_release": java_release,
+                "required_java_release": required_release,
                 "java_output": command_output(&java),
                 "version_checked": version_checked,
                 "version_output": version_output,
@@ -3093,6 +3137,44 @@ async fn handle_check_freerouting(
             })))
         }
     }
+}
+
+/// The KiCad project whose design rules apply to a DSN: `project_path` when
+/// given, else the only `.kicad_pro` in the DSN's folder, else in its parent
+/// (a `route/` subfolder is common). None when there is none or several.
+fn route_project(args: &serde_json::Value, dsn: &Path) -> anyhow::Result<Option<PathBuf>> {
+    if args
+        .get("project_path")
+        .is_some_and(|value| !value.is_null())
+    {
+        let project = get_path(args, "project_path")?;
+        if !project.is_file() {
+            anyhow::bail!("project_path is not a file: {}", project.display());
+        }
+        return Ok(Some(project));
+    }
+    let folder = dsn.parent().unwrap_or_else(|| Path::new("."));
+    for dir in [Some(folder), folder.parent()].into_iter().flatten() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let projects: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "kicad_pro"))
+            .collect();
+        match projects.len() {
+            0 => continue,
+            1 => return Ok(projects.into_iter().next()),
+            // Silently routing to Freerouting's defaults would ignore the
+            // project's rules; ask which one (merge review, plan step 5).
+            _ => anyhow::bail!(
+                "several .kicad_pro files beside the DSN in {}; name the one whose design rules \
+                 apply with project_path",
+                dir.display()
+            ),
+        }
+    }
+    Ok(None)
 }
 
 async fn handle_route_specctra_dsn(
@@ -3125,19 +3207,153 @@ async fn handle_route_specctra_dsn(
         .transpose()
         .map_err(|_| anyhow::anyhow!("max_passes is too large"))?;
     let job_timeout_seconds = args["job_timeout_seconds"].as_u64();
-    let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or(900);
+    // The optimizer window opens only once routing is done: a default that
+    // ignored it killed a run 900 s in, with the optimizer still inside the
+    // optimize_seconds it had been given.
+    let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or_else(|| {
+        let optimize = args["optimize_seconds"].as_u64().unwrap_or(0);
+        900u64.saturating_add(optimize).min(86_400)
+    });
+    // With no overall_timeout_seconds given, a very large optimize_seconds
+    // leaves the capped default no time for routing. Name the argument the
+    // caller sent, not one they did not (merge review, plan step 5).
+    if args["overall_timeout_seconds"].is_null() {
+        if let Some(optimize) = args["optimize_seconds"].as_u64() {
+            if overall_timeout_seconds <= optimize {
+                return Ok(crate::tools::invalid_arg(
+                    "optimize_seconds",
+                    &format!(
+                        "{optimize} s leaves no time for routing within the 86400 s limit on one \
+                         call; lower it, or set overall_timeout_seconds above it"
+                    ),
+                ));
+            }
+        }
+    }
+    // Freerouting does not find these rules in the DSN; without them it
+    // routes to its own defaults, or with none at all through its job API.
+    let project = route_project(args, &dsn)?;
+    let project_rules = match &project {
+        Some(path) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+            let parsed: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))?;
+            crate::freerouting_mcp::project_route_rules(&parsed)
+        }
+        None => serde_json::Map::new(),
+    };
+    // The project's rules are a lower limit (merge review, plan step 5):
+    // router_settings may tighten them but not relax them, and may not turn
+    // off checks, unless the caller says so explicitly.
+    let allow_relaxed = args["allow_below_project_rules"].as_bool().unwrap_or(false);
+    if !allow_relaxed {
+        if let Some(requested) = args["router_settings"].as_object() {
+            let relaxed = crate::freerouting_mcp::relaxations(requested, &project_rules);
+            if !relaxed.is_empty() {
+                return Ok(crate::tools::invalid_arg(
+                    "router_settings",
+                    &format!(
+                        "these settings relax the project's design rules or turn off checks: {}; \
+                         pass allow_below_project_rules: true to route that way anyway",
+                        relaxed.join("; ")
+                    ),
+                ));
+            }
+        }
+    }
     let settings = crate::freerouting_mcp::RouteSettings {
         max_passes,
         optimizer_enabled: args["optimizer_enabled"].as_bool(),
         job_timeout_seconds,
+        optimize_seconds: args["optimize_seconds"].as_u64(),
+        optimizer_max_passes: args["optimizer_max_passes"]
+            .as_u64()
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("optimizer_max_passes is too large"))?,
+        optimizer_improvement_threshold: args["optimizer_improvement_threshold"].as_f64(),
+        plane_nets: args["plane_nets"].as_array().map(|nets| {
+            nets.iter()
+                .filter_map(|net| net.as_str())
+                .map(str::to_string)
+                .collect()
+        }),
+        plane_as_obstacle: args["plane_as_obstacle"].as_bool(),
+        router_settings: args["router_settings"].as_object().cloned(),
+        project_rules: project_rules.clone(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
     };
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
         .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
+    // A board with unrouted connections or clearance violations is not a
+    // routed board, even though Freerouting ends the job COMPLETED. A count
+    // that could not be read, a project rule the JAR did not apply, or
+    // settings that could not be checked are not a pass either (merge
+    // review, plan step 5). The SES is written in every case, for inspection.
+    let mut problems = Vec::new();
+    match evidence.unrouted {
+        Some(0) => {}
+        Some(unrouted) => problems.push(format!("{unrouted} connection(s) left unrouted")),
+        None => problems.push(
+            "Freerouting's log could not be read, so whether every connection was routed is not \
+             known (it is looked for where Freerouting keeps it on Linux, or at FREEROUTING_LOG)"
+                .to_string(),
+        ),
+    }
+    match evidence.violations {
+        Some(0) => {}
+        Some(violations) => problems.push(format!(
+            "{violations} clearance violation(s) in Freerouting's own check"
+        )),
+        // An unknown count is not a pass (documentation review, plan step 5).
+        None if evidence.unrouted.is_some() => problems.push(
+            "Freerouting's log gave no clearance-violation count for the end of the job"
+                .to_string(),
+        ),
+        None => {}
+    }
+    if !evidence.project_rules_not_applied.is_empty() {
+        problems.push(format!(
+            "project design rules this Freerouting did not apply: {}",
+            evidence.project_rules_not_applied.join("; ")
+        ));
+    }
+    if !evidence.settings_checked {
+        problems.push(
+            "Freerouting's effective settings could not be read back, so the settings sent were \
+             not verified"
+                .to_string(),
+        );
+    }
+    if project.is_none() {
+        problems.push(
+            "no .kicad_pro was found beside the DSN or in its parent folder, so the project's \
+             edge and hole rules were not sent; name it with project_path"
+                .to_string(),
+        );
+    }
+    if allow_relaxed {
+        problems.push("allow_below_project_rules was set".to_string());
+    }
+    let fully_routed = problems.is_empty();
+    let message = (!fully_routed).then(|| {
+        format!(
+            "The SES at {} is not a verified complete routing: {}. Check it with \
+             plan_specctra_ses_import and DRC before relying on it.",
+            ses_output.display(),
+            problems.join("; ")
+        )
+    });
     Ok(CallToolResult::json(&json!({
-        "success": true,
+        "success": fully_routed,
+        "message": message,
+        "unrouted_connections": evidence.unrouted,
+        "unrouted_connections_checked": evidence.unrouted.is_some(),
+        "clearance_violations": evidence.violations,
+        "settings_checked": evidence.settings_checked,
         "method": "local_freerouting_native_mcp",
         "engine": {
             "name": "Freerouting",
@@ -3162,7 +3378,15 @@ async fn handle_route_specctra_dsn(
         "final_state": evidence.final_state,
         "poll_count": evidence.poll_count,
         "elapsed_seconds": evidence.elapsed_seconds,
-        "ses_bytes": evidence.ses_bytes
+        "ses_bytes": evidence.ses_bytes,
+        "last_activity": evidence.last_activity,
+        "settings_not_applied": evidence.settings_not_applied,
+        "settings_warnings": evidence.settings_warnings,
+        "project_rules": {
+            "project_path": project,
+            "sent": project_rules,
+            "not_applied": evidence.project_rules_not_applied
+        }
     })))
 }
 
@@ -3368,6 +3592,7 @@ mod freerouting_tests {
                 ])
                 .env(CHILD, "1")
                 .env_remove("HOME")
+                .env(copperpour_test_home::UNCHANGED, "1")
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
