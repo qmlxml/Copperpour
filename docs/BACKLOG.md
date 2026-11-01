@@ -61,6 +61,12 @@ Each entry names where it was found, what is wrong, and the condition that close
   connection, possibly sending the user's credentials, before the include is refused. Closing
   condition: the allowed-folder check runs before any file-system access to the candidate, or the
   limitation is stated in the simulation documentation.
+- **On Windows, `..` in a model path can name a different file than KiCad's** (review 3 of the
+  Windows CI fixes). Copperpour applies `..` to the resolved project folder (`join_relative` in
+  `simulation/flatten.rs`), as Unix does; KiCad on Windows applies it to the folder as opened. For a
+  project opened through a junction or a `subst` drive, `${KIPRJMOD}/../shared/m.lib` then names
+  another file, or none. Not a safety problem: the allowed-folder check runs on the result. Closing
+  condition: `..` applied to the project folder as opened, or the difference documented for users.
 - **A project on a network share cannot simulate with relative model files** (same review; existed
   before). The snapshot writes model paths under the project folder, which for a project on a share
   or a mapped drive is `\\server\share\…`, and the include check refuses every such path.

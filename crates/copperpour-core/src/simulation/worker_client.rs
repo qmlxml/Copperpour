@@ -223,13 +223,19 @@ async fn run_probe(
         Ok::<_, std::io::Error>((status, out, err))
     })
     .await;
+    // Kill and wait before `scratch` is removed: on Windows a process still
+    // running in that folder makes the removal fail, and `TempDir` ignores the
+    // failure, leaving the folder behind. The wait has its own limit, so a
+    // worker that cannot be ended (stuck in the kernel) leaves a folder behind
+    // rather than holding the tool call without end.
     let (exit, out, err) = match finished {
-        Ok(result) => result.context("Failed to read the simulation worker's output")?,
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            let _ = tokio::time::timeout(KILL_WAIT, child.kill()).await;
+            return Err(error).context("Failed to read the simulation worker's output");
+        }
         Err(_) => {
-            // Kill and wait before `scratch` is removed: on Windows a process
-            // still running in that folder makes the removal fail, and
-            // `TempDir` ignores the failure, leaving the folder behind.
-            let _ = child.kill().await;
+            let _ = tokio::time::timeout(KILL_WAIT, child.kill()).await;
             return Ok(EngineStatus::unavailable("timed_out"));
         }
     };
@@ -240,6 +246,9 @@ async fn run_probe(
     }
     Ok(interpret_probe_output(&out))
 }
+
+/// How long a probe waits for a killed worker to end.
+const KILL_WAIT: Duration = Duration::from_secs(5);
 
 /// A command for the worker, working in `dir`. A worker must not hold the MCP
 /// stdin, and `SPICE_*` must not change results.

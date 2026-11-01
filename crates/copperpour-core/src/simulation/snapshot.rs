@@ -388,4 +388,43 @@ mod tests {
         take_snapshot(&root, out.path()).unwrap();
         assert!(out.path().join("same.kicad_sch").is_file());
     }
+
+    /// The sequence that failed on Windows: a project resolved by
+    /// `canonicalize`, its relative `Sim.Library` rewritten by the snapshot,
+    /// then read as an include by the deck check. Uses no kicad-cli, so it
+    /// runs on every platform's CI.
+    #[test]
+    fn a_rewritten_model_path_passes_the_include_check() {
+        use crate::simulation::flatten::{flatten, Compatibility, DeckInputs};
+        let project = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("models")).unwrap();
+        std::fs::write(project.path().join("models/a.lib"), ".model dmod D\n").unwrap();
+        let root = project.path().join("top.kicad_sch");
+        let source = sheet(&[]);
+        let with_library = format!(
+            "{} (property \"Sim.Library\" \"models/a.lib\" (at 0 0 0)))",
+            source.strip_suffix(')').unwrap()
+        );
+        std::fs::write(&root, with_library).unwrap();
+
+        let snapshot = take_snapshot(&root, out.path()).unwrap();
+
+        let copy = std::fs::read_to_string(&snapshot.root_sheet).unwrap();
+        let value_start = copy.find(SIM_LIBRARY_PROPERTY).unwrap() + SIM_LIBRARY_PROPERTY.len();
+        let rest = &copy[value_start..];
+        let library = unescape(&rest[..closing_quote(rest).unwrap()]);
+        assert!(Path::new(&library).is_absolute(), "{library}");
+        let project_dir = project.path().canonicalize().unwrap();
+        let deck = flatten(&DeckInputs {
+            netlist: &format!(".title t\n.include \"{library}\"\nD1 a 0 dmod\n"),
+            testbench: &[],
+            project_dir: &project_dir,
+            allowed_roots: std::slice::from_ref(&project_dir),
+            compatibility: Compatibility::DEFAULT,
+            excluded_elements: &[],
+        })
+        .unwrap();
+        assert!(deck.render().contains(".model dmod D"), "{}", deck.render());
+    }
 }

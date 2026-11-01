@@ -826,7 +826,9 @@ impl Flattener<'_> {
                 RefusalCode::UnsafeDeckContent,
                 origin,
                 number,
-                "Include paths may not name a network location.",
+                "Include paths may not start with two separators: that names a network \
+                 location or a Windows device. Only a local drive path in the form \
+                 \\\\?\\C:\\... is accepted.",
             ));
         }
         let search_path = self.search_path(whole_target, base);
@@ -1196,6 +1198,14 @@ fn names_network_location(target: &str) -> bool {
 /// and `.` and `..` are applied as Windows applies them to an ordinary path.
 /// Any other folder, and an absolute `relative`, is joined as `Path::join`
 /// does, so Unix keeps the kernel's own handling of `..` through symlinks.
+///
+/// The verbatim folder is a resolved one, so `..` here steps out of the real
+/// folder, not out of a junction or `subst` drive the user opened the project
+/// through; that is what Unix does too, and before this function such a path
+/// named no file at all on Windows. KiCad on Windows applies `..` to the path
+/// as opened, so the two can name different files (recorded in
+/// `docs/BACKLOG.md`). Only Windows parses the `\\\\?\\` prefix: on Unix a folder
+/// so named is one path component, which `..` would step out of.
 pub(crate) fn join_relative(folder: &Path, relative: &str) -> PathBuf {
     let verbatim = folder.as_os_str().to_string_lossy().starts_with(r"\\?\");
     if !verbatim || !Path::new(relative).is_relative() || relative.starts_with(['/', '\\']) {
@@ -2040,6 +2050,12 @@ mod tests {
 
     #[test]
     fn a_verbatim_drive_path_is_local() {
+        // Accepting a drive path is correct because the include is read only
+        // after its resolved path is checked against the allowed folders. It
+        // would be wrong for a mapped network drive (`\\?\Z:\`) or a link to a
+        // share: those are opened before that check refuses them, which
+        // `docs/BACKLOG.md` records ("A model include on a network location is
+        // touched before it is refused").
         for target in [r"\\?\C:\m.lib", r"\\?\z:\dir\m.lib", "/abs/m.lib", "m.lib"] {
             assert!(!names_network_location(target), "{target}");
         }
