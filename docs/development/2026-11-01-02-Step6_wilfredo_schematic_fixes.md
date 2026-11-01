@@ -84,3 +84,39 @@ tests do not set up for these cases).
 
 Gate after fix pass 1 (`logs/gate-step6-fix1.summary`): 3,703 passed (+2), 1 failed (the known
 baseline failure), 109 ignored. After the full run, `~/.copperpour/templates` does not exist.
+Committed as `dd92bdf`.
+
+## Review 2 (robustness) and fix pass 2
+
+The reviewer measured with kicad-cli 10.0.7 on copies of the `complex_hierarchy` demo. Confirmed
+correct: rounding ties away from zero as KiCad does; the pin-collision check at 1e-7 mm; a cyclic
+hierarchy and multi-instance sheets; kicad-cli on the live file without kill on timeout;
+`(power)`, `(power local)` and empty power values. Fixed:
+
+1. **A coordinate above about 1.8e302 was written as `inf`**, which KiCad cannot load (measured: exit
+   3). The sheet tools now refuse `x`, `y`, `width` or `height` beyond ±100,000 mm
+   (`coordinate_out_of_range`).
+2. **Shrinking a sheet could move a pin onto the corner where a pin of the other edge was**, joining
+   their nets. `edit_sheet` now refuses a resize that puts two pins on one point.
+3. **The hierarchy summary hid a missing child sheet** (kicad-cli exits 0 with no message; measured):
+   new warning `sheet_files_missing`, from a walk of the referenced sheet files.
+4. **A child file given to the hierarchy scope was summarised as a root** with no hint (measured): new
+   warning `not_the_project_root`. Live test
+   `hierarchy_summary_live_reports_missing_sheets_and_a_child_given_as_root` (passes; added to
+   `scripts/run_live_tests.sh`).
+5. **A wiring call that returned an error, rather than an error result, did not name the nets already
+   written**: both paths now do.
+6. **`connections_made` was built from the request**: it now lists only the pins connected, with
+   `not_connected` beside them.
+7. **A pin in two template nets shorted them** (a second label on the same stub): the pin is kept on
+   the first net and the conflict reported.
+8. **`edit_sheet_pin` could rename a pin to an existing name** (predates this work): now refused.
+10. A net is counted as written only if something was added to it.
+
+Recorded in `docs/BACKLOG.md`: the hierarchy scope runs kicad-cli on the live project (it creates a
+`.kicad_prl`); parts matched by reference alone; off-grid pin offsets kept on a move. Minor 9 (an
+unparsable batch body) is not reachable in practice, since the body is produced in-process.
+
+Gate after fix pass 2 (`logs/gate-step6-fix2.summary`): 3,703 passed, 1 failed (the known baseline
+failure), 110 ignored (+1, the live test). A first run failed clippy on the live test's
+configuration; fixed.

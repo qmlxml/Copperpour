@@ -109,6 +109,14 @@ Each entry names where it was found, what is wrong, and the condition that close
 - **`apply_template` wires pins by reference name**, so a `ref_start` that collides with an existing
   part also wires that part's pins. Closing condition: the refusal of a colliding `ref_start`, or
   wiring by the placed instances' UUIDs.
+- **`export_netlist_summary` with `schematic_scope: "hierarchy"` runs kicad-cli on the live project**,
+  which creates a `.kicad_prl` file there (measured; no lock left); the file scope is a pure read.
+  Closing condition: run on a private copy, as the simulation's export does.
+- **The hierarchy summary matches pins to parts by reference alone**, so two parts with the same
+  reference (unannotated `R?`) give the second `pin_count: 0`. Closing condition: matched by the
+  netlist's sheet path as well.
+- **Moving an off-grid sheet keeps its pins' offsets along the edge**, so those pins stay off the
+  grid. Closing condition: pins snapped with the sheet.
 - **`f517fd8` and `d2961f4` from wilfredo-a14/agent-hub were not merged** (activity reporting to,
   and editor control of, a modified KiCad build). Closing condition: an owner decision.
 

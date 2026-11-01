@@ -45,7 +45,7 @@ if [ "$what" = simulation ] || [ "$what" = all ]; then
     grep -E '^test result' logs/live-simulation.log
 fi
 if [ "$what" = drc ] || [ "$what" = all ]; then
-    cargo test -p copperpour-core --locked --lib -- --ignored drc_parse_tests::live candidate_drc_live \
+    cargo test -p copperpour-core --locked --lib -- --ignored drc_parse_tests::live candidate_drc_live hierarchy_summary_live \
         > logs/live-drc.log 2>&1 || status=1
     grep -E '^test result' logs/live-drc.log
 fi

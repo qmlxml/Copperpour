@@ -2026,10 +2026,32 @@ fn natural_compare(a: &str, b: &str) -> std::cmp::Ordering {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
+/// The largest coordinate or size accepted, in mm. KiCad keeps schematic
+/// coordinates as integers; far beyond this, rounding to six decimals
+/// overflows to infinity and the file gets `inf`, which KiCad cannot load
+/// (measured in the merge review, plan step 6).
+const MAX_COORDINATE_MM: f64 = 100_000.0;
+
+/// Refuse an `x`, `y`, `width` or `height` larger than [`MAX_COORDINATE_MM`].
+fn coordinate_out_of_range(args: &Value) -> Option<CallToolResult> {
+    ["x", "y", "width", "height"].into_iter().find_map(|field| {
+        let value = args.get(field)?.as_f64()?;
+        (value.abs() > MAX_COORDINATE_MM).then(|| {
+            invalid_arg(
+                field,
+                &format!("{value} mm is outside the ±{MAX_COORDINATE_MM} mm KiCad can hold"),
+            )
+        })
+    })
+}
+
 async fn handle_add_hierarchical_sheet(
     args: &Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    if let Some(refused) = coordinate_out_of_range(args) {
+        return Ok(refused);
+    }
     let parent_path = get_path(args, "schematic")?;
     let sheet_file = match require_str(args, "sheet_file") {
         Ok(v) => v.to_string(),
@@ -2201,6 +2223,9 @@ async fn handle_add_hierarchical_sheet(
 }
 
 async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    if let Some(refused) = coordinate_out_of_range(args) {
+        return Ok(refused);
+    }
     let sch_path = get_path(args, "schematic")?;
     let sheet_name = match require_str(args, "sheet_name") {
         Ok(v) => v.to_string(),
@@ -2302,6 +2327,26 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         }
         if sheet.width != w || sheet.height != h {
             sheet.set_size(w, h);
+            // Shrinking can move a pin on one edge onto the corner where a pin
+            // of the other edge already is, joining their nets on the parent
+            // sheet (merge review, plan step 6).
+            let round6 = copperpour_sexp::geometry::round6;
+            let mut seen: std::collections::HashMap<(String, String), &str> =
+                std::collections::HashMap::new();
+            for pin in &sheet.pins {
+                let point = (round6(pin.at.x).to_string(), round6(pin.at.y).to_string());
+                if let Some(other) = seen.insert(point.clone(), pin.name.as_str()) {
+                    return Ok(invalid_arg(
+                        if too_short { "height" } else { "width" },
+                        &format!(
+                            "a {w} x {h} box would put pins '{other}' and '{}' on one point \
+                             ({}, {}), joining their nets on the parent sheet. Move one of them \
+                             first.",
+                            pin.name, point.0, point.1
+                        ),
+                    ));
+                }
+            }
             changed.push("size");
         }
     }
@@ -2333,6 +2378,9 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
 }
 
 async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    if let Some(refused) = coordinate_out_of_range(args) {
+        return Ok(refused);
+    }
     let sch_path = get_path(args, "schematic")?;
     let sheet_name = match require_str(args, "sheet_name") {
         Ok(v) => v.to_string(),
@@ -3056,6 +3104,9 @@ async fn handle_import_sheet_pins(
 }
 
 async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    if let Some(refused) = coordinate_out_of_range(args) {
+        return Ok(refused);
+    }
     let sch_path = get_path(args, "schematic")?;
     let sheet_name = match require_str(args, "sheet_name") {
         Ok(v) => v.to_string(),
@@ -3139,6 +3190,9 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
 }
 
 async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    if let Some(refused) = coordinate_out_of_range(args) {
+        return Ok(refused);
+    }
     let sch_path = get_path(args, "schematic")?;
     let sheet_name = match require_str(args, "sheet_name") {
         Ok(v) => v.to_string(),
@@ -3201,6 +3255,14 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     let mut changed = Vec::new();
     if let Some(new_name) = opt_str(args, "new_name") {
         requested.push("name");
+        // A second pin of that name makes the read-back by name ambiguous, as
+        // add_sheet_pin already refuses (merge review, plan step 6).
+        if other_pins.iter().any(|(other, _, _)| other == new_name) {
+            return Ok(invalid_arg(
+                "new_name",
+                &format!("sheet '{sheet_name}' already has a pin named '{new_name}'"),
+            ));
+        }
         pin.name = new_name.to_string();
         changed.push("name");
     }

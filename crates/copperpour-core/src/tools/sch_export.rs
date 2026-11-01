@@ -675,7 +675,82 @@ async fn hierarchy_netlist_summary(
         )));
     }
     let source = std::fs::read_to_string(temp.path())?;
-    Ok(CallToolResult::json(&summarize_exported_netlist(&source)?))
+    let mut summary = summarize_exported_netlist(&source)?;
+    // kicad-cli exports a hierarchy with a missing child sheet with exit 0
+    // and no message, and treats a child file it is given as a root (both
+    // measured on kicad-cli 10.0.7 in the merge review, plan step 6), so the
+    // summary says when either applies.
+    let missing = missing_sheet_files(sch_path);
+    let mut warnings = Vec::new();
+    if !missing.is_empty() {
+        warnings.push(json!({
+            "code": "sheet_files_missing",
+            "detail": "These sheet files are referenced but do not exist, so their parts and \
+                       nets are not in this summary.",
+            "items": missing,
+        }));
+    }
+    if let Some(root) = project_root_schematic(sch_path) {
+        warnings.push(json!({
+            "code": "not_the_project_root",
+            "detail": format!(
+                "This file is not the project's root schematic ({}); it was summarised as if it \
+                 were one, with its own references and no parent connections.",
+                root.display()
+            ),
+        }));
+    }
+    summary["warnings"] = json!(warnings);
+    Ok(CallToolResult::json(&summary))
+}
+
+/// Sheet files referenced from `root` (recursively) that do not exist. Each
+/// file is visited once, so a cycle ends.
+fn missing_sheet_files(root: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(file) = queue.pop() {
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        let Ok((_, tree)) = read_schematic(&file) else {
+            continue;
+        };
+        let dir = file.parent().unwrap_or_else(|| Path::new("."));
+        for child in copperpour_sexp::schematic::sheet_files(&tree) {
+            let path = dir.join(child);
+            if path.is_file() {
+                queue.push(path);
+            } else {
+                missing.push(path.display().to_string());
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// The project's root schematic, when it exists beside `file` and is a
+/// different file: `<project stem>.kicad_sch` for the one `.kicad_pro` in
+/// `file`'s folder.
+fn project_root_schematic(file: &Path) -> Option<std::path::PathBuf> {
+    let dir = file.parent()?;
+    let mut projects = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "kicad_pro"));
+    let project = projects.next()?;
+    if projects.next().is_some() {
+        return None;
+    }
+    let root = project.with_extension("kicad_sch");
+    let same = match (root.canonicalize(), file.canonicalize()) {
+        (Ok(root), Ok(file)) => root == file,
+        _ => true,
+    };
+    (!same && root.is_file()).then_some(root)
 }
 
 /// Shape a `kicadsexpr` netlist like the file-scope summary, adding each
@@ -1362,6 +1437,65 @@ mod netlist_summary_tests {
     /// The rail is the case that used to disappear.
     const SCH: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
     const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+
+    /// kicad-cli exports a hierarchy with a missing child sheet with exit 0
+    /// and no message, and treats a child file as a root; the summary must
+    /// say so (measured on kicad-cli 10.0.7, merge review of plan step 6).
+    ///
+    ///     KICAD_DEMOS=... cargo test -p copperpour-core --lib hierarchy_summary_live -- --ignored
+    #[tokio::test]
+    #[ignore = "needs kicad-cli and KICAD_DEMOS"]
+    async fn hierarchy_summary_live_reports_missing_sheets_and_a_child_given_as_root() {
+        let demos = std::path::PathBuf::from(std::env::var_os("KICAD_DEMOS").unwrap());
+        let source = demos.join("complex_hierarchy");
+        let tmp = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(&source).unwrap().flatten() {
+            if entry.path().is_file() {
+                std::fs::copy(entry.path(), tmp.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let config = ServerConfig {
+            kicad_cli: std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".into()),
+            ..Default::default()
+        };
+        let ctx = ToolContext::new(config, Arc::new(crate::router::ToolRouter::new()));
+        let call = |schematic: std::path::PathBuf| {
+            let ctx = &ctx;
+            async move {
+                let result = handle_export_netlist_summary(
+                    &json!({ "schematic": schematic, "schematic_scope": "hierarchy" }),
+                    ctx,
+                )
+                .await
+                .unwrap();
+                let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                    panic!("expected text content");
+                };
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            }
+        };
+        let codes = |body: &serde_json::Value| -> Vec<String> {
+            body["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|w| w["code"].as_str().map(str::to_string))
+                .collect()
+        };
+        let whole = call(tmp.path().join("complex_hierarchy.kicad_sch")).await;
+        assert!(codes(&whole).is_empty(), "{whole}");
+        let child = call(tmp.path().join("ampli_ht.kicad_sch")).await;
+        assert!(
+            codes(&child).contains(&"not_the_project_root".to_string()),
+            "{child}"
+        );
+        std::fs::remove_file(tmp.path().join("ampli_ht.kicad_sch")).unwrap();
+        let missing = call(tmp.path().join("complex_hierarchy.kicad_sch")).await;
+        assert!(
+            codes(&missing).contains(&"sheet_files_missing".to_string()),
+            "{missing}"
+        );
+    }
 
     #[tokio::test]
     async fn a_schematic_scope_that_is_not_a_string_is_refused() {

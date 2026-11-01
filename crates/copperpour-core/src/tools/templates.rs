@@ -789,6 +789,28 @@ async fn wire_template_connections(
     // a pin the batch could not resolve is in its `errors`, not in `added`
     // (merge review, plan step 6). The nets already written when one fails
     // are named in the error.
+    // A pin claimed by two nets would get a second label on the same stub,
+    // and KiCad would join the two nets: keep it on the first and report the
+    // rest (merge review, plan step 6).
+    let mut owner: HashMap<TemplatePin, String> = HashMap::new();
+    for (net, net_pins) in &mut nets {
+        net_pins.retain(|pin| match owner.get(pin) {
+            Some(first) if first != net => {
+                unresolved.push(json!({
+                    "reason": format!(
+                        "pin {}.{} is in both net '{first}' and net '{net}'; it was connected to \
+                         '{first}' only, because one pin cannot carry two nets",
+                        pin.0, pin.1
+                    )
+                }));
+                false
+            }
+            _ => {
+                owner.insert(pin.clone(), net.clone());
+                true
+            }
+        });
+    }
     let mut wired: HashSet<TemplatePin> = HashSet::new();
     let mut wiring_errors: Vec<String> = Vec::new();
     let mut written_nets: Vec<String> = Vec::new();
@@ -806,21 +828,40 @@ async fn wire_template_connections(
             "direction": "auto",
             "label_type": "net_label",
         });
-        let result = crate::tools::sch_batch::handle_batch_connect_to_net(&args, ctx).await?;
+        let done = |written: &[String]| {
+            if written.is_empty() {
+                "no net was written".to_string()
+            } else {
+                format!("nets already written: {}", written.join(", "))
+            }
+        };
+        let result = match crate::tools::sch_batch::handle_batch_connect_to_net(&args, ctx).await {
+            Ok(result) => result,
+            Err(error) => {
+                anyhow::bail!(
+                    "connecting net '{net}' failed ({}): {error:#}",
+                    done(&written_nets)
+                )
+            }
+        };
         let text = match result.content.first() {
             Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
             _ => String::new(),
         };
         if result.is_error {
-            let done = if written_nets.is_empty() {
-                "no net was written".to_string()
-            } else {
-                format!("nets already written: {}", written_nets.join(", "))
-            };
-            anyhow::bail!("connecting net '{net}' failed ({done}): {text}");
+            anyhow::bail!(
+                "connecting net '{net}' failed ({}): {text}",
+                done(&written_nets)
+            );
         }
-        written_nets.push(net.clone());
         let body: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        // Written only if something was added to it (merge review, plan step 6).
+        if body["added"]
+            .as_array()
+            .is_some_and(|added| !added.is_empty())
+        {
+            written_nets.push(net.clone());
+        }
         for added in body["added"].as_array().into_iter().flatten() {
             if let (Some(reference), Some(pin)) =
                 (added["reference"].as_str(), added["pin"].as_str())
@@ -847,6 +888,24 @@ async fn wire_template_connections(
     unconnected.dedup();
     for error in wiring_errors {
         unresolved.push(json!({ "reason": error }));
+    }
+    // `connections_made` lists only the pins the wiring connected; the pins of
+    // an entry that were not connected are named beside them.
+    for entry in &mut made {
+        let pins: Vec<String> = entry["pins"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pin| pin.as_str().map(str::to_string))
+            .collect();
+        let (connected, missing): (Vec<String>, Vec<String>) = pins.into_iter().partition(|pin| {
+            pin.split_once('.')
+                .is_some_and(|(r, n)| wired.contains(&(r.to_string(), n.to_string())))
+        });
+        entry["pins"] = json!(connected);
+        if !missing.is_empty() {
+            entry["not_connected"] = json!(missing);
+        }
     }
     Ok(TemplateWiring {
         made,
