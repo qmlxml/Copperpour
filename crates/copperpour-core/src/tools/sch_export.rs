@@ -210,7 +210,11 @@ pub fn tools() -> Vec<ToolDef> {
              KiCad's API would drop. \
              Added footprints are staged beside the board as KiCad measured it; `staging` \
              names the item classes KiCad would not list, so a partial or unmeasured board \
-             is never reported as complete or empty. `changes` lists the first `limit` \
+             is never reported as complete or empty. A pad may change net unless a track, \
+             arc or via of its old net reaches it, or a zone's net cannot be read; a copper \
+             pour on either net does not block, and `zones_to_refill` (with a \
+             `zones_need_refill` warning) names the pour nets to refill with refill_zones \
+             after the apply. `changes` lists the first `limit` \
              planned changes, `changes_count` all of them; `output` writes the whole \
              response to a file.",
             json!({

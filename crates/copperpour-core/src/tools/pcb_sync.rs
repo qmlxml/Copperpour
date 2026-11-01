@@ -383,6 +383,12 @@ struct SyncPlan {
     /// Survives a conflict: it is a report about the schematic, not a change
     /// the plan would make.
     unassigned: Vec<UnassignedFootprint>,
+    /// Nets of copper zones a planned pad reassignment involves (old or new
+    /// net). A pour is recomputed from the pads by `refill_zones`, so it does
+    /// not block the change the way a track does; its fill is stale after the
+    /// apply until refilled (owner ruling 2026-11-01, plan step 7b, after the
+    /// `marju212` fork's `6dad58a`). Empty for a conflicted plan.
+    zones_to_refill: BTreeSet<String>,
     /// What the live board's measured extent was, set from the snapshot the
     /// plan was made against, so the dry run and the apply report the same.
     /// Not part of the plan's identity: `sync_response` reports it.
@@ -752,6 +758,11 @@ struct SyncResponse<'a> {
     /// collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
     /// `coverage` entry beside it is a count category and stays singular.
     unassigned_footprints: &'a [UnassignedFootprint],
+    /// Zone nets whose fills are stale after the apply (see
+    /// `SyncPlan::zones_to_refill`), with a `zones_need_refill` warning naming
+    /// `refill_zones`, in the dry run as well as after the apply.
+    zones_to_refill: &'a BTreeSet<String>,
+    warnings: Vec<serde_json::Value>,
     /// Bounded as rendered only: `plan.changes` stays whole, since the plan
     /// revision hashes it and the apply sends it.
     changes: &'a [PlannedChange],
@@ -790,8 +801,37 @@ impl<'a> SyncResponse<'a> {
             undo: applied.then_some("Ctrl-Z reverses the whole schematic-to-PCB update."),
             diagnostics: Cow::Borrowed(&plan.diagnostics),
             unassigned_footprints: &plan.unassigned,
+            zones_to_refill: &plan.zones_to_refill,
+            warnings: refill_warning(&plan.zones_to_refill, applied)
+                .into_iter()
+                .collect(),
         }
     }
+}
+
+/// The warning for stale zone fills: before the apply it says what the apply
+/// will leave, after it what to do now.
+fn refill_warning(zones: &BTreeSet<String>, applied: bool) -> Option<serde_json::Value> {
+    if zones.is_empty() {
+        return None;
+    }
+    let nets = zones
+        .iter()
+        .map(|net| format!("'{net}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = if applied {
+        format!(
+            "Pads changed net under zones on {nets}; their fills are stale. Run refill_zones, \
+             then save_project. Until then DRC can report shorts or unconnected items there."
+        )
+    } else {
+        format!(
+            "Applying this plan changes pads' nets under zones on {nets}; their fills will be \
+             stale until refill_zones runs after the apply."
+        )
+    };
+    Some(serde_json::json!({ "code": "zones_need_refill", "message": message }))
 }
 
 fn sync_response(
@@ -866,6 +906,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
     let mut diagnostics = Vec::new();
     let mut counts = SyncCounts::default();
     let mut changes = Vec::new();
+    let mut zones_to_refill = BTreeSet::new();
     let mut board_by_path = HashMap::new();
     let mut board_by_reference = HashMap::new();
 
@@ -1162,24 +1203,30 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             // (#862). Without the copper, any routed net blocks.
             // Each refusal names its cause, so the caller removes what
             // blocks rather than tracks that do not (review 3 of plan step 7).
+            // A pour on either net does not block (owner ruling 2026-11-01,
+            // plan step 7b): it is recorded in `zones_to_refill`, since a
+            // refill recomputes it from the pads. An unreadable zone still
+            // refuses, as its net is unknown.
             let blocked: Option<String> = match &board.copper {
                 Some(copper) if copper.unreadable_zone => Some(
                     "a zone's net could not be read, so it may pour either net; check the zones \
                      with list_zones or in KiCad"
                         .to_string(),
                 ),
-                Some(copper) if copper.zone_nets.contains(old_net) => Some(format!(
-                    "a zone pours '{old_net}'; its fill would still reach the pad (list_zones, \
-                     delete_zone)"
-                )),
-                Some(copper) if copper.zone_nets.contains(new_net) => Some(format!(
-                    "a zone pours '{new_net}'; its fill does not reach the pad until refilled \
-                     (list_zones, delete_zone)"
-                )),
-                Some(copper) if !old_net.is_empty() => copper
-                    .reach(footprint, number, old_net)
-                    .map(|why| format!("{why} (query_traces, delete_trace, delete_via)")),
-                Some(_) => None,
+                Some(copper) => {
+                    let reached = (!old_net.is_empty())
+                        .then(|| copper.reach(footprint, number, old_net))
+                        .flatten()
+                        .map(|why| format!("{why} (query_traces, delete_trace, delete_via)"));
+                    if reached.is_none() {
+                        for net in [old_net, new_net] {
+                            if copper.zone_nets.contains(net) {
+                                zones_to_refill.insert(net.to_string());
+                            }
+                        }
+                    }
+                    reached
+                }
                 None => (board.routed_nets.contains_key(old_net)
                     || board.routed_nets.contains_key(new_net))
                 .then(|| "routed copper uses that net".to_string()),
@@ -1251,6 +1298,10 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         PlanStatus::Ready
     };
     let plan_revision = plan_revision(netlist_source, board);
+    // A conflicted plan reassigns nothing, so it leaves no fill stale.
+    if !diagnostics.is_empty() {
+        zones_to_refill.clear();
+    }
     SyncPlan {
         status,
         plan_revision,
@@ -1258,6 +1309,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         changes,
         diagnostics,
         unassigned,
+        zones_to_refill,
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
     }
@@ -5095,21 +5147,35 @@ mod tests {
         );
     }
 
-    /// Copperpour's rule (#862) stays with the copper read: a pour on the old
-    /// or new net refuses, as does a zone whose net cannot be read.
+    /// With the copper read, a pour on the old or new net is planned and named
+    /// for a refill (owner ruling 2026-11-01, plan step 7b). (a) Not refusing
+    /// is right: a refill recomputes the fill from the pads. (b) Refusing is
+    /// right when a zone's net cannot be read, asserted here, and when copper
+    /// of the old net reaches the pad (`a_poured_net_with_copper_on_the_pad_still_blocks`).
     #[test]
-    fn with_copper_read_a_pour_or_unreadable_zone_still_blocks() {
-        for zones in [&["VCC"][..], &["BUS"][..]] {
-            assert_eq!(
-                pad_move_plan(far_vcc_track(), zones, Some(0.6), false).status,
-                PlanStatus::Conflict,
-                "{zones:?}"
-            );
+    fn with_copper_read_a_pour_asks_for_a_refill_and_an_unreadable_zone_blocks() {
+        for poured in ["VCC", "BUS"] {
+            let plan = pad_move_plan(far_vcc_track(), &[poured], Some(0.6), false);
+            assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+            assert_eq!(plan.zones_to_refill, BTreeSet::from([poured.to_string()]));
         }
-        assert_eq!(
-            pad_move_plan(far_vcc_track(), &[], Some(0.6), true).status,
-            PlanStatus::Conflict
-        );
+        let unreadable = pad_move_plan(far_vcc_track(), &["VCC"], Some(0.6), true);
+        assert_eq!(unreadable.status, PlanStatus::Conflict);
+        assert!(unreadable.zones_to_refill.is_empty());
+    }
+
+    /// Copper of the old net on the pad still refuses, pour or not, and a
+    /// conflicted plan names no zone to refill, since it changes nothing.
+    #[test]
+    fn a_poured_net_with_copper_on_the_pad_still_blocks() {
+        let track = vec![CopperPiece::Segment {
+            a: Point { x: -3.0, y: 2.0 },
+            b: Point { x: 0.2, y: 2.0 },
+            half_width: 0.2,
+        }];
+        let plan = pad_move_plan(track, &["VCC"], Some(0.6), false);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.zones_to_refill.is_empty());
     }
 
     /// A pad whose reach cannot be bounded (custom shape) counts as touched.
@@ -6310,6 +6376,7 @@ mod tests {
             changes,
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
+            zones_to_refill: BTreeSet::new(),
             staging: None,
         }
     }
@@ -7336,23 +7403,48 @@ mod tests {
         assert_eq!(update["reference"], "R1", "{plan:#}");
     }
 
-    /// The pour's own net still conflicts: moving `R1`'s `GND` pad would
-    /// leave it under copper KiCad pours as `GND`.
+    /// The refill warning of a served response, if any.
+    fn refill_warnings(plan: &serde_json::Value) -> Vec<String> {
+        plan["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|warning| warning["code"] == "zones_need_refill")
+            .map(|warning| warning["message"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Owner ruling 2026-11-01 (plan step 7b, after the `marju212` fork's
+    /// `6dad58a`): moving `R1`'s `GND` pad off the `GND` pour is planned, and
+    /// the pour is named for a refill. (a) Not refusing is right: a pour's
+    /// fill is recomputed from the pads by `refill_zones`, as KiCad's own
+    /// Update PCB leaves it to a refill. (b) Refusing is right when a track,
+    /// arc or via of `GND` reaches the pad, or a zone's net cannot be read
+    /// (`a_poured_net_with_copper_on_the_pad_still_blocks`,
+    /// `a_pour_without_a_net_blocks_every_net`).
     #[tokio::test]
-    async fn a_pour_still_blocks_its_own_net() {
+    async fn a_pad_leaving_a_poured_net_asks_for_a_refill() {
         let plan = plan_moving_off("GND", vec![zone_item(GND_POUR)]).await;
 
-        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(routed_pad_conflicts(&plan), Vec::<String>::new());
         assert_eq!(
-            routed_pad_conflicts(&plan),
-            vec!["R1 pad 2 would change from 'GND' to 'NEW_NET': a zone pours 'GND'; its fill would still reach the pad (list_zones, delete_zone)"],
+            plan["zones_to_refill"],
+            serde_json::json!(["GND"]),
+            "{plan:#}"
+        );
+        let warnings = refill_warnings(&plan);
+        assert_eq!(warnings.len(), 1, "{plan:#}");
+        assert!(
+            warnings[0].contains("'GND'") && warnings[0].contains("refill_zones"),
+            "{warnings:?}"
         );
     }
 
-    /// Moving a pad onto the pour's net conflicts too: the check covers the
-    /// new net as well as the old one.
+    /// Moving a pad onto the pour's net is planned the same way: its new net's
+    /// pour does not reach it until refilled. (a)/(b) as above.
     #[tokio::test]
-    async fn a_pour_blocks_a_pad_moving_onto_its_net() {
+    async fn a_pad_moving_onto_a_poured_net_asks_for_a_refill() {
         let served = ServedSync::holding(HeldBoard {
             footprints: vec![schematic_backed_resistor()],
             zones: vec![zone_item(GND_POUR)],
@@ -7365,11 +7457,25 @@ mod tests {
             .replace("(name \"/Power/VCC\")", "(name \"GND\")");
 
         let plan = served.dry_run(&netlist).await;
-
-        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(plan["status"], "ready", "{plan:#}");
         assert_eq!(
-            routed_pad_conflicts(&plan),
-            vec!["R1 pad 1 would change from 'VCC' to 'GND': a zone pours 'GND'; its fill does not reach the pad until refilled (list_zones, delete_zone)"],
+            plan["zones_to_refill"],
+            serde_json::json!(["GND"]),
+            "{plan:#}"
+        );
+
+        // After the apply the warning says what to do now.
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(
+            applied["zones_to_refill"],
+            serde_json::json!(["GND"]),
+            "{applied:#}"
+        );
+        let warnings = refill_warnings(&applied);
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("Run refill_zones, then save_project"),
+            "{warnings:?}"
         );
     }
 
