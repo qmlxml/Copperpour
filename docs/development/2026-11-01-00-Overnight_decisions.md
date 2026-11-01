@@ -134,3 +134,7 @@ apply that choice without asking. All remaining items matched:
   first seen after the labels are written.
 - **17: KEEP**; an opt-in argument taking the whole design-rule override group from the library is
   recorded as the future compatibility option.
+
+Owner instruction, 2026-11-01: owner-level decisions are settled between the two reviewers — applied
+directly when the two independent opinions match, and after a discussion to agreement when they do
+not; the owner is asked only for actions needing their hands or credentials.
