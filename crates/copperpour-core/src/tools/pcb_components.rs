@@ -2032,8 +2032,8 @@ fn indent_block(block: &str, indent: &str, eol: &str) -> String {
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 /// The footprint-text tools, listed as their own toolset, `pcb_footprint_text`.
-/// They live in this file next to the other placed-footprint edits, but
-/// `pcb_components` and `pcb_board` are both at the per-toolset limit of 20.
+/// They live in this file next to the other placed-footprint edits, but the
+/// per-toolset limit is 20, and `pcb_components` has 20 and `pcb_board` 19.
 pub fn footprint_text_tools() -> Vec<ToolDef> {
     vec![
         tool!(
