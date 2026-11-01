@@ -225,7 +225,10 @@ Each entry names where it was found, what is wrong, and the condition that close
 
 ## Before the first push (owner ruling 2026-11-01)
 
-- **Rewrite the commit identity and messages before `integration` is pushed anywhere.** Owner
+- **~~Rewrite the commit identity and messages before `integration` is pushed anywhere.~~ Done
+  2026-11-01**: rewritten on a copy, checked, and pushed to `qmlxml/Copperpour` (`integration` at
+  `b1ac895`, pull request #1 into the fork's `main` for CI); the local branch now matches it, and the
+  old history is kept as the local branch `integration-before-rewrite`. Owner
   rulings 2026-11-01: the e-mail `qmlxml@gmail.com` appears only with the name "Vasyl Melnichuk";
   the owner's commits never name AI tools, in messages or in the development documents (product code
   that names a supported MCP client stays); Copperpour's own published commits on `main` are not
@@ -236,7 +239,8 @@ Each entry names where it was found, what is wrong, and the condition that close
   <work-dir>`. It works on a copy, rewrites author and committer, removes the tool trailers from
   messages, rewords the development documents in every version, adds a commit updating the 82 quoted
   commit IDs, and prints its checks. Since 2026-11-01 this repository's own identity is
-  Vasyl Melnichuk. Closing condition: run, checked by the owner, before the first push.
+  Vasyl Melnichuk. Before each later push: check that the new commits carry that identity and name no
+  AI tools.
 
 ## Test isolation and state files (found 2026-11-01)
 
