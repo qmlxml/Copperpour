@@ -1,6 +1,7 @@
 ### `list_board_footprint_texts` and `move_footprint_texts` (minor release)
 
-- New tools in the `pcb_board` toolset, from the `marju212/Konnect` fork (commit `a8af6d2`).
+- New tools in a new toolset, `pcb_footprint_text` (`pcb_board` and `pcb_components` are at the
+  limit of 20 tools per toolset), from the `marju212/Konnect` fork (commit `a8af6d2`).
 - `list_board_footprint_texts` lists the texts of placed footprints (reference, value, custom fields,
   plain texts) with layer, absolute and footprint-local position, angle, size and visibility.
 - `move_footprint_texts` moves, rotates, re-layers or hides them without moving the footprints. Each

@@ -1433,9 +1433,9 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         super::board_stackup::tool(),
+        super::board_stackup_set::tool(),
         super::footprint_fields::tool(),
     ];
-    tools.extend(super::pcb_components::footprint_text_tools());
     tools.extend(super::pcb_board_zones::tools());
     tools
 }

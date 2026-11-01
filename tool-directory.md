@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **22 toolsets** organized into 11 categories
+- **23 toolsets** organized into 11 categories
 - **245 registered tools** + **7 always-visible meta-tools** = **252 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<copperpour dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
@@ -29,7 +29,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 22 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 23 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -171,7 +171,7 @@ and Windows servers do not.
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
-| `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
+| `check_schematic_overlaps` | Find collisions using transformed symbol drawings, pins, and label and field text (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
 ### `sch_batch` · 13 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
@@ -194,7 +194,7 @@ and Windows servers do not.
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. A pair whose route would join another net is skipped and listed in `errors`. |
 
 ### `sch_export` · 10 tools
-**Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
+**Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC and set its checks' severities, and synchronize a live PCB.
 **Source:** [`crates/copperpour-core/src/tools/sch_export.rs`](crates/copperpour-core/src/tools/sch_export.rs)
 
 | Tool | Description |
@@ -207,6 +207,7 @@ and Windows servers do not.
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. The file scope does not require kicad-cli. `schematic_scope: "hierarchy"` summarises the whole design from the root sheet; the default (`"file"`) covers the one file and says how many child sheets it left out. The hierarchy scope runs kicad-cli and warns (`sheet_files_missing`, `not_the_project_root`) when referenced sheet files are absent or the file given is not the project's root. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. |
+| `set_erc_severity` | Set ERC checks' severities (`error`, `warning`, `ignore`) under `erc.rule_severities` in the `.kicad_pro`, by the check keys KiCad 10.0.6 has or the file already names; only the named keys change, and the reply gives each one's previous and current severity. Refused while KiCad holds the project. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. A pad may change net unless copper of its old net reaches it or a zone's net cannot be read (the conflict names the cause); a pour on either net does not block, and `zones_to_refill` with a `zones_need_refill` warning names the pours to refill after the apply. |
 
@@ -238,7 +239,7 @@ and Windows servers do not.
 ## PCB
 
 ### `pcb_board` · 18 tools
-**Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import, custom fields on placed footprints, footprint texts.
+**Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import, custom fields on placed footprints.
 **Source:** [`crates/copperpour-core/src/tools/pcb_board.rs`](crates/copperpour-core/src/tools/pcb_board.rs)
 
 | Tool | Description |
@@ -248,7 +249,8 @@ and Windows servers do not.
 | `set_board_title_block` | Set any of the board's title-block fields — `title`, `date`, `revision`, `company`, `comment_1`..`comment_9`, which `${TITLE}`, `${REVISION}`, `${COMMENT1}` and the like resolve from. An omitted field is kept and an empty string clears it. Writes the open board over IPC (KiCad 10.0.1+, else `unsupported_capability`, never a file fallback), unsaved and without an undo step, or the saved file when KiCad does not hold it. Returns the block read back, `changed` and `source`. |
 | `get_board_extents` | Return the box enclosing the board's items, footprint text excluded. Reads the live board where it can (`board_source`); a saved-file answer names what it could not measure, and a live answer names each item class KiCad would not list (tables and generators on KiCad 10). |
 | `get_layer_list` | Return the board's enabled layers: `name`, `display_name` and a `copper` flag, plus the file-backed `id`, `type` and optional `user_name`. IPC-first, so an unsaved stackup change in a live KiCad is visible; `board_source` (`auto`/`live`/`saved`) selects the board state and `sources` names where each part of the answer came from. |
-| `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup. |
+| `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup, or by `set_board_stackup` on a closed board. |
+| `set_board_stackup` | Replace the physical stackup of a board KiCad does not hold open: copper thicknesses (or ounces, read as KiCad reads `oz`), each dielectric's type, thickness, material, εr and loss tangent, solder mask color and thickness, silkscreen color, finish and impedance control; a value left out is the board's, else KiCad's default. The board thickness written is the stack's sum. kicad-cli loads and saves a copy first, and the write is refused unless KiCad reads back every value, or with no kicad-cli. Does not change the copper-layer count. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
 | `set_active_layer` | Make a layer the PCB editor's active layer on a board open in KiCad, read it back, and report it with the previous one. Editor state only: never writes the board file. `editor_unavailable` when the board is not open in KiCad, `unsupported_capability` when KiCad does not handle the command. No Copperpour tool uses the active layer; it changes only where the person's next hand-drawn item goes. |
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. Appends — clear the old edges with `delete_graphics` first. |
@@ -261,6 +263,13 @@ and Windows servers do not.
 | `delete_zone` | Delete exactly one zone UUID returned by `list_zones` using its matching source and revision. Live deletion uses one KiCad commit; it then requests refill, waits for readiness and verifies full readback. Saved-file deletion checks the same revision under the atomic document lock and verifies absence and preserved zone metadata. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 | `set_footprint_field` | Add or update a custom field (LCSC, MPN, …) on a placed footprint via KiCAD IPC. Refuses the mandatory fields; a new field is hidden by default and sits on the footprint's Fab layer. One undo step; the response is a fresh read-back. |
+
+### `pcb_footprint_text` · 2 tools
+**Purpose:** List, move, rotate, re-layer and hide the texts of placed footprints: reference designators, values, custom fields, plain texts.
+**Source:** [`crates/copperpour-core/src/tools/pcb_components.rs`](crates/copperpour-core/src/tools/pcb_components.rs)
+
+| Tool | Description |
+|------|-------------|
 | `list_board_footprint_texts` | List the texts of placed footprints — reference, value, custom fields and plain texts — with layer, absolute board and footprint-local position (`local` is null on a back-side footprint), angle, size and visibility. Requires KiCAD running with the board open. |
 | `move_footprint_texts` | Move, rotate, re-layer or hide footprint texts (reference designators, values, custom fields, plain texts) without moving the footprints: absolute, relative or footprint-local positions (not on a back-side footprint), checked first and sent in one commit (one undo step); the response is the texts read back from the board. Unknown keys, an entry that changes nothing, and a layer on the other board side are refused. Requires KiCAD running with the board open. |
 

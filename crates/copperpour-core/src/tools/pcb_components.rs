@@ -2031,9 +2031,9 @@ fn indent_block(block: &str, indent: &str, eol: &str) -> String {
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
-/// The footprint-text tools. They live in this file next to the other
-/// placed-footprint edits but are listed in `pcb_board`, beside board text,
-/// because `pcb_components` is at the per-toolset cap.
+/// The footprint-text tools, listed as their own toolset, `pcb_footprint_text`.
+/// They live in this file next to the other placed-footprint edits, but
+/// `pcb_components` and `pcb_board` are both at the per-toolset limit of 20.
 pub fn footprint_text_tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -8527,7 +8527,7 @@ mod board_footprint_graphics_tests {
 
     #[test]
     fn footprint_text_tools_are_registered_with_the_arguments_they_read() {
-        let tools = crate::tools::pcb_board::tools();
+        let tools = crate::router::registry::tools_for("pcb_footprint_text").unwrap();
         for (name, required) in [
             ("list_board_footprint_texts", vec!["board"]),
             ("move_footprint_texts", vec!["board", "moves"]),

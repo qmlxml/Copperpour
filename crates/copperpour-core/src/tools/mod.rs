@@ -9,6 +9,7 @@ mod board_source;
 #[cfg(test)]
 mod board_source_contract_tests;
 mod board_stackup;
+mod board_stackup_set;
 #[cfg(test)]
 mod board_title_block_tests;
 #[cfg(test)]
@@ -25,6 +26,7 @@ mod design_rules_tests;
 pub(crate) mod drc;
 pub mod easyeda;
 pub mod editor_navigation;
+mod erc_severity;
 mod footprint_fields;
 mod footprint_graphics;
 mod footprint_metadata;

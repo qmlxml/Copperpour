@@ -215,7 +215,8 @@ mod tests {
                         "apply_template/properties/net_mappings" |
                         // Passed through to Freerouting; what it does not
                         // apply is read back and reported (settings_not_applied).
-                        "route_specctra_dsn/properties/router_settings"
+                        "route_specctra_dsn/properties/router_settings" |
+                        "set_erc_severity/properties/severities"
                     ),
                         "unreviewed open input record: {path}"
                     );
