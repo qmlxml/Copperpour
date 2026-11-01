@@ -17,7 +17,9 @@ Each entry names where it was found, what is wrong, and the condition that close
   nothing.
 - **Windows build not checked.** `crates/copperpour/src/live_editor.rs` was adapted at the merge but
   not compiled for Windows: `cargo check --target x86_64-pc-windows-gnu` needs the MinGW C compiler
-  for `nng-sys`. Closing condition: the module compiles for a Windows target.
+  for `nng-sys`. Owner ruling 2026-11-01: check it through GitHub CI (push `integration`, enable
+  Actions on `qmlxml/Copperpour`, open a pull request from `integration` into the fork's `main`), not
+  a local MinGW install. Closing condition: the Windows job of that run passes.
 - **Annotation does not consult the live-editor hook** (`sch_annotate`), so it is refused while the
   editor is open. Closing condition: decided whether it should, and done or documented as intended.
 

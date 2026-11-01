@@ -109,3 +109,5 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
 - **Test leftovers deleted** (`~/.copperpour`, `~/.local/share/konnect/locks` with 107,778 lock
   files; no Copperpour process running) and the two defects recorded in `docs/BACKLOG.md`, "Test
   isolation and state files". 2 models agree.
+- **Windows build: checked through GitHub CI** when the owner pushes (pull request from
+  `integration` into the fork's `main`), not a local MinGW install. 2 models agree.
