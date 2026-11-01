@@ -137,7 +137,7 @@ mod tests {
         );
     }
 
-    /// Not on Windows: there the candidate is `/usr/bin\\java.exe`, which can
+    /// Not on Windows: there the candidate is `/usr/bin\java.exe`, which can
     /// never equal the macOS stub's path, so the order under test cannot arise.
     #[cfg(not(windows))]
     #[test]

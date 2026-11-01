@@ -202,13 +202,25 @@ mod tests {
             assert!(
                 path.as_deref().is_some_and(Path::is_absolute),
                 "{path:?} among app_data {:?}, local_data {:?}, user_state {:?}, \
-                 user_data {:?}; USERPROFILE {:?}, LOCALAPPDATA {:?}",
+                 user_data {:?}; unfiltered dirs: config {:?}, data_local {:?}, home {:?}; \
+                 USERPROFILE {:?}, LOCALAPPDATA {:?}, AppData/Roaming and AppData/Local \
+                 under USERPROFILE exist: {:?}",
                 app_data_dir(),
                 local_data_dir(),
                 user_state_dir(),
                 user_data_dir(),
+                dirs::config_dir(),
+                dirs::data_local_dir(),
+                dirs::home_dir(),
                 std::env::var_os("USERPROFILE"),
                 std::env::var_os("LOCALAPPDATA"),
+                std::env::var_os("USERPROFILE").map(|profile| {
+                    let profile = Path::new(&profile).join("AppData");
+                    (
+                        profile.join("Roaming").is_dir(),
+                        profile.join("Local").is_dir(),
+                    )
+                }),
             );
         }
         #[cfg(not(target_os = "windows"))]

@@ -14,12 +14,16 @@
 //! empty directory and fails if anything appears in it, which catches a test
 //! binary that does not call this, and doctests, which cannot.
 //!
-//! Remaining gaps, stated rather than hidden: on Windows `dirs` reads the
-//! known-folder API and ignores `USERPROFILE` and `APPDATA` for `home_dir`,
-//! `config_dir` and `data_local_dir`, so Copperpour code that calls those
-//! through `app_dirs` is redirected only where it also honours a variable set
-//! here (`COPPERPOUR_STATE_DIR`, `APPDATA` read directly); and kicad-cli on
-//! Windows may still use the real profile's cache folder. `UNCHANGED` is
+//! On Windows `dirs` reads the known-folder API, not `APPDATA` or
+//! `LOCALAPPDATA`. The Windows CI run of 2026-11-01 showed that API resolving
+//! the roaming folder under `USERPROFILE` and returning nothing while that
+//! folder was missing (`a_relative_home_gives_no_relative_user_directory`
+//! failed until `AppData/Roaming` and `AppData/Local` were created under the
+//! temporary home), so `config_dir` and `data_local_dir` follow this
+//! isolation as long as those folders exist. Remaining gaps, stated rather
+//! than hidden: whether `home_dir` also follows `USERPROFILE` on Windows is
+//! not measured, and kicad-cli on Windows may still use the real profile's
+//! cache folder. `UNCHANGED` is
 //! inherited by grandchildren and, if exported in a shell, turns isolation off
 //! for the whole run; the gate's empty-home check is what would show it. A
 //! process started with its environment cleared and not carrying

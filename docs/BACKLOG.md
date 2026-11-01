@@ -15,7 +15,10 @@ Each entry names where it was found, what is wrong, and the condition that close
   module. It runs only on a push to `main` or a pull request into `main`
   (`ci.yml` lines 3-7), and only once Actions is enabled on the fork; pushing `integration` alone runs
   nothing.
-- **Windows build not checked.** `crates/copperpour/src/live_editor.rs` was adapted at the merge but
+- **~~Windows build not checked.~~ Done 2026-11-01**
+  (`docs/development/2026-11-01-09-Windows_CI_fixes.md`): the Windows job of CI run 41329352599 on
+  pull request #1 passes, after two commits that fixed a test-only compile error and 18 Windows test
+  failures. `crates/copperpour/src/live_editor.rs` was adapted at the merge but
   not compiled for Windows: `cargo check --target x86_64-pc-windows-gnu` needs the MinGW C compiler
   for `nng-sys`. Owner ruling 2026-11-01: check it through GitHub CI (push `integration`, enable
   Actions on `qmlxml/Copperpour`, open a pull request from `integration` into the fork's `main`), not
@@ -249,9 +252,9 @@ Each entry names where it was found, what is wrong, and the condition that close
   directories at `<target>/copperpour-test-home`, and `scripts/gate.sh` fails if anything is written
   to the empty `HOME` it runs with; `every_test_binary_calls_isolate` catches a test file without
   the call under plain `cargo test`, so in CI too. Remaining: CI does not run the empty-`HOME` check
-  itself (it changes only once the branch can be pushed and CI watched); on Windows `dirs` ignores
-  the profile variables, so the native Specctra bridge's directory and kicad-cli's cache are not
-  redirected; the Windows `e2e-kicad` workflow has not been run with the isolation (run it by
+  itself (it changes only once the branch can be pushed and CI watched); on Windows `dirs` follows
+  `USERPROFILE` for the application-data folders (seen in CI 2026-11-01), but whether the native
+  Specctra bridge's directory and kicad-cli's cache are redirected is not measured; the Windows `e2e-kicad` workflow has not been run with the isolation (run it by
   `workflow_dispatch` before a release).
 - **A test that skips counts as a pass, and the gate cannot see skips**: `cargo test` hides the
   `SKIP:` output of passing tests (measured: the gate logs before and after the test-isolation change
