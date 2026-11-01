@@ -102,3 +102,7 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
   stock KiCad answers.** First opinion (this session) was to leave both out; the second reviewer's was a
   stock-capable subset. The owner asked the two to discuss; the plan they agreed is recorded in
   `docs/BACKLOG.md` ("2 models agree"), and the owner accepted it.
+- **"silent zero" added to the forbidden-terms table** of the owner's global instructions file
+  (replacement: "an empty result reported as a checked zero when the check did not run"; quoting an
+  identifier verbatim is a citation). The one prose use (fork survey, line 72) was rewritten; upstream
+  test names and the public migration-note file name are left as they are. 2 models agree.
