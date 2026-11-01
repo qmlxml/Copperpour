@@ -98,3 +98,7 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
   and compare completion and violations with Freerouting on the same boards, read the design, and
   report to the owner, who then decides between not taking it and a router-only branch. Second
   opinion (second reviewer) agreed on D first; it would go to the router-only branch directly if D passes.
+- **wilfredo `f517fd8` / `d2961f4`: merge nothing now; measure, then a narrow implementation if
+  stock KiCad answers.** First opinion (this session) was to leave both out; the second reviewer's was a
+  stock-capable subset. The owner asked the two to discuss; the plan they agreed is recorded in
+  `docs/BACKLOG.md` ("2 models agree"), and the owner accepted it.

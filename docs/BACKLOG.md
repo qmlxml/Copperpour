@@ -124,8 +124,17 @@ Each entry names where it was found, what is wrong, and the condition that close
   findings the pooled top level removed, and a rail judged fine has no record of which sheets
   supplied it; rails are pooled by name, so a rail named differently on two sheets is not pooled.
   Closing condition: a pooled `rail_coverage` with its sources.
-- **`f517fd8` and `d2961f4` from wilfredo-a14/agent-hub were not merged** (activity reporting to,
-  and editor control of, a modified KiCad build). Closing condition: an owner decision.
+- **`f517fd8` and `d2961f4` from wilfredo-a14/agent-hub are not merged** (activity reporting to,
+  and editor control of, a modified KiCad build). Owner ruling 2026-11-01, with a plan agreed by two
+  models: measure first, with stock KiCad 10.0.7 running and a board open, whether KiCad answers
+  `GetActiveLayer`, `SetActiveLayer`, `GetVisibleLayers`, `SetVisibleLayers` and `RunAction`
+  (`common.Control.zoomFitScreen`); correct `tool-directory.md`'s `set_active_layer` row or the tool
+  by the result. Only if they are handled: a new narrow implementation (not a cherry-pick) of
+  `set_active_layer` (same name; refusal kept when KiCad answers unsupported; migration note),
+  `set_layer_visibility` (the fork's arguments) and `run_editor_action` (PCB editor, fixed list of
+  actions that open no dialog), with the full review cycle. Never taken: the activity reporting,
+  `activity-hook`, the custom IPC messages, the dispatch-path and live-editor changes, `d2961f4`.
+  Revisit the rest if the owner adopts the modified KiCad build. Waiting for: a live KiCad session.
 
 ## PCB sync and library data (plan step 7)
 
