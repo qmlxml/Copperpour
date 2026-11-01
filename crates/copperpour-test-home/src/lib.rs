@@ -15,12 +15,13 @@
 //! binary that does not call this, and doctests, which cannot.
 //!
 //! On Windows `dirs` reads the known-folder API, not `APPDATA` or
-//! `LOCALAPPDATA`. The Windows CI run of 2026-11-01 showed that API resolving
-//! the roaming folder under `USERPROFILE` and returning nothing while that
-//! folder was missing (`a_relative_home_gives_no_relative_user_directory`
+//! `LOCALAPPDATA`. The Windows CI runs of 2026-11-01 are consistent with that
+//! API resolving the roaming folder under `USERPROFILE` and returning nothing
+//! while that folder is missing (`a_relative_home_gives_no_relative_user_directory`
 //! failed until `AppData/Roaming` and `AppData/Local` were created under the
-//! temporary home), so `config_dir` and `data_local_dir` follow this
-//! isolation as long as those folders exist. Not measured on Windows: whether
+//! temporary home); this is inferred from pass and fail, not read from the
+//! API's output. So the folders are created there, and `config_dir` and
+//! `data_local_dir` are expected to follow this isolation. Not measured on Windows: whether
 //! `home_dir` also follows `USERPROFILE`, and whether kicad-cli's cache
 //! folder follows `LOCALAPPDATA` now that it exists under the temporary home. `UNCHANGED` is
 //! inherited by grandchildren and, if exported in a shell, turns isolation off

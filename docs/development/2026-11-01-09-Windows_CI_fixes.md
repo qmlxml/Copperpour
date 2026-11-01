@@ -10,7 +10,8 @@ compiler for `nng-sys` and `aws-lc-sys`), so each fix is checked by a CI run.
 `tools/simulation.rs` test `the_export_never_writes_into_the_project` used
 `std::os::unix::fs::PermissionsExt`. Every fake tool in its module (`with_fake_cli`) is a shell
 script with an empty Windows body, so no test in it could run on Windows; the module is now
-`#[cfg(unix)]`, as the module before it already was. Commit `70212eb8`. The product, including the
+`#[cfg(unix)]`, as one test before it already was (`units_come_from_the_signal`; the commit
+message says "the module before it", which is wrong). Commit `70212eb8`. The product, including the
 Windows-only live editor (`crates/copperpour/src/live_editor.rs`), compiled.
 
 ## Run 2 (41327451982): 18 tests failed
@@ -34,9 +35,11 @@ which `display_path` keeps for paths of 260 characters or more and for reserved 
 
 Commit `394a37be`. Run 3 (41329352599): all ten jobs pass, Windows included. The `app_dirs` cause
 above was a hypothesis when committed. Its passing is consistent with it and is the only evidence:
-the cause is inferred from pass and fail, not read from the API's output. In run 2 the real
-profile's roaming folder existed, and `APPDATA` pointed at a created folder, yet the lookup failed,
-so it followed neither; it did not fail once the folders existed under the temporary `USERPROFILE`.
+the cause is inferred from pass and fail, not read from the API's output. In the failing child
+process `APPDATA` is deliberately relative, so `app_data_dir` falls back to `dirs::config_dir`, the
+known-folder lookup, which returned nothing in run 2 (when `USERPROFILE` was the temporary home
+without `AppData`) and a usable folder once `AppData/Roaming` existed there. That the runner's real
+profile has a roaming folder was assumed, not checked.
 
 Gate (`logs/gate-windows-fixes.summary`): 3,750 passed, 0 failed, 113 ignored, `home-untouched`
 PASS.
@@ -116,8 +119,8 @@ the tests now compiled on Unix only never ran there. Fixed:
 4. **No test covered the sequence that failed**: new `a_rewritten_model_path_passes_the_include_check`
    resolves a temporary project, takes a snapshot with a relative `Sim.Library`, and passes the
    rewritten value to the include check as an `.include`. It needs no kicad-cli, so it runs on
-   Windows CI; on Linux it passes with or without this step's fixes, since `canonicalize` returns no
-   prefix there, so only the Windows run tests the fix.
+   Windows CI; on Linux it should pass with or without this step's fixes (not run against the earlier
+   code), since `canonicalize` returns no prefix there, so only the Windows run tests the fix.
 5. `..` under a resolved folder: `join_relative` follows the real folder, as Unix does, where KiCad
    on Windows follows the folder as opened (a junction or `subst` drive). Documented in the function
    and recorded in `docs/BACKLOG.md`. The function's comment also says a `\\?\` folder is parsed only
@@ -147,3 +150,14 @@ verbatim folders made to name their file, and the probe's timeout made to bound 
 killed worker. Not shipped, recorded in `docs/BACKLOG.md`: network-drive and share limits of the
 include check, the `..` difference from KiCad on Windows, the empty-`HOME` check in CI, and a
 Windows run with a real KiCad project (the `e2e-kicad` workflow is disabled on forks).
+
+## Documentation review
+
+An independent check confirmed the commit contents, the CI runs and their head commits, the 18
+failures, the gate counts and the test names. Corrected: the `with_fake_cli` module was said to
+follow an earlier Unix-only module (only one earlier test was Unix-only); the `app_dirs` cause said
+`APPDATA` pointed at a created folder (in the failing child it is deliberately relative); the
+test-home module documentation stated that cause as observed rather than inferred; a backlog entry
+said "same review" after another review's entry was inserted above it; the closed Windows-build
+entry still said the live editor was not compiled for Windows; the new end-to-end test was said to
+pass on Linux without the fixes, which was reasoned, not run.

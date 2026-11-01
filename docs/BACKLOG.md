@@ -18,9 +18,10 @@ Each entry names where it was found, what is wrong, and the condition that close
 - **~~Windows build not checked.~~ Done 2026-11-01**
   (`docs/development/2026-11-01-09-Windows_CI_fixes.md`): the Windows job passes on pull request #1
   (first in CI run 41329352599, and on every run since, latest 41331483665), after fixing a
-  test-only compile error and 18 Windows test failures. `crates/copperpour/src/live_editor.rs` was adapted at the merge but
-  not compiled for Windows: `cargo check --target x86_64-pc-windows-gnu` needs the MinGW C compiler
-  for `nng-sys`. Owner ruling 2026-11-01: check it through GitHub CI (push `integration`, enable
+  test-only compile error and 18 Windows test failures. `crates/copperpour/src/live_editor.rs`,
+  adapted at the merge, compiles in that job (`cargo check --workspace`, from the first run on); it
+  is still not compiled locally, since `cargo check --target x86_64-pc-windows-gnu` needs the MinGW
+  C compiler for `nng-sys`. Owner ruling 2026-11-01: check it through GitHub CI (push `integration`, enable
   Actions on `qmlxml/Copperpour`, open a pull request from `integration` into the fork's `main`), not
   a local MinGW install. Closing condition: the Windows job of that run passes.
 - **Annotation does not consult the live-editor hook** (`sch_annotate`), so it is refused while the
@@ -67,8 +68,8 @@ Each entry names where it was found, what is wrong, and the condition that close
   project opened through a junction or a `subst` drive, `${KIPRJMOD}/../shared/m.lib` then names
   another file, or none. Not a safety problem: the allowed-folder check runs on the result. Closing
   condition: `..` applied to the project folder as opened, or the difference documented for users.
-- **A project on a network share cannot simulate with relative model files** (same review; existed
-  before). The snapshot writes model paths under the project folder, which for a project on a share
+- **A project on a network share cannot simulate with relative model files** (review 2 of the
+  Windows CI fixes; existed before). The snapshot writes model paths under the project folder, which for a project on a share
   or a mapped drive is `\\server\share\…`, and the include check refuses every such path.
   Closing condition: an include under the project's own folder is accepted, or the limitation is
   documented.
