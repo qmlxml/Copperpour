@@ -798,7 +798,7 @@ fn freerouting_state_dir() -> Option<PathBuf> {
 }
 
 /// HotSpot writes a crash report (`hs_err_pid*.log`) and possibly a core dump
-/// into its working directory, which is the KiCad project Konnect serves: a
+/// into its working directory, which is the KiCad project Copperpour serves: a
 /// G1 crash once left its report at the root of a project repository. Send
 /// the report next to Freerouting's logs (the temporary directory when there
 /// is no state directory) and never dump core.
@@ -1983,7 +1983,10 @@ mod tests {
         // JVM options (headless, then the crash-report options added in plan
         // step 5) all come before -jar.
         assert_eq!(arguments[0], "-Djava.awt.headless=true");
-        let jar = arguments.iter().position(|argument| *argument == "-jar").unwrap();
+        let jar = arguments
+            .iter()
+            .position(|argument| *argument == "-jar")
+            .unwrap();
         assert_eq!(arguments[jar + 1], "freerouting.jar");
         assert!(arguments[..jar]
             .iter()

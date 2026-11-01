@@ -204,7 +204,7 @@ Committed as `414e90c`.
 
 An independent check of this log, the plan entry, the overnight decisions, SIMULATION_NOTES, the
 plan's merge note, the migration note, the backlog and the skill against the code and logs found
-seven inaccuracies, all corrected: the failure count (44 new: 43 script, 1 toolset count); the count
+seven inaccuracies, all corrected: the failure count (44 new: 43 from the scripts, one from the toolset-count test); the count
 of review 3's findings in the plan entry; an incomplete list of `konnect` names kept on purpose (one
 comment and two test names were renamed; the rest are now listed with reasons); `.op` said moved out
 of SIMULATION_NOTES but still there (removed); the overnight note's reload wording; a log file

@@ -94,7 +94,7 @@ Directions are `right`, `top-right`, `top`, `top-left`, `left`, `bottom-left`,
 `bottom`, `bottom-right`, as seen in the 2D top view. On a long part whose pin 1
 sits near the middle of an end (a 2x05 header), take the dominant side, `left`
 rather than `bottom-left`. Record what you saw, even
-when the part was wrong: Konnect derives the correction the observation
+when the part was wrong: Copperpour derives the correction the observation
 proves, `footprint_pin1 − jlc_model_pin1 + cpl − kicad`, and refuses the policy
 if it differs from the rule's `rotation_degrees`. A rule cannot then say one
 thing while its own evidence says another.
