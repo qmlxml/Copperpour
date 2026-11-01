@@ -165,11 +165,18 @@ pub(crate) async fn run(
     if sync {
         let path = board.to_path_buf();
         let synchronized = with_board_ipc_classified(ctx, board, move |client, _| {
-            let operation = || -> anyhow::Result<String> {
-                if refill {
-                    client.refill_zones()?;
-                    client.wait_for_board_ready(READY_TIMEOUT)?;
+            // A failed refill is reported as `refill_zones`, before anything
+            // is saved, so its message says it can be repeated (step 7b
+            // documentation review): the sync's warning offers this path.
+            if refill {
+                if let Err(error) = client
+                    .refill_zones()
+                    .and_then(|()| client.wait_for_board_ready(READY_TIMEOUT))
+                {
+                    return Ok(Err(uncertain(&path, "refill_zones", error)));
                 }
+            }
+            let operation = || -> anyhow::Result<String> {
                 client.save_board()?;
                 client.wait_for_board_ready(READY_TIMEOUT)?;
                 let live = client.save_document_to_string()?;

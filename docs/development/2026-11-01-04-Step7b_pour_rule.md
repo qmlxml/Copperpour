@@ -30,7 +30,9 @@ Committed as `922977f9`.
 ## Review 1 and fix pass 1
 
 The review covered the implementation, robustness and intent viewpoints in one pass; reviews 2 and
-3 are run separately as well, as the workflow requires. Confirmed: the apply's response reports the
+3 are run separately as well, as the workflow requires. Fixes are numbered by the review's finding
+numbers; a number missing from a list was a finding confirmed correct or merged into another.
+Confirmed: the apply's response reports the
 plan it applied (re-planned from a fresh snapshot); `zones_to_refill` is deduplicated, records both
 nets of a pad moving between two pours, and is kept whole in `output` files; the plan revision need
 not hash it (it is derived from the zones, whose count the revision hashes). Fixed:
@@ -68,8 +70,9 @@ returns; the dry run, no-op, stale-revision and preflight returns all happen bef
 4. Net names in the warning are quoted with escaping, so a name containing a quote or comma is
    unambiguous.
 5. The response also checks `plan.status`, not only the status string.
-6. A poisoned lock keeps its value instead of dropping the warning.
-7. The warning repeats every poured net; their number is the distinct poured nets, so it is left.
+6. The read after the commit takes the value from a poisoned lock instead of dropping the warning.
+7. The warning lists each distinct poured net once; the list has no duplicates to remove, so it is
+   unchanged.
 8. An out-of-date comment in the planner corrected.
 
 Gate (`logs/gate-step7b-fix2.summary`): 3,733 passed (+1), 1 failed (the known baseline failure),
@@ -85,7 +88,8 @@ pour first. Fixed:
 1. **The warning's alternative did not refill the board**: `run_drc` with `refill_zones: true` but
    without `sync_live_board: true` fills a temporary copy for its own check and checks the saved
    file, which does not hold the sync yet. The warning now names `run_drc` with
-   `sync_live_board: true` and `refill_zones: true`; the served test asserts it.
+   `sync_live_board: true` and `refill_zones: true`; `a_pad_moving_onto_a_poured_net_asks_for_a_refill`,
+   which runs through the full tool dispatch, asserts it.
 2. **A failed refill said "do not repeat possibly applied work blindly"**, so a caller following it
    stopped with stale fills that nothing reports again. `refill_zones` failures now say the refill
    only recomputes the fills and can be repeated safely; other uncertain operations keep the old
@@ -100,4 +104,19 @@ pour first. Fixed:
 A first gate run failed Copperpour's documentation test, which read the skill's `zones_to_refill` and
 `zones_need_refill` as tool names; both were added to its `NOT_TOOLS` list. Gate
 (`logs/gate-step7b-fix3.summary`): 3,734 passed (+1), 1 failed (the known baseline failure), 110
+ignored.
+
+Committed as `d428bd17`.
+
+## Documentation review
+
+An independent check confirmed the hashes, gate counts, names and quoted wording. Corrected: the
+plan's record named "the review 3 commit" instead of `d428bd17`; the fix lists' numbering is now
+explained; two unclear sentences rewritten; "served test" replaced by the test's name. It also found
+that **`run_drc` with `sync_live_board: true` and `refill_zones: true`, the alternative the warning
+offers, still reported a failed refill under `synchronize_drc_source` with the "do not repeat"
+message**: the refill stage now fails as `refill_zones`, before anything is saved, with the
+"can be repeated safely" message.
+
+Gate (`logs/gate-step7b-doc.summary`): 3,734 passed, 1 failed (the known baseline failure), 110
 ignored.
