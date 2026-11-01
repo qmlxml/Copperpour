@@ -111,3 +111,10 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
   isolation and state files". 2 models agree.
 - **Windows build: checked through GitHub CI** when the owner pushes (pull request from
   `integration` into the fork's `main`), not a local MinGW install. 2 models agree.
+
+### Owner review of the overnight decisions, 2026-11-01 (one at a time, each with a second opinion)
+
+- **1: MODIFY.** Read the schematic's `(exclude_from_sim yes)` flag: flagged parts stay under
+  `excluded_in_schematic`; other parts missing from the SPICE netlist get a separate code
+  `not_in_spice_netlist` with a true description; both keep the result `modified`. To be done in the
+  follow-up work. 2 models agree.
