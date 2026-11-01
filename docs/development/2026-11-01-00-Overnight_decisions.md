@@ -138,3 +138,5 @@ apply that choice without asking. All remaining items matched:
 Owner instruction, 2026-11-01: owner-level decisions are settled between the two reviewers — applied
 directly when the two independent opinions match, and after a discussion to agreement when they do
 not; the owner is asked only for actions needing their hands or credentials.
+- **J3Techs native router: not taken at this revision** (after the assessment, option D;
+  `2026-11-01-06-J3Techs_router_assessment.md`). 2 models agree.
