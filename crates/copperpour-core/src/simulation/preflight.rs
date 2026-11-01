@@ -1646,6 +1646,7 @@ mod tests {
             lib_id: None,
             has_sim_fields: false,
             sim_params: None,
+            symbol_uuids: Vec::new(),
         };
         let kicad = KiCadNetlist {
             components: vec![
@@ -1766,6 +1767,7 @@ mod tests {
             lib_id: None,
             has_sim_fields: false,
             sim_params: None,
+            symbol_uuids: Vec::new(),
         }
     }
 
@@ -2731,6 +2733,7 @@ mod tests {
             lib_id: Some(format!("Device:{part}")),
             has_sim_fields,
             sim_params: None,
+            symbol_uuids: Vec::new(),
         };
         let kicad = KiCadNetlist {
             components: vec![
@@ -2762,6 +2765,7 @@ mod tests {
             lib_id: Some("Device:Varistor".to_string()),
             has_sim_fields: true,
             sim_params,
+            symbol_uuids: Vec::new(),
         };
         let kicad = KiCadNetlist {
             components: vec![

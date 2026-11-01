@@ -1333,6 +1333,15 @@ impl RunEnd<'_> {
                 "items": self.design.excluded_in_schematic,
             }));
         }
+        if !self.design.not_in_spice_netlist.is_empty() {
+            warnings.push(json!({
+                "code": "not_in_spice_netlist",
+                "detail": "These parts have no line in KiCad's SPICE netlist, usually because they \
+                           have no simulation model, so they were not simulated. The result is not \
+                           evidence about them.",
+                "items": self.design.not_in_spice_netlist,
+            }));
+        }
         if !self.request.testbench.spice_lines.is_empty() {
             warnings.push(json!({
                 "code": "testbench_elements_added",
@@ -1385,10 +1394,12 @@ impl RunEnd<'_> {
             .collect();
         let modified = !design.excluded_references.is_empty()
             || !design.excluded_in_schematic.is_empty()
+            || !design.not_in_spice_netlist.is_empty()
             || !testbench.spice_lines.is_empty();
         let circuit = json!({
             "excluded_references": design.excluded_references,
             "excluded_in_schematic": design.excluded_in_schematic,
+            "not_in_spice_netlist": design.not_in_spice_netlist,
             "added_line_count": testbench.spice_lines.len(),
             "dropped_directives": self.deck.dropped_directives,
             "approximations": approximations,
@@ -1570,6 +1581,10 @@ struct Design {
     /// merged (plan step 4, review 3): such parts used to vanish while the
     /// result still read `as_drawn`.
     excluded_in_schematic: Vec<String>,
+    /// Parts in KiCad's netlist with no line in its SPICE netlist whose
+    /// symbol is not flagged `exclude_from_sim`: usually a part with no model
+    /// (owner review of overnight decision 1).
+    not_in_spice_netlist: Vec<String>,
     preflight: Option<Preflight>,
     project_dir: PathBuf,
     inputs_hash: String,
@@ -1647,6 +1662,46 @@ fn allowed_roots(project_dir: &Path, model_dirs: &[PathBuf]) -> (Vec<PathBuf>, V
     (roots, ignored)
 }
 
+/// UUIDs of placed symbols flagged `(exclude_from_sim yes)` in the sheet
+/// files under `dir` (the snapshot's copy). A file that cannot be read or
+/// parsed contributes nothing; its parts are then reported as
+/// `not_in_spice_netlist`, which still marks the result `modified`.
+fn sim_excluded_symbols(dir: &Path) -> std::collections::HashSet<String> {
+    let mut flagged = std::collections::HashSet::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "kicad_sch") {
+                continue;
+            }
+            let Some(tree) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| copperpour_sexp::parse_sexp(&text).ok())
+            else {
+                continue;
+            };
+            // Placed symbols are direct children of the sheet; library
+            // symbols sit under `lib_symbols` and are not visited.
+            for symbol in tree.find_all("symbol") {
+                if symbol.find_str("exclude_from_sim") == Some("yes") {
+                    if let Some(uuid) = symbol.find_str("uuid") {
+                        flagged.insert(uuid.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    flagged
+}
+
 async fn inspect_design(
     kicad_cli: &str,
     schematic: &Path,
@@ -1707,15 +1762,31 @@ async fn inspect_design(
             has_testbench_lines: !inputs.testbench.spice_lines.is_empty(),
         })
     });
-    let excluded_in_schematic: Vec<String> = elements
+    // Parts missing from what ran, split by whether the schematic itself flags
+    // them: KiCad's netlist does not carry the flag, so it is read from the
+    // snapshot's sheet files and matched by symbol UUID.
+    let flagged = sim_excluded_symbols(&source);
+    let flagged_references: std::collections::HashSet<&str> = kicad
+        .components
+        .iter()
+        .filter(|component| {
+            component
+                .symbol_uuids
+                .iter()
+                .any(|uuid| flagged.contains(uuid))
+        })
+        .map(|component| component.reference.as_str())
+        .collect();
+    let (excluded_in_schematic, not_in_spice_netlist): (Vec<String>, Vec<String>) = elements
         .iter()
         .filter(|element| element.element_name.is_none() && !element.reference.starts_with('#'))
         .map(|element| element.reference.clone())
-        .collect();
+        .partition(|reference| flagged_references.contains(reference.as_str()));
     let inlined = deck.as_ref().map_or(&[][..], |deck| &deck.inlined_files);
     let inputs_hash = inputs_hash(sources_hash, inlined)?;
     Ok(Design {
         excluded_in_schematic,
+        not_in_spice_netlist,
         compatibility,
         inputs_hash,
         project_dir,
@@ -1858,6 +1929,10 @@ fn readiness_report(
             report["excluded_in_schematic"] =
                 json!(listing(design.excluded_in_schematic.iter(), limit));
         }
+        if !design.not_in_spice_netlist.is_empty() {
+            report["not_in_spice_netlist"] =
+                json!(listing(design.not_in_spice_netlist.iter(), limit));
+        }
         report["source_evidence"] = json!({
             "excludes_unsaved_editor_state": true,
             "locks_present": design.locks_present,
@@ -1946,6 +2021,37 @@ mod tests {
             code_model_count: 1,
             export_timeout: EXPORT_TIMEOUT,
         }
+    }
+
+    /// The flag is read from the sheet files: only placed symbols marked
+    /// `(exclude_from_sim yes)` count, in any sheet of the snapshot, and a
+    /// library symbol's own flag does not (owner review of overnight
+    /// decision 1).
+    #[test]
+    fn sim_excluded_symbols_reads_placed_symbols_in_every_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("top.kicad_sch"),
+            "(kicad_sch (lib_symbols (symbol \"Device:R\" (exclude_from_sim yes))) \
+             (symbol (lib_id \"Device:R\") (exclude_from_sim yes) (uuid \"u-flagged\")) \
+             (symbol (lib_id \"Device:R\") (exclude_from_sim no) (uuid \"u-kept\")))",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(
+            dir.path().join("sub").join("child.kicad_sch"),
+            "(kicad_sch (symbol (lib_id \"Connector:J\") (exclude_from_sim yes) (uuid \"u-child\")))",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("broken.kicad_sch"), "(kicad_sch (").unwrap();
+        let flagged = sim_excluded_symbols(dir.path());
+        assert_eq!(
+            flagged,
+            ["u-flagged", "u-child"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
     }
 
     #[test]
@@ -2044,6 +2150,7 @@ mod tests {
             ignored_model_dirs: Vec::new(),
             excluded_references: Vec::new(),
             excluded_in_schematic: Vec::new(),
+            not_in_spice_netlist: Vec::new(),
             preflight: None,
             project_dir: PathBuf::new(),
             inputs_hash: String::new(),

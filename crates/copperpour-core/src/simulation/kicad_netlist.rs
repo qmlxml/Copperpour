@@ -19,6 +19,10 @@ pub(crate) struct Component {
     /// the value, or leaves the part unmodelled.
     pub has_sim_fields: bool,
     pub sim_params: Option<String>,
+    /// The placed symbol's UUIDs (`tstamps`, one per unit). KiCad's netlist
+    /// does not carry `exclude_from_sim`, so the flag is matched by these
+    /// against the schematic files (owner review of overnight decision 1).
+    pub symbol_uuids: Vec<String>,
 }
 
 /// What a library symbol carries, which a placed symbol may not have copied.
@@ -124,12 +128,23 @@ fn component(node: &SexpNode) -> Result<Component> {
         Some(format!("{lib}:{part}"))
     });
     let (has_sim_fields, sim_params) = sim_fields(node);
+    let symbol_uuids = node
+        .find("tstamps")
+        .and_then(SexpNode::children)
+        .unwrap_or_default()
+        .iter()
+        .skip(1)
+        .filter_map(SexpNode::as_str)
+        .flat_map(str::split_whitespace)
+        .map(str::to_owned)
+        .collect();
     Ok(Component {
         reference: required(node, "ref")?,
         value: node.find_str("value").unwrap_or_default().to_owned(),
         lib_id,
         has_sim_fields,
         sim_params,
+        symbol_uuids,
     })
 }
 
@@ -289,6 +304,17 @@ mod tests {
     const HIERARCHY_NET: &str = include_str!("../../tests/fixtures/simulation/subsheets.net");
     const HIERARCHY_CIR: &str = include_str!("../../tests/fixtures/simulation/subsheets.cir");
 
+    /// A netlist part keeps its symbol UUIDs (`tstamps`), which the
+    /// simulation matches against the schematic's `exclude_from_sim` flags.
+    #[test]
+    fn a_component_keeps_its_symbol_uuids() {
+        let node = copperpour_sexp::parse_sexp(
+            "(comp (ref \"R2\") (value \"100k\") (tstamps \"u-1 u-2\"))",
+        )
+        .unwrap();
+        assert_eq!(component(&node).unwrap().symbol_uuids, ["u-1", "u-2"]);
+    }
+
     #[test]
     fn real_kicad_output_gives_components_pins_and_pin_details() {
         let netlist = parse(RECTIFIER_NET).unwrap();
@@ -396,6 +422,7 @@ mod tests {
             lib_id: None,
             has_sim_fields: false,
             sim_params: None,
+            symbol_uuids: Vec::new(),
         };
         let kicad = KiCadNetlist {
             components: vec![component("R7"), component("VR7"), component("BT1")],
@@ -418,6 +445,7 @@ mod tests {
                 lib_id: None,
                 has_sim_fields: false,
                 sim_params: None,
+                symbol_uuids: Vec::new(),
             }],
             nets: Vec::new(),
             library_parts: Vec::new(),
