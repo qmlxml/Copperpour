@@ -52,3 +52,25 @@ not hash it (it is derived from the zones, whose count the revision hashes). Fix
 
 Gate (`logs/gate-step7b-fix1.summary`): 3,732 passed (+1), 1 failed (the known baseline failure),
 110 ignored.
+Committed as `a3eea5e6`.
+
+## Review 2 (robustness) and fix pass 2
+
+Confirmed: the IPC closure runs at most once and the shared refill set is read only after it
+returns; the dry run, no-op, stale-revision and preflight returns all happen before it is set; every
+`plan_sync` diagnostic is a conflict; a zone on no net is not recorded. Fixed:
+
+1. **A recovered batch (confirmed rolled back) was told to refill and save.** The refill guidance is
+   now added only to an `ipc_outcome_unknown` result (`with_refill_guidance`).
+2. **That guidance was a second text item**, which callers reading `content[0]` and the error JSON
+   never saw: `zones_to_refill` and the `zones_need_refill` warning are now fields of the error's
+   JSON body. Test `only_an_uncertain_outcome_carries_the_refill_guidance` (finding 3).
+4. Net names in the warning are quoted with escaping, so a name containing a quote or comma is
+   unambiguous.
+5. The response also checks `plan.status`, not only the status string.
+6. A poisoned lock keeps its value instead of dropping the warning.
+7. The warning repeats every poured net; their number is the distinct poured nets, so it is left.
+8. An out-of-date comment in the planner corrected.
+
+Gate (`logs/gate-step7b-fix2.summary`): 3,733 passed (+1), 1 failed (the known baseline failure),
+110 ignored.

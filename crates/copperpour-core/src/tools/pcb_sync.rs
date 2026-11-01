@@ -693,20 +693,11 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 crate::mcp::error::extract_error_kind(&result).as_deref(),
                 Some("ipc_outcome_unknown" | "ipc_batch_recovered")
             ) {
-                let mut result = result;
                 let refill = planned_refill
                     .lock()
-                    .map(|refill| refill.clone())
-                    .unwrap_or_default();
-                if let Some(warning) = refill_warning(&refill, true) {
-                    result.content.push(ToolContent::Text {
-                        text: format!(
-                            "If the commit took effect: {}",
-                            warning["message"].as_str().unwrap_or_default()
-                        ),
-                    });
-                }
-                return Ok(result);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                return Ok(with_refill_guidance(result, &refill));
             }
             let message = result
                 .content
@@ -824,12 +815,12 @@ impl<'a> SyncResponse<'a> {
             // A conflicted plan applies nothing, whichever stage refused it
             // (planner, preflight or a stale revision), so it leaves no fill
             // stale (step 7b review 1).
-            zones_to_refill: if status == "conflict" {
+            zones_to_refill: if status == "conflict" || plan.status == PlanStatus::Conflict {
                 &NO_ZONES
             } else {
                 &plan.zones_to_refill
             },
-            warnings: if status == "conflict" {
+            warnings: if status == "conflict" || plan.status == PlanStatus::Conflict {
                 Vec::new()
             } else {
                 refill_warning(&plan.zones_to_refill, applied)
@@ -842,6 +833,38 @@ impl<'a> SyncResponse<'a> {
 
 static NO_ZONES: BTreeSet<String> = BTreeSet::new();
 
+/// An uncertain commit outcome, given the pours the plan would have left
+/// stale: `zones_to_refill` and the `zones_need_refill` warning go into the
+/// error's JSON body, where a caller reads fields (step 7b review 2). A
+/// recovered batch (`ipc_batch_recovered`) is confirmed unchanged, so it gets
+/// nothing: telling the caller to refill and save would be false.
+fn with_refill_guidance(mut result: CallToolResult, zones: &BTreeSet<String>) -> CallToolResult {
+    if crate::mcp::error::extract_error_kind(&result).as_deref() != Some("ipc_outcome_unknown") {
+        return result;
+    }
+    let Some(mut warning) = refill_warning(zones, true) else {
+        return result;
+    };
+    warning["message"] = serde_json::json!(format!(
+        "If the commit took effect: {}",
+        warning["message"].as_str().unwrap_or_default()
+    ));
+    let Some(ToolContent::Text { text }) = result.content.first_mut() else {
+        return result;
+    };
+    let Ok(mut body) = serde_json::from_str::<serde_json::Value>(text) else {
+        return result;
+    };
+    if let Some(object) = body.as_object_mut() {
+        object.insert("zones_to_refill".to_string(), serde_json::json!(zones));
+        object.insert("warnings".to_string(), serde_json::json!([warning]));
+        if let Ok(serialized) = serde_json::to_string(&body) {
+            *text = serialized;
+        }
+    }
+    result
+}
+
 /// The warning for stale zone fills: before the apply it says what the apply
 /// will leave, after it what to do now.
 fn refill_warning(zones: &BTreeSet<String>, applied: bool) -> Option<serde_json::Value> {
@@ -850,7 +873,7 @@ fn refill_warning(zones: &BTreeSet<String>, applied: bool) -> Option<serde_json:
     }
     let nets = zones
         .iter()
-        .map(|net| format!("'{net}'"))
+        .map(|net| format!("{net:?}"))
         .collect::<Vec<_>>()
         .join(", ");
     let message = if applied {
@@ -1233,10 +1256,10 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 continue;
             }
             // With the live copper read, only copper of the old net reaching
-            // this pad, or a pour on either net, blocks the change; a part
-            // could otherwise never leave a busy net such as +5V (merge of the
-            // `marju212` fork, plan step 7). The pour rule is Copperpour's
-            // (#862). Without the copper, any routed net blocks.
+            // this pad, or a zone whose net cannot be read, blocks the change;
+            // a part could otherwise never leave a busy net such as +5V (merge
+            // of the `marju212` fork, plan steps 7 and 7b). Without the
+            // copper, any routed net blocks.
             // Each refusal names its cause, so the caller removes what
             // blocks rather than tracks that do not (review 3 of plan step 7).
             // A pour on either net does not block (owner ruling 2026-11-01,
@@ -6421,6 +6444,39 @@ mod tests {
         assert_eq!(refused["warnings"], serde_json::json!([]));
     }
 
+    /// An uncertain commit outcome names the pours to refill in its JSON
+    /// body; a recovered batch, confirmed unchanged, does not (step 7b review
+    /// 2: telling the caller to refill and save an unchanged board is false).
+    #[test]
+    fn only_an_uncertain_outcome_carries_the_refill_guidance() {
+        let zones = BTreeSet::from(["GND".to_string()]);
+        let body = |result: &CallToolResult| {
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text content");
+            };
+            serde_json::from_str::<serde_json::Value>(text).unwrap()
+        };
+        let uncertain = with_refill_guidance(
+            crate::tools::ipc_uncertain_result("commit reply lost"),
+            &zones,
+        );
+        assert_eq!(uncertain.content.len(), 1);
+        let uncertain = body(&uncertain);
+        assert_eq!(
+            uncertain["zones_to_refill"],
+            serde_json::json!(["GND"]),
+            "{uncertain}"
+        );
+        assert!(uncertain["warnings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("If the commit took effect:"));
+        let recovered =
+            with_refill_guidance(crate::tools::ipc_recovered_result("rolled back"), &zones);
+        let recovered = body(&recovered);
+        assert!(recovered.get("zones_to_refill").is_none(), "{recovered}");
+    }
+
     fn plan_adding(changes: Vec<PlannedChange>) -> SyncPlan {
         SyncPlan {
             status: PlanStatus::Ready,
@@ -7498,7 +7554,7 @@ mod tests {
         let warnings = refill_warnings(&plan);
         assert_eq!(warnings.len(), 1, "{plan:#}");
         assert!(
-            warnings[0].contains("'GND'") && warnings[0].contains("refill_zones"),
+            warnings[0].contains("\"GND\"") && warnings[0].contains("refill_zones"),
             "{warnings:?}"
         );
     }
