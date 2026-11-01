@@ -25,3 +25,30 @@ change and report the pours to refill, as KiCad's Update PCB does and as the `ma
 
 Gate (`logs/gate-step7b.summary`): 3,731 passed (+1), 1 failed (the known baseline failure), 110
 ignored.
+Committed as `922977f9`.
+
+## Review 1 and fix pass 1
+
+The review covered the implementation, robustness and intent viewpoints in one pass; reviews 2 and
+3 are run separately as well, as the workflow requires. Confirmed: the apply's response reports the
+plan it applied (re-planned from a fresh snapshot); `zones_to_refill` is deduplicated, records both
+nets of a pad moving between two pours, and is kept whole in `output` files; the plan revision need
+not hash it (it is derived from the zones, whose count the revision hashes). Fixed:
+
+1. **A plan refused after the pad loop** (preflight failure, stale revision) still carried
+   `zones_to_refill` and a warning saying the apply would leave fills stale. The response now names
+   no zone and no warning whenever its status is `conflict`. Test
+   `a_conflicted_response_names_no_zone_to_refill`.
+3. A test's Rule A statement still said refusing was right when a zone poured VCC, and cited two
+   removed tests: rewritten. The tool directory row now also names the unreadable-zone refusal.
+5. **An uncertain commit outcome dropped the refill**: the plan's pour nets are kept outside the IPC
+   closure, and the uncertain result gains "If the commit took effect: …" with the refill warning.
+6. The warning after the apply also names `run_drc` with `refill_zones: true`, says a saved and
+   plotted board can carry the short, and that it is reported only in this response. Refilling
+   inside the sync was not chosen by the owner; the one-time report is in `docs/BACKLOG.md`.
+7. The Rule A statement says the rule depends on a live KiCad being present, so a future file-only
+   path does not inherit it.
+8. A pour of a third net under a moved pad is not listed: `docs/BACKLOG.md`.
+
+Gate (`logs/gate-step7b-fix1.summary`): 3,732 passed (+1), 1 failed (the known baseline failure),
+110 ignored.

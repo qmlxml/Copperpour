@@ -178,6 +178,16 @@ Each entry names where it was found, what is wrong, and the condition that close
   text tools, net ties on placement, and the refresh's no-op with net ties rely on unit tests and on
   the fork's live checks. Closing condition: one live run on a board with a solder jumper.
 
+- **A stale zone fill after a sync is reported once** (step 7b): the `zones_need_refill` warning is in
+  the apply's response only; a later sync returns `noop` and nothing detects a fill left stale, which
+  a saved and plotted board then carries. Refilling inside the sync was not chosen (owner ruling
+  2026-11-01). Closing condition: a check that reports a fill older than the pads it covers, or a
+  recorded decision that the one warning suffices.
+- **A pour of a third net under a moved pad is not listed in `zones_to_refill`**, although its
+  clearance around the pad can be stale when the old and new nets' netclass clearances differ.
+  Closing condition: every zone net whose outline covers a moved pad listed, or this measured as
+  harmless on a live board.
+
 ## Test isolation and state files (found 2026-11-01)
 
 - **Tests write into the developer's real state directories.** Only

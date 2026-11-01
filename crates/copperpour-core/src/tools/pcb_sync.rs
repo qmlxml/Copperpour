@@ -576,6 +576,10 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     };
     let ipc_board = board.clone();
     let library_board = board.clone();
+    // The pour nets of the plan being applied, kept outside the IPC closure
+    // so an uncertain commit outcome can still name them (step 7b review 1).
+    let planned_refill = std::sync::Arc::new(std::sync::Mutex::new(BTreeSet::<String>::new()));
+    let planned_refill_in = planned_refill.clone();
     let result = attempt_ipc_write(
         ctx,
         &board,
@@ -640,6 +644,9 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 return Ok(sync_response(&plan, "noop", hierarchy.len(), false, &options));
             }
 
+            if let Ok(mut refill) = planned_refill_in.lock() {
+                refill.clone_from(&plan.zones_to_refill);
+            }
             let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
@@ -686,6 +693,19 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 crate::mcp::error::extract_error_kind(&result).as_deref(),
                 Some("ipc_outcome_unknown" | "ipc_batch_recovered")
             ) {
+                let mut result = result;
+                let refill = planned_refill
+                    .lock()
+                    .map(|refill| refill.clone())
+                    .unwrap_or_default();
+                if let Some(warning) = refill_warning(&refill, true) {
+                    result.content.push(ToolContent::Text {
+                        text: format!(
+                            "If the commit took effect: {}",
+                            warning["message"].as_str().unwrap_or_default()
+                        ),
+                    });
+                }
                 return Ok(result);
             }
             let message = result
@@ -801,13 +821,26 @@ impl<'a> SyncResponse<'a> {
             undo: applied.then_some("Ctrl-Z reverses the whole schematic-to-PCB update."),
             diagnostics: Cow::Borrowed(&plan.diagnostics),
             unassigned_footprints: &plan.unassigned,
-            zones_to_refill: &plan.zones_to_refill,
-            warnings: refill_warning(&plan.zones_to_refill, applied)
-                .into_iter()
-                .collect(),
+            // A conflicted plan applies nothing, whichever stage refused it
+            // (planner, preflight or a stale revision), so it leaves no fill
+            // stale (step 7b review 1).
+            zones_to_refill: if status == "conflict" {
+                &NO_ZONES
+            } else {
+                &plan.zones_to_refill
+            },
+            warnings: if status == "conflict" {
+                Vec::new()
+            } else {
+                refill_warning(&plan.zones_to_refill, applied)
+                    .into_iter()
+                    .collect()
+            },
         }
     }
 }
+
+static NO_ZONES: BTreeSet<String> = BTreeSet::new();
 
 /// The warning for stale zone fills: before the apply it says what the apply
 /// will leave, after it what to do now.
@@ -822,8 +855,11 @@ fn refill_warning(zones: &BTreeSet<String>, applied: bool) -> Option<serde_json:
         .join(", ");
     let message = if applied {
         format!(
-            "Pads changed net under zones on {nets}; their fills are stale. Run refill_zones, \
-             then save_project. Until then DRC can report shorts or unconnected items there."
+            "Pads changed net under zones on {nets}; their fills are stale. Run refill_zones \
+             (or run_drc with refill_zones: true), then save_project. Until then DRC can \
+             report shorts or unconnected items there, and a board saved and plotted with the \
+             stale fill can have a short. This is reported only in this response: a later \
+             sync does not detect a stale fill."
         )
     } else {
         format!(
@@ -6362,6 +6398,29 @@ mod tests {
         }
     }
 
+    /// A plan refused after the pad loop (a preflight failure or a stale
+    /// revision) applies nothing, so its response names no zone to refill and
+    /// carries no refill warning, while the same plan answered as ready does
+    /// (step 7b review 1).
+    #[test]
+    fn a_conflicted_response_names_no_zone_to_refill() {
+        let mut plan = plan_adding(Vec::new());
+        plan.zones_to_refill = BTreeSet::from(["GND".to_string()]);
+        let body = |status: &str| {
+            let result = sync_response(&plan, status, 1, false, &ResponseOptions::default());
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text content");
+            };
+            serde_json::from_str::<serde_json::Value>(text).unwrap()
+        };
+        let ready = body("ready");
+        assert_eq!(ready["zones_to_refill"], serde_json::json!(["GND"]));
+        assert_eq!(ready["warnings"][0]["code"], "zones_need_refill");
+        let refused = body("conflict");
+        assert_eq!(refused["zones_to_refill"], serde_json::json!([]));
+        assert_eq!(refused["warnings"], serde_json::json!([]));
+    }
+
     fn plan_adding(changes: Vec<PlannedChange>) -> SyncPlan {
         SyncPlan {
             status: PlanStatus::Ready,
@@ -7313,10 +7372,11 @@ mod tests {
     /// on. The board's R1 has its VCC pad on no net and the schematic gives
     /// it VCC, so the change starts from the empty net, the case review 1 of
     /// plan step 7 found refused: the empty name was recorded as poured.
-    /// (a) Not refusing is right: no copper touches the pad and no zone pours
-    /// VCC. (b) Refusing would be right if a zone poured VCC, or its net could
-    /// not be read (`a_pour_blocks_a_pad_moving_onto_its_net`,
-    /// `with_copper_read_a_pour_or_unreadable_zone_still_blocks`).
+    /// (a) Not refusing is right: no copper touches the pad, and the zone pours
+    /// no net, so nothing needs a refill either. (b) Refusing would be right if
+    /// copper of the pad's old net reached it, or a zone's net could not be read
+    /// (`copper_reaching_the_pad_still_blocks_the_change`,
+    /// `with_copper_read_a_pour_asks_for_a_refill_and_an_unreadable_zone_blocks`).
     #[tokio::test]
     async fn a_zone_on_no_net_does_not_block_a_pad_gaining_a_net() {
         use copperpour_ipc::gen::kiapi;
@@ -7418,7 +7478,9 @@ mod tests {
     /// `6dad58a`): moving `R1`'s `GND` pad off the `GND` pour is planned, and
     /// the pour is named for a refill. (a) Not refusing is right: a pour's
     /// fill is recomputed from the pads by `refill_zones`, as KiCad's own
-    /// Update PCB leaves it to a refill. (b) Refusing is right when a track,
+    /// Update PCB leaves it to a refill; that needs a live KiCad, which this
+    /// IPC-only tool always has. A path without one (a file-only sync) must
+    /// not inherit this rule. (b) Refusing is right when a track,
     /// arc or via of `GND` reaches the pad, or a zone's net cannot be read
     /// (`a_poured_net_with_copper_on_the_pad_still_blocks`,
     /// `a_pour_without_a_net_blocks_every_net`).
@@ -7474,7 +7536,9 @@ mod tests {
         );
         let warnings = refill_warnings(&applied);
         assert!(
-            warnings.len() == 1 && warnings[0].contains("Run refill_zones, then save_project"),
+            warnings.len() == 1
+                && warnings[0].contains("Run refill_zones")
+                && warnings[0].contains("then save_project"),
             "{warnings:?}"
         );
     }
