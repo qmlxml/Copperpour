@@ -52,3 +52,40 @@ Migration note `docs/api-migrations/footprint-net-ties-and-zone-connection.md`.
 
 Gate (`logs/gate-step7-a7886a9.summary`): 3,719 passed (+4), 1 failed (the known baseline
 failure), 110 ignored.
+Committed as `9c801a7`.
+
+## `04afb36`: not applied
+
+Zone nets are already read by Copperpour (#862, `zone_net`, test `a_zone_pours_only_its_own_net`);
+Copperpour ignores a zone on no net, where the fork's reading blocks every change. `delete_trace`
+accepting a via UUID would change what an existing public tool accepts; `delete_via` exists and
+reports `deleted_type: "via"`. (Overnight decision 16.)
+
+## `7fa1510`: a pad-net change refused only when copper reaches the pad (re-implemented)
+
+The snapshot records each pad's board position and reach (`PadReach`), and the routed copper by net
+(`RoutedCopper`: tracks and arc chords as segments, vias as discs, zone nets, an unreadable zone).
+The planner refuses when copper of the old net reaches the pad, or a zone pours either net (kept from
+Copperpour, #862; `6dad58a` waits for the owner), or a zone's net is unreadable. Without the copper
+read (a closed board, the test boards) the old rule applies. Differences from the fork:
+
+- **An arc's chords are widened by its sagitta.** The fork used the two chords alone; copper on the
+  bulge of an arc then did not count as reaching the pad, which would allow the change. Test
+  `an_arc_touches_a_pad_on_its_bulge` puts a pad on the arc 0.59 mm from both chords.
+- **A custom-shape pad counts as reached** (its primitives can extend past its anchor size), as does
+  a pad whose size cannot be read. Test `a_pad_without_a_bounded_reach_counts_as_touched`.
+- A via with no size read is given a 1 mm radius (the fork: 0.5 mm), and the largest layer size is
+  used rather than the first.
+- Pad positions are taken as board coordinates, as Copperpour's IPC client documents
+  (`get_footprint_pads_in`); the proto comment saying "relative to the parent footprint" is out of
+  date.
+- Geometry is read only from items of their declared type; the routed-net count still reads every
+  item, as before.
+
+Tests from the fork, adapted: `a_pad_no_copper_touches_may_leave_a_routed_net` (with the Rule A
+statement of when refusing would be right), `copper_reaching_the_pad_still_blocks_the_change`; new:
+`with_copper_read_a_pour_or_unreadable_zone_still_blocks`. Migration note
+`docs/api-migrations/sync-pad-net-change-by-copper-reach.md`. Not run against KiCad here (backlog).
+
+Gate (`logs/gate-step7-7fa1510.summary`): 3,724 passed (+5), 1 failed (the known baseline
+failure), 110 ignored.

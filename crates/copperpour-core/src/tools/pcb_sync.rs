@@ -128,6 +128,11 @@ struct BoardFootprint {
     /// Every pad the live footprint has, netted or not. `pad_nets` holds only
     /// pads that carry a net, so it cannot answer whether a pad exists.
     pad_numbers: BTreeSet<String>,
+    /// Where each pad sits on the board and how far its copper reaches, so a
+    /// pad-net change can be judged by the copper that touches that pad
+    /// (merge of the `marju212` fork, plan step 7). Empty when the footprint
+    /// was not read from a live board.
+    pad_reach: Vec<PadReach>,
     position: Point,
     rotation: f64,
     layer: String,
@@ -146,7 +151,107 @@ struct BoardState {
     /// Net name to the number of routed copper objects (tracks, arcs, vias,
     /// and zones) carrying the net.
     routed_nets: BTreeMap<String, usize>,
+    /// The routed copper itself, when read from a live board. Without it a
+    /// pad on a routed net cannot change net at all (the coarser rule).
+    copper: Option<RoutedCopper>,
     bounds: Bounds,
+}
+
+/// One pad's centre in board coordinates and the radius its copper reaches:
+/// half the diagonal of its largest copper shape, so a touch is never
+/// missed. `None` for a pad whose reach cannot be bounded (a custom shape,
+/// whose primitives may extend past its anchor size, or no size at all).
+#[derive(Debug, Clone, PartialEq)]
+struct PadReach {
+    number: String,
+    at: Point,
+    radius: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CopperPiece {
+    Segment { a: Point, b: Point, half_width: f64 },
+    Disc { at: Point, radius: f64 },
+}
+
+/// Tracks, arcs and vias by net, the nets that carry a copper zone, and
+/// whether a zone's net could not be read.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct RoutedCopper {
+    pieces: BTreeMap<String, Vec<CopperPiece>>,
+    zone_nets: BTreeSet<String>,
+    unreadable_zone: bool,
+}
+
+/// Slack added to every touch distance, in mm, so a track ending exactly on
+/// a pad's edge counts as touching it.
+const TOUCH_SLACK_MM: f64 = 0.01;
+
+impl RoutedCopper {
+    /// Whether copper of `net` reaches a pad of `footprint` numbered
+    /// `number`. Layers are not compared, so copper on another layer counts:
+    /// that errs towards refusing. A pad with no reach read (no geometry, a
+    /// custom shape) counts as touched.
+    fn touches_pad(&self, footprint: &BoardFootprint, number: &str, net: &str) -> bool {
+        let pads: Vec<&PadReach> = footprint
+            .pad_reach
+            .iter()
+            .filter(|pad| pad.number == number)
+            .collect();
+        if pads.is_empty() || pads.iter().any(|pad| pad.radius.is_none()) {
+            return true;
+        }
+        let Some(pieces) = self.pieces.get(net) else {
+            return false;
+        };
+        pads.iter().any(|pad| {
+            let reach = pad.radius.unwrap_or(f64::INFINITY) + TOUCH_SLACK_MM;
+            pieces.iter().any(|piece| match piece {
+                CopperPiece::Segment { a, b, half_width } => {
+                    point_segment_distance(&pad.at, a, b) <= reach + half_width
+                }
+                CopperPiece::Disc { at, radius } => {
+                    (pad.at.x - at.x).hypot(pad.at.y - at.y) <= reach + radius
+                }
+            })
+        })
+    }
+
+    /// Whether a zone pours `net`, or a zone's net could not be read.
+    fn poured(&self, net: &str) -> bool {
+        self.unreadable_zone || self.zone_nets.contains(net)
+    }
+}
+
+fn point_segment_distance(p: &Point, a: &Point, b: &Point) -> f64 {
+    let (vx, vy) = (b.x - a.x, b.y - a.y);
+    let len2 = vx * vx + vy * vy;
+    let t = if len2 == 0.0 {
+        0.0
+    } else {
+        (((p.x - a.x) * vx + (p.y - a.y) * vy) / len2).clamp(0.0, 1.0)
+    };
+    (p.x - a.x - t * vx).hypot(p.y - a.y - t * vy)
+}
+
+/// An arc as two chords (start to mid, mid to end), each widened by the
+/// arc's sagitta, the most the arc bulges past its chord start to end. The
+/// chords alone would miss copper on the bulge; widened, they cover it and
+/// err towards refusing.
+fn arc_pieces(a: Point, m: Point, b: Point, half_width: f64) -> [CopperPiece; 2] {
+    let half_width = half_width + point_segment_distance(&m, &a, &b);
+    [
+        CopperPiece::Segment {
+            a,
+            b: m,
+            half_width,
+        },
+        CopperPiece::Segment {
+            a: m,
+            b,
+            half_width,
+        },
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1010,7 +1115,23 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             if old_net == new_net {
                 continue;
             }
-            if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
+            // With the live copper read, only copper of the old net reaching
+            // this pad, or a pour on either net, blocks the change; a part
+            // could otherwise never leave a busy net such as +5V (merge of the
+            // `marju212` fork, plan step 7). The pour rule is Copperpour's
+            // (#862). Without the copper, any routed net blocks.
+            let blocked = match &board.copper {
+                Some(copper) => {
+                    copper.poured(old_net)
+                        || copper.poured(new_net)
+                        || (!old_net.is_empty() && copper.touches_pad(footprint, number, old_net))
+                }
+                None => {
+                    board.routed_nets.contains_key(old_net)
+                        || board.routed_nets.contains_key(new_net)
+                }
+            };
+            if blocked {
                 diagnostics.push(conflict(
                     "routed_pad_net_change",
                     format!(
@@ -2047,29 +2168,111 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
         .map(|net| (net.name.clone(), net.netcode))
         .collect::<BTreeMap<_, _>>();
     let mut routed_nets = BTreeMap::new();
+    let mut copper = RoutedCopper::default();
+    let mm = |v: Option<&kiapi::common::types::Vector2>| {
+        v.map(|v| Point {
+            x: copperpour_ipc::builders::nm_to_mm(v.x_nm),
+            y: copperpour_ipc::builders::nm_to_mm(v.y_nm),
+        })
+    };
+    let net_of = |net: Option<&kiapi::board::types::Net>| {
+        net.map(|net| net.name.clone())
+            .filter(|name| !name.is_empty())
+    };
+    let half = |width: Option<&kiapi::common::types::Distance>| {
+        width.map_or(0.0, |w| {
+            copperpour_ipc::builders::nm_to_mm(w.value_nm) / 2.0
+        })
+    };
+    // The geometry is read only from items of their declared type: whether
+    // a trace query also lists arcs and vias has not been measured here, and
+    // decoding one message as another would place copper at random. The
+    // routed-net count keeps reading every item, which can only refuse more.
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
         if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, track.net.as_ref());
+            if !copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Track") {
+                continue;
+            }
+            if let (Some(net), Some(a), Some(b)) = (
+                net_of(track.net.as_ref()),
+                mm(track.start.as_ref()),
+                mm(track.end.as_ref()),
+            ) {
+                copper
+                    .pieces
+                    .entry(net)
+                    .or_default()
+                    .push(CopperPiece::Segment {
+                        a,
+                        b,
+                        half_width: half(track.width.as_ref()),
+                    });
+            }
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
         if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, arc.net.as_ref());
+            if !copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Arc") {
+                continue;
+            }
+            if let (Some(net), Some(a), Some(m), Some(b)) = (
+                net_of(arc.net.as_ref()),
+                mm(arc.start.as_ref()),
+                mm(arc.mid.as_ref()),
+                mm(arc.end.as_ref()),
+            ) {
+                copper.pieces.entry(net).or_default().extend(arc_pieces(
+                    a,
+                    m,
+                    b,
+                    half(arc.width.as_ref()),
+                ));
+            }
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
         if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, via.net.as_ref());
+            if !copperpour_ipc::builders::any_is(&item, "kiapi.board.types.Via") {
+                continue;
+            }
+            if let (Some(net), Some(at)) = (net_of(via.net.as_ref()), mm(via.position.as_ref())) {
+                // The largest copper size on any layer; a via with none read
+                // is given 1 mm, larger than any standard via, so it errs
+                // towards touching.
+                let radius = via
+                    .pad_stack
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|stack| stack.copper_layers.iter())
+                    .filter_map(|layer| layer.size.as_ref())
+                    .map(|size| copperpour_ipc::builders::nm_to_mm(size.x_nm.max(size.y_nm)) / 2.0)
+                    .fold(None, |max: Option<f64>, r| {
+                        Some(max.map_or(r, |m| m.max(r)))
+                    })
+                    .unwrap_or(1.0);
+                copper
+                    .pieces
+                    .entry(net)
+                    .or_default()
+                    .push(CopperPiece::Disc { at, radius });
+            }
         }
     }
     let mut unreadable_zone = false;
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
         match zone_net(item.value.as_slice()) {
-            ZoneNet::Copper(net) => record_routed_net(&mut routed_nets, Some(&net)),
+            ZoneNet::Copper(net) => {
+                copper.zone_nets.insert(net.name.clone());
+                record_routed_net(&mut routed_nets, Some(&net))
+            }
             ZoneNet::RuleArea => {}
             ZoneNet::Unreadable => unreadable_zone = true,
         }
     }
+    copper.unreadable_zone = unreadable_zone;
     if unreadable_zone {
         // A zone whose net cannot be read could pour any net, so every pad-net
         // reassignment fails closed.
@@ -2091,6 +2294,7 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
         state: BoardState {
             footprints,
             routed_nets,
+            copper: Some(copper),
             bounds: Bounds {
                 min_x: extents.min.x,
                 min_y: extents.min.y,
@@ -2127,6 +2331,7 @@ fn board_footprint_from_instance(
         .context("KiCad returned a footprint without a definition")?;
     let mut pad_nets = BTreeMap::new();
     let mut pad_numbers = BTreeSet::new();
+    let mut pad_reach = Vec::new();
     for child in &definition.items {
         // Same discriminator as `apply_footprint_fields`, for the same
         // reason: a graphic can decode as an empty pad.
@@ -2147,6 +2352,38 @@ fn board_footprint_from_instance(
             continue;
         };
         pad_numbers.insert(pad.number.clone());
+        // Pads come back in board coordinates (`client.rs`,
+        // `get_footprint_pads_in`), so no footprint transform is applied.
+        if let Some(at) = pad.position.as_ref() {
+            use kiapi::board::types::PadStackShape;
+            let layers = pad
+                .pad_stack
+                .as_ref()
+                .map(|stack| stack.copper_layers.as_slice())
+                .unwrap_or_default();
+            let custom = layers
+                .iter()
+                .any(|layer| layer.shape() == PadStackShape::PssCustom);
+            let radius = layers
+                .iter()
+                .filter_map(|layer| layer.size.as_ref())
+                .map(|size| {
+                    copperpour_ipc::builders::nm_to_mm(size.x_nm)
+                        .hypot(copperpour_ipc::builders::nm_to_mm(size.y_nm))
+                        / 2.0
+                })
+                .fold(None, |max: Option<f64>, r| {
+                    Some(max.map_or(r, |m| m.max(r)))
+                });
+            pad_reach.push(PadReach {
+                number: pad.number.clone(),
+                at: Point {
+                    x: copperpour_ipc::builders::nm_to_mm(at.x_nm),
+                    y: copperpour_ipc::builders::nm_to_mm(at.y_nm),
+                },
+                radius: radius.filter(|_| !custom),
+            });
+        }
         if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
             pad_nets.insert(pad.number, net.name);
         }
@@ -2188,6 +2425,7 @@ fn board_footprint_from_instance(
         symbol_path: board_symbol_path(footprint.symbol_path.as_ref()),
         pad_nets,
         pad_numbers,
+        pad_reach,
         position: Point {
             x: position
                 .map(|point| copperpour_ipc::builders::nm_to_mm(point.x_nm))
@@ -3775,6 +4013,7 @@ mod tests {
                 ("2".to_string(), "GND".to_string()),
             ]),
             pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
+            pad_reach: Vec::new(),
             position: Point { x: 1.0, y: 2.0 },
             rotation: 0.0,
             layer: "F.Cu".to_string(),
@@ -3790,6 +4029,7 @@ mod tests {
         BoardState {
             footprints,
             routed_nets: BTreeMap::new(),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -3822,6 +4062,7 @@ mod tests {
                         ("2".to_string(), "GND".to_string()),
                     ]),
                     pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
+                    pad_reach: Vec::new(),
                     position: Point { x: 25.0, y: 30.0 },
                     rotation: 90.0,
                     layer: "B.Cu".to_string(),
@@ -3839,6 +4080,7 @@ mod tests {
                     symbol_path: None,
                     pad_nets: BTreeMap::new(),
                     pad_numbers: BTreeSet::new(),
+                    pad_reach: Vec::new(),
                     position: Point { x: 2.0, y: 2.0 },
                     rotation: 0.0,
                     layer: "F.Cu".to_string(),
@@ -3850,6 +4092,7 @@ mod tests {
                 },
             ],
             routed_nets: BTreeMap::new(),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -4662,6 +4905,156 @@ mod tests {
         );
     }
 
+    /// R1's pad 1 moves from VCC to BUS. `vcc` is the routed VCC copper on
+    /// the board, `zone_nets` the nets a zone pours, and `pad1` the reach
+    /// read for pad 1 (`None`: no bound, as for a custom-shape pad). After the
+    /// `marju212` fork's pad-reach rule (plan step 7).
+    fn pad_move_plan(
+        vcc: Vec<CopperPiece>,
+        zone_nets: &[&str],
+        pad1: Option<f64>,
+        unreadable_zone: bool,
+    ) -> SyncPlan {
+        let design = ExportedDesign {
+            components: vec![DesignComponent {
+                pad_nets: BTreeMap::from([
+                    ("1".to_string(), "BUS".to_string()),
+                    ("2".to_string(), "GND".to_string()),
+                ]),
+                ..resistor("R1", "/sheet/existing")
+            }],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.pad_reach = vec![
+            PadReach {
+                number: "1".to_string(),
+                at: Point { x: 0.2, y: 2.0 },
+                radius: pad1,
+            },
+            PadReach {
+                number: "2".to_string(),
+                at: Point { x: 1.8, y: 2.0 },
+                radius: Some(0.6),
+            },
+        ];
+        let mut board = board_with(vec![footprint]);
+        board.routed_nets = BTreeMap::from([("VCC".to_string(), vcc.len())]);
+        board.copper = Some(RoutedCopper {
+            pieces: BTreeMap::from([("VCC".to_string(), vcc)]),
+            zone_nets: zone_nets.iter().map(|net| net.to_string()).collect(),
+            unreadable_zone,
+        });
+        plan_sync("netlist", &design, &board)
+    }
+
+    fn far_vcc_track() -> Vec<CopperPiece> {
+        vec![CopperPiece::Segment {
+            a: Point { x: 5.0, y: 5.0 },
+            b: Point { x: 9.0, y: 5.0 },
+            half_width: 0.2,
+        }]
+    }
+
+    /// (a) Not refusing is right here: VCC is routed only far from R1's pad 1,
+    /// so moving the pad strands no copper and KiCad's Update PCB would make
+    /// the same change. Before this rule a part could never leave a routed
+    /// net such as +5V. (b) Refusing is right when copper of VCC reaches the
+    /// pad, when a zone pours VCC or BUS, or when a zone's net is unreadable,
+    /// which the tests below assert.
+    #[test]
+    fn a_pad_no_copper_touches_may_leave_a_routed_net() {
+        let plan = pad_move_plan(far_vcc_track(), &[], Some(0.6), false);
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert!(!plan
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "routed_pad_net_change"));
+    }
+
+    #[test]
+    fn copper_reaching_the_pad_still_blocks_the_change() {
+        let track = vec![CopperPiece::Segment {
+            a: Point { x: -3.0, y: 2.0 },
+            b: Point { x: 0.2, y: 2.0 },
+            half_width: 0.2,
+        }];
+        assert_eq!(
+            pad_move_plan(track, &[], Some(0.6), false).status,
+            PlanStatus::Conflict
+        );
+        let via = vec![CopperPiece::Disc {
+            at: Point { x: 0.2, y: 3.0 },
+            radius: 0.45,
+        }];
+        assert_eq!(
+            pad_move_plan(via, &[], Some(0.6), false).status,
+            PlanStatus::Conflict
+        );
+    }
+
+    /// Copperpour's rule (#862) stays with the copper read: a pour on the old
+    /// or new net refuses, as does a zone whose net cannot be read.
+    #[test]
+    fn with_copper_read_a_pour_or_unreadable_zone_still_blocks() {
+        for zones in [&["VCC"][..], &["BUS"][..]] {
+            assert_eq!(
+                pad_move_plan(far_vcc_track(), zones, Some(0.6), false).status,
+                PlanStatus::Conflict,
+                "{zones:?}"
+            );
+        }
+        assert_eq!(
+            pad_move_plan(far_vcc_track(), &[], Some(0.6), true).status,
+            PlanStatus::Conflict
+        );
+    }
+
+    /// A pad whose reach cannot be bounded (custom shape) counts as touched.
+    #[test]
+    fn a_pad_without_a_bounded_reach_counts_as_touched() {
+        assert_eq!(
+            pad_move_plan(far_vcc_track(), &[], None, false).status,
+            PlanStatus::Conflict
+        );
+    }
+
+    /// An arc bulges past its chords: a pad on the bulge is touched although
+    /// both chords (start to mid, mid to end) pass about 0.59 mm from it.
+    #[test]
+    fn an_arc_touches_a_pad_on_its_bulge() {
+        // Semicircle of radius 2 around (0.2, 4.0), from (-1.8, 4) through
+        // (0.2, 2) to (2.2, 4). The pad at (1.614, 2.586) sits on the arc
+        // itself, 2.0 mm from the centre.
+        let pieces = arc_pieces(
+            Point { x: -1.8, y: 4.0 },
+            Point { x: 0.2, y: 2.0 },
+            Point { x: 2.2, y: 4.0 },
+            0.1,
+        );
+        let pad = Point { x: 1.614, y: 2.586 };
+        for piece in &pieces {
+            if let CopperPiece::Segment { a, b, .. } = piece {
+                assert!(
+                    point_segment_distance(&pad, a, b) > 0.5,
+                    "a chord alone misses"
+                );
+            }
+        }
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.pad_reach = vec![PadReach {
+            number: "1".to_string(),
+            at: pad,
+            radius: Some(0.1),
+        }];
+        let copper = RoutedCopper {
+            pieces: BTreeMap::from([("VCC".to_string(), pieces.to_vec())]),
+            ..Default::default()
+        };
+        assert!(copper.touches_pad(&footprint, "1", "VCC"));
+    }
+
     #[test]
     fn removing_a_pad_from_a_routed_net_conflicts_the_whole_plan() {
         let design = ExportedDesign {
@@ -4681,6 +5074,7 @@ mod tests {
                 symbol_path: Some("/sheet/existing".to_string()),
                 pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
                 pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
+                pad_reach: Vec::new(),
                 position: Point { x: 1.0, y: 2.0 },
                 rotation: 0.0,
                 layer: "F.Cu".to_string(),
@@ -4691,6 +5085,7 @@ mod tests {
                 fields: BTreeMap::new(),
             }],
             routed_nets: BTreeMap::from([("VCC".to_string(), 1)]),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -4865,6 +5260,7 @@ mod tests {
         let board = BoardState {
             footprints: Vec::new(),
             routed_nets: BTreeMap::new(),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
