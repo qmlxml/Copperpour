@@ -40,3 +40,11 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
    true`. Several `.kicad_pro` files beside the DSN are refused.
 10. **Every part a built-in CPL rule rotated is listed in the review warnings** (designator overrides
     and project rules are not).
+
+## Step 6 (wilfredo-a14)
+
+11. **`f517fd8` and `d2961f4` were not merged.** They depend on a modified KiCad build ("the fredo
+    fork": an API Activity panel and custom IPC commands) and post an AI coding client's shell commands to
+    KiCad. Merge them only if the fork should depend on that KiCad build: cherry-pick both.
+12. **`c2143d2` was reverted** as superseded by Copperpour's own custom-field support (it wrote
+    fields twice).
