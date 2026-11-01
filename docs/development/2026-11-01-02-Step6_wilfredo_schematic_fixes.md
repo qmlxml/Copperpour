@@ -59,7 +59,7 @@ reported back and the read-back compares against what was written. Findings and 
    symbols as global. Test `only_power_local_symbols_are_reported_local`.
 2. **`apply_template` took the pins it asked to wire as wired**, ignoring the batch call's per-pin
    errors, and a failure on one net did not say which nets were already written. The wired set now
-   comes from each batch call's `added` list; its `errors` are reported in `unresolved_connections`;
+   comes from each batch call's `added` list; its `errors` are reported in `connections_unresolved`;
    the failure names the nets already written.
 3. **The merged template test wrote into the real `~/.copperpour/templates`** of the machine running
    the tests (the adaptation commit had removed the contributor's isolation). It now runs through
@@ -95,7 +95,7 @@ hierarchy and multi-instance sheets; kicad-cli on the live file without kill on 
 
 1. **A coordinate above about 1.8e302 was written as `inf`**, which KiCad cannot load (measured: exit
    3). The sheet tools now refuse `x`, `y`, `width` or `height` beyond ±100,000 mm
-   (`coordinate_out_of_range`).
+   as an invalid argument naming the field (function `coordinate_out_of_range`).
 2. **Shrinking a sheet could move a pin onto the corner where a pin of the other edge was**, joining
    their nets. `edit_sheet` now refuses a resize that puts two pins on one point.
 3. **The hierarchy summary hid a missing child sheet** (kicad-cli exits 0 with no message; measured):
@@ -156,3 +156,14 @@ Findings and what was done:
 
 Gate after fix pass 3 (`logs/gate-step6-fix3.summary`): 3,704 passed (+1), 1 failed (the known
 baseline failure), 110 ignored.
+
+## Documentation review
+
+An independent check of the step log, the plan's "Step 6 as shipped", overnight decisions 11–14,
+the migration note and the tool directory confirmed hashes, commit counts, gate totals, and test,
+function and field names. Corrected: the migration note still said restating an off-grid position
+moves the sheet (review 3 changed that) and named the argument `net_map` (it is `net_mappings`);
+this log named `unresolved_connections` in one place; the coordinate refusal is an invalid argument,
+not a code; the tool directory and migration note now list the review 2 refusals, the hierarchy
+summary's warnings and that its scope runs kicad-cli. "honest no-op" in the `edit_sheet_pin` row
+replaced with a literal description.
