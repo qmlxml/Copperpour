@@ -85,3 +85,11 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
     of taking it from the library alone (which matched neither of KiCad's two modes). The other
     option was a new argument taking the whole group from the library, as KiCad's "Update clearance
     overrides" does; not added overnight because it is new public API.
+
+### Owner rulings, 2026-11-01 morning
+
+- **Decision 15 (pour blocks a pad-net change): allow it and report the pours to refill**, as
+  KiCad's Update PCB does and as fork commit `6dad58a` does. `zones_to_refill` is reported in the dry
+  run and after apply, as a warning naming `refill_zones`; tracks, arcs and vias of the old net
+  reaching the pad, and an unreadable zone, still refuse. To be implemented as plan step 7b with the
+  full cycle.
