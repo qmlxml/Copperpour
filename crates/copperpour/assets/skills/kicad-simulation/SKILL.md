@@ -24,12 +24,12 @@ load_toolset('simulation')    # check_simulation_readiness, run_simulation
 ## Workflow
 
 1. Save the schematic. Unsaved editor changes are not seen.
-2. Run `check_simulation_readiness`. `ready: true` means it can run. `ready: false` names what stops it. `ready: null` means a check could not run.
+2. Run `check_simulation_readiness`. `ready: true` means it can run. `ready: false` names what stops it. `ready: null` means a check could not run. Read its `warnings` too: `not_in_spice_netlist` names parts KiCad left out for a reason the schematic does not show; tell the person before running.
 3. Fix what it names, using its `suggested_fix` on each unmodelled symbol.
 4. Run `run_simulation` with one analysis:
    - `{ "kind": "operating_point" }` for DC levels.
    - `{ "kind": "transient", "stop_time_seconds": 0.14 }` for inrush, load steps and anything over time.
-5. Report the results, and state `simulated_circuit` if it is `modified`.
+5. Report the results, and state `simulated_circuit` if it is `modified`. Name by reference every part the result does not cover (`circuit.excluded_in_schematic`, `circuit.not_in_spice_netlist`, `circuit.excluded_references`) and say the result is not evidence about them; for `not_in_spice_netlist`, also say the cause is not known and the schematic should be checked.
 
 ## Transient Runs
 
@@ -217,7 +217,7 @@ Nothing in `testbench` touches the schematic. Use the `spice_name` values from r
 - **`finding: "signal_not_found"`:** the run does not hold that signal. Only voltage sources keep their currents in circuits with digital parts, or with `.ic` or `.nodeset` under `use_initial_conditions`, and `device_currents_not_saved` says which. Digital nets have no `v()`.
 - **`simulated_circuit`:** `modified` means parts were excluded (by `exclude_references`, or by the schematic's own "exclude from simulation" on a symbol or a sheet, listed in `circuit.excluded_in_schematic`), missing from KiCad's SPICE netlist for a reason the schematic does not show (listed in `circuit.not_in_spice_netlist`), or added. Never present such a result as describing the schematic as drawn.
 - **`circuit.approximations`:** parts whose behaviour rests on an assumption, such as a varistor at its library default or a thermistor as an ideal resistor. A result with an approximation on a protection or inrush part is not evidence about that part; say so.
-- **`warnings`:** read them before reporting a result. `engine_messages` lists what ngspice ignored or changed, which can alter the circuit. `device_currents_not_saved` means only node voltages and voltage source currents were saved. `excluded_in_schematic` names parts that were not simulated. `testbench_elements_added` means results depend on lines you added, such as a stand-in: they describe those lines, not a real part. `control_block_dropped` means the schematic's `.control` block, which can change the circuit, was not run. `schematic_open_in_editor` means KiCad has the schematic open, and the result reflects the saved files, not unsaved edits.
+- **`warnings`:** read them before reporting a result. `engine_messages` lists what ngspice ignored or changed, which can alter the circuit. `device_currents_not_saved` means only node voltages and voltage source currents were saved. `excluded_in_schematic` names parts the schematic excludes from simulation; `not_in_spice_netlist` names parts left out for a reason the schematic does not show; `sheets_not_read` names sheet files whose flags could not be read. None of these parts was simulated. `testbench_elements_added` means results depend on lines you added, such as a stand-in: they describe those lines, not a real part. `control_block_dropped` means the schematic's `.control` block, which can change the circuit, was not run. `schematic_open_in_editor` means KiCad has the schematic open, and the result reflects the saved files, not unsaved edits.
 - **`operating_point.rows`:** currents read positive into a device's first pin, so a delivering source reads negative.
 - **Full data:** `artifacts.table_path` holds every row, and `artifacts.deck_path` holds the deck that ran.
 

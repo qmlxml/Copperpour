@@ -244,7 +244,9 @@ pub(crate) struct NetEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ElementEntry {
     pub reference: String,
-    /// Null when the symbol has no line in the deck: excluded from simulation.
+    /// Null when the symbol has no line in the deck: excluded by the schematic
+    /// (see `excluded_in_schematic`), by `exclude_references` (`excluded`), or
+    /// left out for a reason not known (`not_in_spice_netlist`).
     pub element_name: Option<String>,
     pub modelled: bool,
     pub excluded: bool,

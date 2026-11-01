@@ -1336,11 +1336,15 @@ impl RunEnd<'_> {
         if !self.design.not_in_spice_netlist.is_empty() {
             warnings.push(json!({
                 "code": "not_in_spice_netlist",
-                "detail": "These parts have no line in KiCad's SPICE netlist for a reason the \
-                           schematic does not show (neither their symbol nor their sheet is marked \
-                           exclude from simulation), so they were not simulated. The result is not \
-                           evidence about them.",
+                "detail": NOT_IN_SPICE_DETAIL,
                 "items": self.design.not_in_spice_netlist,
+            }));
+        }
+        if !self.design.sheets_not_read.is_empty() {
+            warnings.push(json!({
+                "code": "sheets_not_read",
+                "detail": SHEETS_NOT_READ_DETAIL,
+                "items": self.design.sheets_not_read,
             }));
         }
         if !self.request.testbench.spice_lines.is_empty() {
@@ -1582,10 +1586,13 @@ struct Design {
     /// merged (plan step 4, review 3): such parts used to vanish while the
     /// result still read `as_drawn`.
     excluded_in_schematic: Vec<String>,
-    /// Parts in KiCad's netlist with no line in its SPICE netlist whose
-    /// symbol is not flagged `exclude_from_sim`: usually a part with no model
-    /// (owner review of overnight decision 1).
+    /// Parts in KiCad's netlist with no line in its SPICE netlist for a
+    /// reason the schematic does not show: neither their symbol nor a sheet on
+    /// their path carries a flag Copperpour found (owner review of overnight
+    /// decision 1; step 4b).
     not_in_spice_netlist: Vec<String>,
+    /// Sheet files whose flags could not be read (see `SimExclusions`).
+    sheets_not_read: Vec<String>,
     preflight: Option<Preflight>,
     project_dir: PathBuf,
     inputs_hash: String,
@@ -1672,6 +1679,11 @@ fn allowed_roots(project_dir: &Path, model_dirs: &[PathBuf]) -> (Vec<PathBuf>, V
 struct SimExclusions {
     symbols: std::collections::HashSet<String>,
     sheets: std::collections::HashSet<String>,
+    /// Sheet files that could not be read or parsed, relative to the
+    /// snapshot: their flags are unknown, so parts on them may be reported as
+    /// `not_in_spice_netlist` although the schematic excludes them (step 4b
+    /// review 3).
+    unread: Vec<String>,
 }
 
 impl SimExclusions {
@@ -1689,9 +1701,9 @@ impl SimExclusions {
     }
 }
 
-fn sim_exclusions(dir: &Path) -> SimExclusions {
+fn sim_exclusions(root: &Path) -> SimExclusions {
     let mut found = SimExclusions::default();
-    let mut stack = vec![dir.to_path_buf()];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -1709,6 +1721,12 @@ fn sim_exclusions(dir: &Path) -> SimExclusions {
                 .ok()
                 .and_then(|text| copperpour_sexp::parse_sexp(&text).ok())
             else {
+                found.unread.push(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
                 continue;
             };
             // Placed symbols and sheets are direct children of the sheet;
@@ -1726,6 +1744,16 @@ fn sim_exclusions(dir: &Path) -> SimExclusions {
     }
     found
 }
+
+const NOT_IN_SPICE_DETAIL: &str = "These parts have no line in KiCad's SPICE netlist, and \
+    Copperpour found no exclude-from-simulation flag for them (on the symbol, a sheet on their \
+    path, or the older Sim.Enable and Spice_Netlist_Enabled fields), so why they were left out is \
+    not known. They were not simulated, and the result is not evidence about them. Check them in \
+    the schematic.";
+
+const SHEETS_NOT_READ_DETAIL: &str = "These sheet files could not be read for their \
+    exclude-from-simulation flags, so parts on them may be listed as not_in_spice_netlist \
+    although the schematic excludes them.";
 
 /// Whether a placed symbol or sheet is excluded from simulation by the
 /// schematic: `(exclude_from_sim yes)`, or one of the older per-symbol fields
@@ -1849,11 +1877,14 @@ async fn inspect_design(
     // from the snapshot's sheet files and matched by symbol and sheet UUID.
     let (excluded_in_schematic, not_in_spice_netlist) =
         split_missing_parts(&kicad, &elements, &exclusions);
+    let mut sheets_not_read = exclusions.unread;
+    sheets_not_read.sort();
     let inlined = deck.as_ref().map_or(&[][..], |deck| &deck.inlined_files);
     let inputs_hash = inputs_hash(sources_hash, inlined)?;
     Ok(Design {
         excluded_in_schematic,
         not_in_spice_netlist,
+        sheets_not_read,
         compatibility,
         inputs_hash,
         project_dir,
@@ -2000,6 +2031,29 @@ fn readiness_report(
             report["not_in_spice_netlist"] =
                 json!(listing(design.not_in_spice_netlist.iter(), limit));
         }
+        // Not a reason to refuse (the run tools do not), but a warning the
+        // caller reads before running, as the run tools give (step 4b review 3).
+        let mut extra = Vec::new();
+        if !design.not_in_spice_netlist.is_empty() {
+            extra.push(json!({
+                "code": "not_in_spice_netlist",
+                "detail": NOT_IN_SPICE_DETAIL,
+                "items": listing(design.not_in_spice_netlist.iter(), limit),
+            }));
+        }
+        if !design.sheets_not_read.is_empty() {
+            extra.push(json!({
+                "code": "sheets_not_read",
+                "detail": SHEETS_NOT_READ_DETAIL,
+                "items": listing(design.sheets_not_read.iter(), limit),
+            }));
+        }
+        if !extra.is_empty() {
+            match report["warnings"].as_array_mut() {
+                Some(warnings) => warnings.extend(extra),
+                None => report["warnings"] = json!(extra),
+            }
+        }
         report["source_evidence"] = json!({
             "excludes_unsaved_editor_state": true,
             "locks_present": design.locks_present,
@@ -2125,6 +2179,8 @@ mod tests {
             set(&["u-flagged", "u-child", "u-sim-off", "u-legacy"])
         );
         assert_eq!(found.sheets, set(&["s-off"]));
+        // A sheet whose flags could not be read is named (step 4b review 3).
+        assert_eq!(found.unread, ["broken.kicad_sch"]);
     }
 
     /// The split, without kicad-cli (step 4b review 1), on the shapes
@@ -2179,6 +2235,7 @@ mod tests {
                 .map(str::to_string)
                 .collect(),
             sheets: ["s-v"].into_iter().map(str::to_string).collect(),
+            unread: Vec::new(),
         };
         let (excluded, unexplained) = split_missing_parts(&kicad, &elements, &exclusions);
         assert_eq!(excluded, ["C201", "C301", "U201", "R401"]);
@@ -2282,6 +2339,7 @@ mod tests {
             excluded_references: Vec::new(),
             excluded_in_schematic: Vec::new(),
             not_in_spice_netlist: Vec::new(),
+            sheets_not_read: Vec::new(),
             preflight: None,
             project_dir: PathBuf::new(),
             inputs_hash: String::new(),

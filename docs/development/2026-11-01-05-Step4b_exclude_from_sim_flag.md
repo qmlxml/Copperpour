@@ -79,3 +79,28 @@ written outside it, and there are no symlinks); KiCad refuses `exclude_from_sim`
 
 Gate (`logs/gate-step4b-fix2.summary`): 3,737 passed, 1 failed (the known baseline failure), 112
 ignored (+1, the new live test).
+Committed as `5142f1ca`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+1. **Readiness said nothing about an unexplained part** beyond a top-level list, while the skill
+   tells the LLM that `ready: true` means it can run. The readiness report now adds a
+   `not_in_spice_netlist` warning with the run tools' text (readiness still does not refuse, as the
+   run tools do not), and the skill's step 2 tells the LLM to tell the person before running. Not
+   covered by a live test: in every measured case a part missing from the SPICE netlist had a flag
+   behind it, so no known schematic produces an unexplained part.
+2. **A sheet file Copperpour could not parse was skipped silently**, and the warning then stated as
+   fact that its parts carry no flag. `sim_exclusions` now names such files; both tools report them
+   under the warning `sheets_not_read`, and the `not_in_spice_netlist` text says Copperpour found no
+   flag, so the cause is not known. Unit test asserts the unread file is named.
+3. The skill's step 5 now requires naming, by reference, every part the result does not cover, and
+   its `warnings` bullet describes all three codes.
+4. and 5. Two stale comments corrected (`Design::not_in_spice_netlist`, `ElementEntry::element_name`).
+6. The run tools list every part; the readiness report bounds its lists by `limit`: documented in the
+   migration note.
+7. The migration note says neither list changes `ready`.
+
+The first gate runs failed the documentation test on the skill's `sheets_not_read` and
+`excluded_references` (a warning code and a result field); both were added to `NOT_TOOLS`. Gate
+(`logs/gate-step4b-fix3.summary`): 3,737 passed, 1 failed (the known baseline failure), 112
+ignored.

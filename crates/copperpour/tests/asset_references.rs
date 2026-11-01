@@ -781,6 +781,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // Warning codes added when merged (plan step 4, review 3).
         "excluded_in_schematic",
         "not_in_spice_netlist",
+        "sheets_not_read",
+        "excluded_references",
         "testbench_elements_added",
         "control_block_dropped",
         "schematic_open_in_editor",

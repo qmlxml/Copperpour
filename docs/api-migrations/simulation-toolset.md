@@ -12,7 +12,7 @@ and `ngspice_model_dirs`. A stopped run's `stopped` object may carry `node` (ngs
 `Spice_Netlist_Enabled` "N" that KiCad 10 still honours, or on a sheet instance that holds it) in
 `circuit.excluded_in_schematic`, and any other part with no line in KiCad's SPICE netlist, for a
 reason the schematic does not show, in `circuit.not_in_spice_netlist`; either makes the circuit
-read `modified`. The readiness report lists both. Results may carry the warnings
-`excluded_in_schematic`, `not_in_spice_netlist`, `testbench_elements_added`,
+read `modified`. The readiness report lists both and, for `not_in_spice_netlist`, adds a warning of that code; neither list changes `ready`. A sheet file whose flags could not be read is named under the warning `sheets_not_read`, in both tools. The run tools list every part; the readiness report bounds its lists by `limit`. Results may carry the warnings
+`excluded_in_schematic`, `not_in_spice_netlist`, `sheets_not_read`, `testbench_elements_added`,
 `control_block_dropped` and `schematic_open_in_editor`. Nothing existing changes; callers need
 no action.
