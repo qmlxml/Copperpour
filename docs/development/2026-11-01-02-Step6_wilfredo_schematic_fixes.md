@@ -45,3 +45,42 @@ A process slip, recorded: a first `git revert` was refused because the adaptatio
 yet committed, and the `git commit --amend` that followed rewrote the previous commit's message.
 The branch was reset to the original commit (`f68faec`) before anything else was committed; the
 edits were then committed on their own and the revert redone.
+Committed as `5e851e9` (step log), with the merge commits before it.
+
+## Review 1 (implementation, focused on the merge) and fix pass 1
+
+Confirmed correct: `along_stub` in `impl StubDirection` and called by both connect tools; the
+duplicate offset; the schema descriptions; the revert left nothing behind; snapped coordinates are
+reported back and the read-back compares against what was written. Findings and what was done:
+
+1. **`(power local)` symbols were judged as global rails** in the power-rail audit, so a local
+   `+3V3` on one sheet could hide another sheet's missing decoupling. New
+   `copperpour_sexp::schematic::local_power_symbol_uuids`; `power_rails` does not count those
+   symbols as global. Test `only_power_local_symbols_are_reported_local`.
+2. **`apply_template` took the pins it asked to wire as wired**, ignoring the batch call's per-pin
+   errors, and a failure on one net did not say which nets were already written. The wired set now
+   comes from each batch call's `added` list; its `errors` are reported in `unresolved_connections`;
+   the failure names the nets already written.
+3. **The merged template test wrote into the real `~/.copperpour/templates`** of the machine running
+   the tests (the adaptation commit had removed the contributor's isolation). It now runs through
+   Copperpour's `in_isolated_home`, as the other fixture tests do. The two files this session's test
+   runs had left there (`one_resistor.json`, `pullups.json`, both test fixtures) were deleted.
+4. **The stranded-pin check compared against unrounded sums** (49.53 + 48.26 = 97.78999999999999), so
+   a pin exactly on the new edge was refused, and it also ran when the size did not change. The
+   edges are rounded as KiCad writes them, and the check runs only on a real resize.
+5. **`edit_sheet_pin` with `side` alone could clamp two pins onto one corner**, joining their nets.
+   A move onto another pin's point is now refused, naming that pin.
+6. **No migration note or tool-directory change** for the caller-visible changes: added
+   `docs/api-migrations/schematic-sheet-and-template-fixes.md` and updated eight tool rows
+   (`export_netlist_summary` no longer says it never needs kicad-cli).
+7. **A malformed `schematic_scope` was read as `"file"`**: now refused. Test
+   `a_schematic_scope_that_is_not_a_string_is_refused`.
+8, 9. Recorded in `docs/BACKLOG.md`: no response field says an input was snapped, and snapping only
+   the size of an off-grid sheet leaves two edges off the grid; and `apply_template`'s wiring finds
+   pins by reference, so a `ref_start` colliding with an existing part also wires that part.
+
+Not covered by new tests: 2, 4 and 5 (they need hierarchy or template fixtures that the existing
+tests do not set up for these cases).
+
+Gate after fix pass 1 (`logs/gate-step6-fix1.summary`): 3,703 passed (+2), 1 failed (the known
+baseline failure), 109 ignored. After the full run, `~/.copperpour/templates` does not exist.

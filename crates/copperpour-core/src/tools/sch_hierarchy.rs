@@ -2266,18 +2266,26 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         // Like eeschema, never shrink the box past a pin: clamping two pins
         // onto the same corner would join their nets on the parent sheet.
         let (left, top) = sheet.position();
+        // Edges rounded as KiCad writes coordinates: 49.53 + 48.26 is
+        // 97.78999999999999 in binary, which refused a pin exactly on the new
+        // edge (merge review, plan step 6). An unchanged size is not checked,
+        // so restating it never refuses a file that already has such a pin.
+        let round6 = copperpour_sexp::geometry::round6;
+        let (bottom, right) = (round6(top + h), round6(left + w));
+        let resizing = sheet.width != w || sheet.height != h;
         let mut too_short = false;
         let stranded: Vec<String> = sheet
             .pins
             .iter()
+            .filter(|_| resizing)
             .filter(|pin| {
                 let rotation = pin.at.rotation.unwrap_or(0.0).rem_euclid(360.0).round();
                 if rotation == 0.0 || rotation == 180.0 {
-                    let past = pin.at.y > top + h;
+                    let past = round6(pin.at.y) > bottom;
                     too_short |= past;
                     past
                 } else {
-                    pin.at.x > left + w
+                    round6(pin.at.x) > right
                 }
             })
             .map(|pin| format!("{} at ({}, {})", pin.name, pin.at.x, pin.at.y))
@@ -3165,6 +3173,16 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     };
     let sheet_uuid = sheet.uuid.clone();
     let sheet_box = SheetBox::of(sheet);
+    // Where the sheet's other pins are, so a move cannot put two pins on one
+    // point, which joins their nets on the parent sheet (merge review, plan
+    // step 6: moving with `side` alone clamps onto a corner).
+    let round6 = copperpour_sexp::geometry::round6;
+    let other_pins: Vec<(String, f64, f64)> = sheet
+        .pins
+        .iter()
+        .filter(|other| other.name != pin_name)
+        .map(|other| (other.name.clone(), round6(other.at.x), round6(other.at.y)))
+        .collect();
     let pin = match sheet.pin_by_name_mut(&pin_name) {
         Some(p) => p,
         None => {
@@ -3235,6 +3253,20 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         if pin.at.rotation != Some(rotation) {
             pin.at.rotation = Some(rotation);
             changed.push("side");
+        }
+    }
+
+    if changed.contains(&"position") {
+        let (x, y) = (round6(pin.at.x), round6(pin.at.y));
+        if let Some((other, _, _)) = other_pins.iter().find(|(_, ox, oy)| *ox == x && *oy == y) {
+            return Ok(invalid_arg(
+                if position.0.is_some() { "x" } else { "side" },
+                &format!(
+                    "pin '{pin_name}' would land at ({x}, {y}), where pin '{other}' already is; \
+                     two pins on one point join their nets on the parent sheet. Give x and y \
+                     for a free place on that edge"
+                ),
+            ));
         }
     }
 

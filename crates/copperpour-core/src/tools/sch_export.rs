@@ -559,7 +559,19 @@ async fn handle_export_netlist_summary(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    match args["schematic_scope"].as_str().unwrap_or("file") {
+    // A present value that is not a string is refused, not read as "file"
+    // (merge review, plan step 6).
+    let scope = match &args["schematic_scope"] {
+        serde_json::Value::Null => "file",
+        serde_json::Value::String(scope) => scope.as_str(),
+        _ => {
+            return Ok(super::invalid_arg(
+                "schematic_scope",
+                "must be the string 'file' or 'hierarchy'",
+            ))
+        }
+    };
+    match scope {
         "file" => {}
         "hierarchy" => return hierarchy_netlist_summary(&sch_path, ctx).await,
         other => {
@@ -1350,6 +1362,25 @@ mod netlist_summary_tests {
     /// The rail is the case that used to disappear.
     const SCH: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
     const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+
+    #[tokio::test]
+    async fn a_schematic_scope_that_is_not_a_string_is_refused() {
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_export_netlist_summary(
+            &json!({ "schematic": "/nowhere/top.kicad_sch", "schematic_scope": 5 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert!(text.contains("schematic_scope"), "{text}");
+    }
 
     async fn summary(content: &str) -> serde_json::Value {
         let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();

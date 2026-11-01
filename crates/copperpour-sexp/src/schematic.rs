@@ -1095,6 +1095,31 @@ pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
     labels
 }
 
+/// UUIDs of placed power symbols whose library symbol is `(power local)`
+/// (KiCad 9 and later): unlike `(power)` / `(power global)`, each sheet's
+/// local power net is separate, so such a symbol must not be judged as a
+/// global rail (added when merged, plan step 6, review 1).
+pub fn local_power_symbol_uuids(tree: &SexpNode) -> std::collections::HashSet<String> {
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+    let mut local = std::collections::HashSet::new();
+    for inst in extract_symbol_instances(tree) {
+        let Some(sym) = find_lib_symbol(&lib_syms, &inst) else {
+            continue;
+        };
+        let is_local = sym
+            .find("power")
+            .and_then(|power| power.children())
+            .is_some_and(|children| children.iter().any(|child| child.as_str() == Some("local")));
+        if let (true, Some(uuid)) = (is_local, inst.uuid.clone()) {
+            local.insert(uuid);
+        }
+    }
+    local
+}
+
 // ─── Pin in library symbol ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -2255,5 +2280,30 @@ mod pin_label_rotation_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod local_power_tests {
+    use super::*;
+
+    #[test]
+    fn only_power_local_symbols_are_reported_local() {
+        let text = r##"(kicad_sch
+  (lib_symbols
+    (symbol "power:+3V3" (power local)
+      (symbol "+3V3_1_1" (pin power_in line (at 0 0 90) (length 0) (name "+3V3") (number "1"))))
+    (symbol "power:GND" (power)
+      (symbol "GND_1_1" (pin power_in line (at 0 0 270) (length 0) (name "GND") (number "1")))))
+  (symbol (lib_id "power:+3V3") (at 10 10 0) (unit 1)
+    (property "Reference" "#PWR01" (at 0 0 0)) (property "Value" "+3V3" (at 0 0 0))
+    (uuid "11111111-1111-1111-1111-111111111111"))
+  (symbol (lib_id "power:GND") (at 20 20 0) (unit 1)
+    (property "Reference" "#PWR02" (at 0 0 0)) (property "Value" "GND" (at 0 0 0))
+    (uuid "22222222-2222-2222-2222-222222222222")))"##;
+        let tree = crate::parse_sexp(text).unwrap();
+        let local = local_power_symbol_uuids(&tree);
+        assert_eq!(local.len(), 1, "{local:?}");
+        assert!(local.contains("11111111-1111-1111-1111-111111111111"));
     }
 }

@@ -101,6 +101,17 @@ Each entry names where it was found, what is wrong, and the condition that close
   non-zero correction are now listed for review (plan step 5, review 2). Closing condition: a
   bottom-side observation per rule, recorded in the policy.
 
+## Schematic sheets and templates (plan step 6)
+
+- **No response field says a sheet's position or size was snapped to the grid**, and snapping only
+  the size of an off-grid sheet leaves its right and bottom edges off the grid. Closing condition: a
+  `snapped` field, and all four edges on the grid.
+- **`apply_template` wires pins by reference name**, so a `ref_start` that collides with an existing
+  part also wires that part's pins. Closing condition: the refusal of a colliding `ref_start`, or
+  wiring by the placed instances' UUIDs.
+- **`f517fd8` and `d2961f4` from wilfredo-a14/agent-hub were not merged** (activity reporting to,
+  and editor control of, a modified KiCad build). Closing condition: an owner decision.
+
 ## Custom-shape pads (plan step 1, not merged)
 
 - **Footprints with custom-shape pads cannot be placed** (about 3.9% of KiCad's library). KiCad's

@@ -433,7 +433,11 @@ async fn handle_audit_power_rails_file(
     let mut finding_rails: Vec<&PowerRail> = Vec::new();
 
     // Find all power nets (from power symbols and labels)
-    let rails = power_rails(&mut graph, &labels);
+    let rails = power_rails(
+        &mut graph,
+        &labels,
+        &copperpour_sexp::schematic::local_power_symbol_uuids(&tree),
+    );
 
     // Check each power net for bulk capacitance
     let (cap_roots, bulk_cap_roots) = capacitor_nets(&mut graph, &placed);
@@ -1760,7 +1764,11 @@ impl PowerRail {
 /// made every audit below report the name the capacitors did not resolve to as
 /// a rail with nothing on it. The name is [`NetGraph::name_of_root`]'s, so it is
 /// the one KiCad's netlister would print.
-fn power_rails(graph: &mut NetGraph, labels: &[Label]) -> Vec<PowerRail> {
+fn power_rails(
+    graph: &mut NetGraph,
+    labels: &[Label],
+    local_power: &std::collections::HashSet<String>,
+) -> Vec<PowerRail> {
     // Which nets are rails, and what each is known as, are separate questions,
     // asked in that order. Collecting names while deciding made the answer
     // depend on label order: a rail claimed by the `+3V3` symbol lost the `VCC`
@@ -1768,7 +1776,13 @@ fn power_rails(graph: &mut NetGraph, labels: &[Label]) -> Vec<PowerRail> {
     let mut rail_roots: BTreeSet<NetRoot> = BTreeSet::new();
     let mut global_roots: BTreeSet<NetRoot> = BTreeSet::new();
     for label in labels {
-        let global = matches!(label.kind, LabelKind::PowerSymbol | LabelKind::GlobalLabel);
+        // A `(power local)` symbol names a net of its own sheet only.
+        let local = label
+            .uuid
+            .as_ref()
+            .is_some_and(|uuid| local_power.contains(uuid));
+        let global =
+            matches!(label.kind, LabelKind::PowerSymbol | LabelKind::GlobalLabel) && !local;
         if global {
             global_roots.insert(graph.root_at(label.x, label.y));
         }

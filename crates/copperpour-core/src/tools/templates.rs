@@ -785,6 +785,13 @@ async fn wire_template_connections(
         }
     }
 
+    // The pins each batch call reports as connected, not the pins requested:
+    // a pin the batch could not resolve is in its `errors`, not in `added`
+    // (merge review, plan step 6). The nets already written when one fails
+    // are named in the error.
+    let mut wired: HashSet<TemplatePin> = HashSet::new();
+    let mut wiring_errors: Vec<String> = Vec::new();
+    let mut written_nets: Vec<String> = Vec::new();
     for (net, net_pins) in &mut nets {
         net_pins.sort();
         net_pins.dedup();
@@ -800,16 +807,33 @@ async fn wire_template_connections(
             "label_type": "net_label",
         });
         let result = crate::tools::sch_batch::handle_batch_connect_to_net(&args, ctx).await?;
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            _ => String::new(),
+        };
         if result.is_error {
-            let detail = match result.content.first() {
-                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
-                _ => String::new(),
+            let done = if written_nets.is_empty() {
+                "no net was written".to_string()
+            } else {
+                format!("nets already written: {}", written_nets.join(", "))
             };
-            anyhow::bail!("connecting net '{net}' failed: {detail}");
+            anyhow::bail!("connecting net '{net}' failed ({done}): {text}");
+        }
+        written_nets.push(net.clone());
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        for added in body["added"].as_array().into_iter().flatten() {
+            if let (Some(reference), Some(pin)) =
+                (added["reference"].as_str(), added["pin"].as_str())
+            {
+                wired.insert((reference.to_string(), pin.to_string()));
+            }
+        }
+        for error in body["errors"].as_array().into_iter().flatten() {
+            if let Some(error) = error.as_str() {
+                wiring_errors.push(format!("{net}: {error}"));
+            }
         }
     }
-
-    let wired: HashSet<&TemplatePin> = nets.values().flatten().collect();
     let mut unconnected: Vec<String> = pins
         .iter()
         .flat_map(|(reference, symbol_pins)| {
@@ -821,6 +845,9 @@ async fn wire_template_connections(
         .collect();
     unconnected.sort();
     unconnected.dedup();
+    for error in wiring_errors {
+        unresolved.push(json!({ "reason": error }));
+    }
     Ok(TemplateWiring {
         made,
         unresolved,
@@ -992,9 +1019,13 @@ mod tests {
     /// with why, and pins no entry reaches are listed as still unconnected.
     #[tokio::test]
     async fn apply_template_wires_its_connection_map() {
-        // Copperpour's fixture writes templates to user_templates_dir(); the
-        // contributor's fixture had its own directory and environment guard
-        // (adapted when merged, plan step 6).
+        // Copperpour's fixture writes templates to user_templates_dir(), so
+        // the test runs in a child with its own HOME, as the other fixture
+        // tests do. Without that, the merged test wrote into the developer's
+        // real ~/.copperpour/templates (found by step 6 review 1).
+        if !in_isolated_home("tools::templates::tests::apply_template_wires_its_connection_map") {
+            return;
+        }
         let (_dir, schematic) = template_fixture();
         let template_dir = user_templates_dir().unwrap();
         std::fs::write(
