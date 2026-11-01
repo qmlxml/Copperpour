@@ -106,3 +106,6 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
   (replacement: "an empty result reported as a checked zero when the check did not run"; quoting an
   identifier verbatim is a citation). The one prose use (fork survey, line 72) was rewritten; upstream
   test names and the public migration-note file name are left as they are. 2 models agree.
+- **Test leftovers deleted** (`~/.copperpour`, `~/.local/share/konnect/locks` with 107,778 lock
+  files; no Copperpour process running) and the two defects recorded in `docs/BACKLOG.md`, "Test
+  isolation and state files". 2 models agree.

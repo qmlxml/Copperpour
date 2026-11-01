@@ -169,6 +169,22 @@ Each entry names where it was found, what is wrong, and the condition that close
   text tools, net ties on placement, and the refresh's no-op with net ties rely on unit tests and on
   the fork's live checks. Closing condition: one live run on a board with a solder jumper.
 
+## Test isolation and state files (found 2026-11-01)
+
+- **Tests write into the developer's real state directories.** Only
+  `crates/copperpour/tests/simulation_live.rs` and `copperpour-sexp/src/writer.rs`'s own tests set
+  `COPPERPOUR_STATE_DIR`; the rest of the suite wrote `~/.copperpour/logs/calls.jsonl` (8 MB, through
+  `observability.rs`'s `user_state_dir()`), test EasyEDA cache entries, and 107,778 document lock
+  files into `~/.local/share/konnect/locks` in one session (deleted by owner ruling, 2026-11-01).
+  Same class as the Freerouting entry above. Closing condition: the test harness points
+  `COPPERPOUR_STATE_DIR` and the user state directory at a temporary directory for every test.
+- **Document lock files are never removed** (`copperpour-sexp/src/writer.rs:588,613-618`): one empty
+  file per distinct document path ever written, so the count grows without limit, slowly in normal
+  use. Keeping them is deliberate: deleting a lock file another process holds would let the next
+  writer lock a new file while the first still holds the old one. Closing condition: a cleanup that
+  takes each file's lock before unlinking it (as `run_registry`'s sweep does for `run/` records), or a
+  recorded decision to leave it.
+
 ## Custom-shape pads (plan step 1, not merged)
 
 - **Footprints with custom-shape pads cannot be placed** (about 3.9% of KiCad's library). KiCad's
