@@ -53,6 +53,19 @@ Each entry names where it was found, what is wrong, and the condition that close
 
 ## SPICE simulation (plan step 4)
 
+- **A model include on a network location is touched before it is refused** (review 2 of the Windows
+  CI fixes, `docs/development/2026-11-01-09-Windows_CI_fixes.md`; existed before). The include
+  check refuses a path written as a network location, but a mapped network drive (`Z:\m.lib`), or a
+  symbolic link inside the project pointing to a share, passes it: `search_path` candidates are
+  tested with `exists()` and `canonicalize` before the allowed-folder check, so Windows opens an SMB
+  connection, possibly sending the user's credentials, before the include is refused. Closing
+  condition: the allowed-folder check runs before any file-system access to the candidate, or the
+  limitation is stated in the simulation documentation.
+- **A project on a network share cannot simulate with relative model files** (same review; existed
+  before). The snapshot writes model paths under the project folder, which for a project on a share
+  or a mapped drive is `\\server\share\…`, and the include check refuses every such path.
+  Closing condition: an include under the project's own folder is accepted, or the limitation is
+  documented.
 - **On Linux and Windows, deck vetting is the only barrier against a schematic's SPICE text running
   commands.** macOS also drops the worker's right to start processes (`RLIMIT_NPROC`); that cannot
   be used on Linux (threads count against it) and nothing replaces it. Measured on Linux: ngspice

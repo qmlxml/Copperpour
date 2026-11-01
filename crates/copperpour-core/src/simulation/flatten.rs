@@ -789,12 +789,12 @@ impl Flattener<'_> {
     fn search_path(&self, target: &str, base: &Path) -> Vec<PathBuf> {
         if let Some(rest) = target.strip_prefix("${KIPRJMOD}") {
             let rest = rest.trim_start_matches(['/', '\\']);
-            return vec![self.inputs.project_dir.join(rest)];
+            return vec![join_relative(self.inputs.project_dir, rest)];
         }
         std::iter::once(self.inputs.project_dir)
             .chain(std::iter::once(base))
             .chain(self.last_include_dir.as_deref())
-            .map(|folder| folder.join(target))
+            .map(|folder| join_relative(folder, target))
             .collect()
     }
 
@@ -1172,7 +1172,11 @@ pub(crate) fn verify_deck(deck: &str) -> Result<(), Refusal> {
 /// include a resolved model path were all refused. `\\?\UNC\…` and `\\.\…`
 /// stay refused.
 fn names_network_location(target: &str) -> bool {
-    if !(target.starts_with("//") || target.starts_with(r"\\")) {
+    // Windows reads any two leading separators, `/\` and `\/` included, as
+    // the start of a UNC path.
+    let separator = |byte: Option<&u8>| matches!(byte, Some(b'/' | b'\\'));
+    let bytes = target.as_bytes();
+    if !(separator(bytes.first()) && separator(bytes.get(1))) {
         return false;
     }
     let Some(rest) = target.strip_prefix(r"\\?\") else {
@@ -1180,6 +1184,37 @@ fn names_network_location(target: &str) -> bool {
     };
     let bytes = rest.as_bytes();
     !(bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == br":\")
+}
+
+/// `folder` joined with the relative path `relative` written in a deck or a
+/// schematic.
+///
+/// A verbatim folder (`\\\\?\\…`, from `canonicalize` on Windows, or kept by
+/// `display_path` for a long path) is not reparsed by Windows: `/` is not a
+/// separator there and `..` is not resolved, so `models/a.lib` would name no
+/// file. Under such a folder the relative path is split on both separators
+/// and `.` and `..` are applied as Windows applies them to an ordinary path.
+/// Any other folder, and an absolute `relative`, is joined as `Path::join`
+/// does, so Unix keeps the kernel's own handling of `..` through symlinks.
+pub(crate) fn join_relative(folder: &Path, relative: &str) -> PathBuf {
+    let verbatim = folder.as_os_str().to_string_lossy().starts_with(r"\\?\");
+    if !verbatim || !Path::new(relative).is_relative() || relative.starts_with(['/', '\\']) {
+        return folder.join(relative);
+    }
+    let mut joined = folder.to_path_buf();
+    for part in relative.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                // Never above the drive or share root that the prefix names.
+                if joined.parent().is_some() {
+                    joined.pop();
+                }
+            }
+            name => joined.push(name),
+        }
+    }
+    joined
 }
 
 #[cfg(test)]
@@ -1978,6 +2013,32 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_path_under_a_verbatim_folder_uses_one_separator() {
+        let folder = Path::new(r"\\?\C:\project");
+        let joined = join_relative(folder, "models/sub\\./x.lib");
+        let expected = ["models", "sub", "x.lib"]
+            .iter()
+            .fold(folder.to_path_buf(), |path, part| path.join(part));
+        assert_eq!(joined, expected);
+        // `..` stops at the drive root; only Windows parses the prefix.
+        #[cfg(windows)]
+        assert_eq!(
+            join_relative(folder, "../../a.lib"),
+            Path::new(r"\\?\C:\").join("a.lib")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            join_relative(folder, "../a.lib"),
+            Path::new(r"\\?\C:\").join("a.lib")
+        );
+        // An ordinary folder is joined as given.
+        assert_eq!(
+            join_relative(Path::new("/project"), "models/../a.lib"),
+            Path::new("/project").join("models/../a.lib")
+        );
+    }
+
+    #[test]
     fn a_verbatim_drive_path_is_local() {
         for target in [r"\\?\C:\m.lib", r"\\?\z:\dir\m.lib", "/abs/m.lib", "m.lib"] {
             assert!(!names_network_location(target), "{target}");
@@ -1988,6 +2049,8 @@ mod tests {
             r"\\?\1:\m.lib",
             r"\\?\C:",
             r"\\host\m.lib",
+            r"/\host\m.lib",
+            r"\/host\m.lib",
         ] {
             assert!(names_network_location(target), "{target}");
         }
@@ -1999,6 +2062,8 @@ mod tests {
             r"\\\\host\\share\\m.lib",
             r"\\host\share\m.lib",
             "//host/share/m.lib",
+            r"/\host\share\m.lib",
+            r"\/host\share\m.lib",
             r"\\?\UNC\host\share\m.lib",
             r"\\.\pipe\m.lib",
             r"\\?\Volume{00000000-0000-0000-0000-000000000000}\m.lib",

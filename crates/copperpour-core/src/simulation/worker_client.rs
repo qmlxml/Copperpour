@@ -203,17 +203,42 @@ async fn run_probe(
     }
     allow_dll_dependencies(&mut command, library);
 
-    let child = spawn_worker(&mut command)?;
-    let output = match tokio::time::timeout(limit, child.wait_with_output()).await {
-        Ok(output) => output.context("Failed to read the simulation worker's output")?,
-        Err(_) => return Ok(EngineStatus::unavailable("timed_out")),
+    let mut child = spawn_worker(&mut command)?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("The simulation worker has no output")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("The simulation worker has no output")?;
+    let finished = tokio::time::timeout(limit, async {
+        use tokio::io::AsyncReadExt;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (read_out, read_err) =
+            tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+        read_out?;
+        read_err?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, out, err))
+    })
+    .await;
+    let (exit, out, err) = match finished {
+        Ok(result) => result.context("Failed to read the simulation worker's output")?,
+        Err(_) => {
+            // Kill and wait before `scratch` is removed: on Windows a process
+            // still running in that folder makes the removal fail, and
+            // `TempDir` ignores the failure, leaving the folder behind.
+            let _ = child.kill().await;
+            return Ok(EngineStatus::unavailable("timed_out"));
+        }
     };
-    if !output.status.success() {
+    if !exit.success() {
         let mut status = EngineStatus::unavailable("nonzero_exit");
-        status.detail = Some(diagnostic_tail(&output.stderr));
+        status.detail = Some(diagnostic_tail(&err));
         return Ok(status);
     }
-    Ok(interpret_probe_output(&output.stdout))
+    Ok(interpret_probe_output(&out))
 }
 
 /// A command for the worker, working in `dir`. A worker must not hold the MCP

@@ -20,10 +20,9 @@
 //! folder was missing (`a_relative_home_gives_no_relative_user_directory`
 //! failed until `AppData/Roaming` and `AppData/Local` were created under the
 //! temporary home), so `config_dir` and `data_local_dir` follow this
-//! isolation as long as those folders exist. Remaining gaps, stated rather
-//! than hidden: whether `home_dir` also follows `USERPROFILE` on Windows is
-//! not measured, and kicad-cli on Windows may still use the real profile's
-//! cache folder. `UNCHANGED` is
+//! isolation as long as those folders exist. Not measured on Windows: whether
+//! `home_dir` also follows `USERPROFILE`, and whether kicad-cli's cache
+//! folder follows `LOCALAPPDATA` now that it exists under the temporary home. `UNCHANGED` is
 //! inherited by grandchildren and, if exported in a shell, turns isolation off
 //! for the whole run; the gate's empty-home check is what would show it. A
 //! process started with its environment cleared and not carrying

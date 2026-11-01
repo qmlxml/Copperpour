@@ -153,14 +153,17 @@ fn live_library_path(value: &str, project_dir: &Path) -> Option<PathBuf> {
     }
     for variable in ["${KIPRJMOD}", "$(KIPRJMOD)"] {
         if let Some(relative) = value.strip_prefix(variable) {
-            return Some(project_dir.join(relative.trim_start_matches(['/', '\\'])));
+            return Some(super::flatten::join_relative(
+                project_dir,
+                relative.trim_start_matches(['/', '\\']),
+            ));
         }
     }
     // Other variables are KiCad's own, and survive the move.
     if value.starts_with('$') || Path::new(value).is_absolute() {
         return None;
     }
-    Some(project_dir.join(value))
+    Some(super::flatten::join_relative(project_dir, value))
 }
 
 fn closing_quote(text: &str) -> Option<usize> {
