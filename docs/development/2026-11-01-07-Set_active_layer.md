@@ -21,3 +21,37 @@ measurement (`stock_editor_command_probe`, 2026-11-01).
 
 Gate (`logs/gate-set-active-layer.summary`): 3,740 passed (+3), 1 failed (the known baseline
 failure), 113 ignored.
+Committed as `4012a292`.
+
+## `run_editor_action`: not implemented
+
+Settled between the two models (owner instruction): not implemented. `RunAction` returns only a
+status, so a view-only allow-list gives an LLM caller nothing; widening the list needs a live
+measurement per action (display toggles are saved in the project settings) and moves toward the
+fork's unbounded version. Recorded in `docs/BACKLOG.md`.
+
+## Review 1 (implementation, robustness, intent) and fix pass 1
+
+1. **A failed read-back after an accepted change was reported as a rejection.** The third call's
+   failure is now `ipc_outcome_unknown` with `retry_safe: true`, saying the change was accepted.
+   Test `a_failed_read_back_after_an_accepted_change_is_safe_to_repeat`; control: with the original
+   unclassified read-back it fails.
+2. **A KiCad with no PCB editor open, or unreachable, gave an untyped rejection**: these now give
+   the typed refusal.
+3. **Board access was still `None`**, so client hooks did not give the "open the board in KiCad"
+   guidance: now `LiveOnly`, and the catalogue test pins it.
+4. The doc comment of `run_action` had moved onto the new method: moved back.
+5. **The refusals were worded for file writes** ("could be silently overwritten", "do not repeat the
+   mutation") although the active layer is editor state with no undo entry and repeating it is
+   safe. The tool now calls `live_board::observe` directly with its own messages; a timeout is
+   `ipc_outcome_unknown` with `retry_safe: true`.
+6. A layer the board does not enable is `invalid_argument` on `layer`, naming `get_layer_list`.
+   Test `a_layer_the_board_does_not_enable_is_an_invalid_argument`.
+7. An unknown layer read first gives `previous` and `changed` as `null`.
+8. The invalid-name message says to use KiCad's canonical names.
+9. The dispatch test uses an address that cannot exist (it had fallen back to `KICAD_API_SOCKET`,
+   so on a machine running KiCad it talked to the live editor) and is renamed; new test
+   `only_set_unhandled_is_refused_as_unsupported`.
+
+Gate (`logs/gate-set-active-layer-fix1.summary`): 3,743 passed (+3), 1 failed (the known baseline
+failure), 113 ignored.

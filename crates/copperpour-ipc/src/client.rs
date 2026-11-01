@@ -5013,7 +5013,6 @@ impl KiCadIpcClient {
         Ok(any)
     }
 
-    /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).
     /// The PCB editor's active layer for `document`. (From the wilfredo-a14
     /// fork's `f517fd8`; measured on stock KiCad 10.0.7, 2026-11-01.)
     pub fn get_active_layer_in(
@@ -5049,6 +5048,7 @@ impl KiCadIpcClient {
         Ok(())
     }
 
+    /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).
     pub fn run_action(&self, action: &str) -> Result<()> {
         let cmd = kiapi::common::commands::RunAction {
             action: action.to_string(),

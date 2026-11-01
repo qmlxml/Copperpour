@@ -152,7 +152,10 @@ Each entry names where it was found, what is wrong, and the condition that close
   fails an internal KiCad assertion** (`ToProtoEnum<PCB_LAYER_ID>`, a visible layer with no protocol
   value), opens one modal dialog per such layer and blocks every later command until a person closes
   them. So per the plan: `set_active_layer` (done 2026-11-01, `docs/development/2026-11-01-07-Set_active_layer.md`)
-  and an allow-listed `run_editor_action` are to be implemented; `set_layer_visibility` is not, on KiCad 10.0.7, because reading the visible layers can
+  is implemented. **`run_editor_action` is not** (decided 2026-11-01, 2 models agree): `RunAction`
+  returns only a status, so view actions (the only ones measured safe from dialogs) give an LLM
+  caller nothing it can see, while the tool name would be permanent public API promising more than a
+  fixed list can provide. Revisit if a tool needs KiCad to show a result to a person; `set_layer_visibility` is not, on KiCad 10.0.7, because reading the visible layers can
   leave KiCad waiting for a person (Rule B). Closing condition for the rest: that implementation, with
   the full review cycle.
 

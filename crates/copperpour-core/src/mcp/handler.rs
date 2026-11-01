@@ -1341,11 +1341,14 @@ mod active_layer_dispatch_tests {
     use crate::tools::ServerConfig;
 
     #[tokio::test]
-    async fn set_active_layer_refusal_survives_served_dispatch_without_writing() {
+    /// Through dispatch, with KiCad unreachable (an address that cannot exist,
+    /// so a KiCad running on the developer's machine is never used): the
+    /// typed refusal, and the file untouched.
+    async fn set_active_layer_without_kicad_is_refused_through_dispatch_without_writing() {
         let handler = McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
-            ipc_address: String::new(),
+            ipc_address: "ipc:///nonexistent/copperpour-test-unreachable.sock".to_string(),
             project_dir: None,
             jlcpcb_db_path: None,
             auto_load_toolsets: true,
