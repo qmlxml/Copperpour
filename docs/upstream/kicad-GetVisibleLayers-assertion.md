@@ -44,8 +44,10 @@ for( PCB_LAYER_ID layer : visible )
     response.add_layers( ToProtoEnum<PCB_LAYER_ID, board::types::BoardLayer>( layer ) );
 ```
 
-The patch has not been compiled (a KiCad build was not run here); it uses only operations the same
-file already uses on `LSET` (`|`, iteration).
+The patch has not been compiled (a KiCad build was not run here). It uses only existing
+operations: `operator&( const BASE_SET&, const BASE_SET& )` (`include/base_set.h`), the `LSET`
+constructor from `BASE_SET` (`include/lset.h`), and iteration over an `LSET`, as the loop it replaces
+already does.
 
 ## Evidence
 

@@ -2384,8 +2384,9 @@ fn known_layer(
 /// The active layer is editor state: no design data, no undo entry, never
 /// written to the file, and setting it twice gives the same result. So this
 /// tool does not use the file-write path and its messages: a timeout is
-/// reported as safe to repeat, and a board not open in KiCad is the typed
-/// `unsupported_capability` refusal (review 1 of this change).
+/// reported as safe to repeat, and a board not open in KiCad is
+/// `editor_unavailable` (reviews 1 and 3 of this change); only a KiCad that
+/// does not handle the command is `unsupported_capability`.
 async fn handle_set_active_layer(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -2611,7 +2612,7 @@ mod active_layer_refusal_tests {
     /// command, which `a_live_board_changes_its_active_layer_and_reads_it_back`
     /// asserts.
     #[tokio::test]
-    async fn set_active_layer_is_typed_unsupported_and_writes_nothing() {
+    async fn set_active_layer_without_kicad_is_editor_unavailable_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("safe.kicad_pcb");
         let original = b"(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(setup\n\t\t(pad_to_mask_clearance 0)\n\t)\n)\n";

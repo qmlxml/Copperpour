@@ -8255,8 +8255,9 @@ mod stackup_tests {
 /// claim that the stable protocol had no supported active-layer mutation; this
 /// probe showed the claim wrong, and the tool now uses the commands.
 ///
-/// Changes nothing in the design: each "set" sends back the value just read,
-/// and the action only zooms the view. Prints one line per command. The
+/// Changes nothing in the design: the first "set" sends back the value just
+/// read; the active layer is then set to another layer, read back and
+/// restored; and the action only zooms the view. Prints one line per command. The
 /// visible-layer pair is skipped unless STOCK_PROBE_VISIBLE=1 (see below).
 ///
 ///     KICAD_API_SOCKET=ipc:///tmp/kicad/api.sock STOCK_PROBE_BOARD=/path/board.kicad_pcb \

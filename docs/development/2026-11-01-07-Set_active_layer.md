@@ -9,7 +9,8 @@ measurement (`stock_editor_command_probe`, 2026-11-01).
 - `handle_set_active_layer`: reads the layer, sets it, reads it back; reports `active_layer`,
   `previous`, `changed`, `source: "ipc_readback"`. An `AS_UNHANDLED`/`AS_UNIMPLEMENTED` answer is
   classified inside the IPC call and kept as the typed `unsupported_capability` refusal; a board
-  not open in KiCad also stays `unsupported_capability`; a read-back that differs is an error.
+  not open in KiCad also stayed `unsupported_capability` at first (`editor_unavailable` since review
+  3, item 2); a read-back that differs is an error.
 - Tests (mock KiCad keeping the active layer): `a_live_board_changes_its_active_layer_and_reads_it_back`,
   `a_kicad_that_does_not_handle_the_command_is_refused_as_unsupported`,
   `a_read_back_that_differs_is_reported`; the earlier refusal test now carries its Rule A statement.
@@ -36,8 +37,8 @@ fork's unbounded version. Recorded in `docs/BACKLOG.md`.
    failure is now `ipc_outcome_unknown` with `retry_safe: true`, saying the change was accepted.
    Test `a_failed_read_back_after_an_accepted_change_is_safe_to_repeat`; control: with the original
    unclassified read-back it fails.
-2. **A KiCad with no PCB editor open, or unreachable, gave an untyped rejection**: these now give
-   the typed refusal.
+2. **A KiCad with no PCB editor open, or unreachable, gave an untyped rejection**: these then gave
+   the typed `unsupported_capability` refusal, changed to `editor_unavailable` in review 3.
 3. **Board access was still `None`**, so client hooks did not give the "open the board in KiCad"
    guidance: now `LiveOnly`, and the catalogue test pins it.
 4. The doc comment of `run_action` had moved onto the new method: moved back.
@@ -103,6 +104,17 @@ new state needs a person to leave it. Fixed:
 5. The decision not to implement `run_editor_action` is in the overnight-decisions record, with both
    opinions and the #395 reference.
 6. The probe's comment is in the past tense.
+
+Committed as `c842a4b4`.
+
+## Documentation review
+
+An independent check confirmed hashes, names, kinds, fields and gate counts. Corrected: two places
+in this log and the handler's doc comment still described a board not open as
+`unsupported_capability`; the test named for that refusal is renamed
+`set_active_layer_without_kicad_is_editor_unavailable_and_writes_nothing`; the probe's comment now
+mentions the change-and-restore; the KiCad report named `|` where the patch uses `&` (checked:
+`operator&` on `BASE_SET` exists in `include/base_set.h`).
 
 Gate (`logs/gate-set-active-layer-fix3.summary`): 3,744 passed, 1 failed (the known baseline
 failure), 113 ignored.
