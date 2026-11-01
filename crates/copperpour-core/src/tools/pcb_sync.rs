@@ -879,7 +879,8 @@ fn refill_warning(zones: &BTreeSet<String>, applied: bool) -> Option<serde_json:
     let message = if applied {
         format!(
             "Pads changed net under zones on {nets}; their fills are stale. Run refill_zones \
-             (toolset pcb_export), then save_project; or run_drc with sync_live_board: true \
+             (toolset pcb_export), then save_project; or run_drc (toolset verification) with \
+             sync_live_board: true \
              and refill_zones: true, which refills the live board, saves it and checks it. A \
              refill only recomputes the fills, so it can be repeated if it fails. Until it \
              succeeds DRC can report shorts or unconnected items there, and a board saved and \

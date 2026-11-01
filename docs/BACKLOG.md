@@ -194,10 +194,16 @@ Each entry names where it was found, what is wrong, and the condition that close
   KiCad's "Update clearance overrides" does.
 - **The sync's readback does not check that net ties were kept**, as it does for models and
   attributes. Closing condition: `net_ties` compared in the readback.
-- **The IPC paths of this step were not run against KiCad here** (no KiCad GUI session): the footprint
-  text tools, net ties on placement, and the refresh's no-op with net ties rely on unit tests and on
-  the fork's live checks. Closing condition: one live run on a board with a solder jumper.
-
+- **~~The IPC paths of this step were not run against KiCad here.~~ Run live 2026-11-01** on stock
+  KiCad 10.0.7 with a copy of the pic_programmer demo, through the server binary over stdio:
+  `move_footprint_texts` moved R1's reference by 1 mm and the read-back matched; a pad moved off GND
+  with `set_pad_net` gave a sync dry run `ready` with `zones_to_refill: ["GND"]` and the
+  `zones_need_refill` warning, the apply then `applied`, and after `refill_zones` and `run_drc` with
+  `sync_live_board: true` DRC reported 0 errors, 0 unconnected and 0 parity differences (as the
+  original demo); `place_component` of `Jumper:SolderJumper-2_P1.3mm_Bridged_Pad1.0x1.5mm` reached
+  the saved board with `(net_tie_pad_groups "1, 2")` and `(zone_connect 1)`; a library-refresh dry
+  run of that jumper was `noop`, so KiCad's read-back of net ties matches what is written. Not run
+  live: `duplicate_component`, `place_array`, an uncertain commit outcome.
 - **A stale zone fill after a sync is reported once** (step 7b): the `zones_need_refill` warning is in
   the apply's response only; a later sync returns `noop` and nothing detects a fill left stale, which
   a saved and plotted board then carries. Refilling inside the sync was not chosen (owner ruling

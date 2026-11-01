@@ -1,0 +1,18 @@
+--- a/pcbnew/api/api_handler_board.cpp
++++ b/pcbnew/api/api_handler_board.cpp
+@@ -1540,7 +1540,14 @@
+ 
+     BoardLayers response;
+ 
+-    for( PCB_LAYER_ID layer : board()->GetVisibleLayers() )
++    // The visible-layer set can hold bits for layer IDs that are not layers: a
++    // project file that saves "visible_layers" as all ones (as KiCad's own demos
++    // do) sets all 128 bits, and 32 of those IDs have no PCB_LAYER_ID name, so
++    // converting them hit the default case of ToProtoEnum. Report only enabled
++    // layers, matching handleSetVisibleLayers, which accepts only enabled ones.
++    LSET visible = board()->GetVisibleLayers() & board()->GetEnabledLayers();
++
++    for( PCB_LAYER_ID layer : visible )
+         response.add_layers( ToProtoEnum<PCB_LAYER_ID, board::types::BoardLayer>( layer ) );
+ 
+     return response;
