@@ -2917,6 +2917,11 @@ mod tests {
         assert_eq!(hidden, 0);
     }
 
+    /// Unix only: every fake tool here is a shell script with an empty Windows
+    /// body, and one test changes directory permissions with Unix mode bits.
+    /// The Windows CI build stopped on the latter (`std::os::unix` does not
+    /// exist there), and the rest could never run on Windows.
+    #[cfg(unix)]
     mod with_fake_cli {
         use super::*;
         /// Copperpour's `write_script` writes the body as given. Linux does not run
