@@ -2352,7 +2352,7 @@ mod tests {
     }
 
     #[test]
-    fn the_final_check_requires_konnects_title_and_a_last_end() {
+    fn the_final_check_requires_copperpours_title_and_a_last_end() {
         assert!(verify_deck("*ng_script\nR1 a 0 1k\n.end\n").is_err());
         assert!(verify_deck(&format!("{DECK_TITLE}\nR1 a 0 1k\n")).is_err());
     }

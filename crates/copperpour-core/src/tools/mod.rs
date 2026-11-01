@@ -300,7 +300,7 @@ pub struct ToolContext {
     pub(crate) guidance: std::sync::OnceLock<std::sync::Arc<dyn crate::guidance::GuidanceProbe>>,
     /// How to reach the simulation worker. Set once by the standalone binary,
     /// which contains it; absent in embedded and test contexts, where
-    /// `current_exe()` is not a Konnect binary.
+    /// `current_exe()` is not a Copperpour binary.
     pub(crate) simulation:
         std::sync::OnceLock<std::sync::Arc<crate::simulation::SimulationRuntime>>,
 }

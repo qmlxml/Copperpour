@@ -22,7 +22,7 @@ Conflict resolution, repeated over many commits:
   plugin/plugin.json, packaging/metadata.json and tool-directory.md: Copperpour's side, by its rule
   that pull requests leave counts alone. Done with the new `scripts/keep_head_in_conflicts.py`,
   which keeps the contributor's changes that merged without conflict and prints what it drops.
-  Afterwards every line the contributor added to those files was compared with what landed; the only
+  Afterwards every line the contributor added to those files was compared with what was committed; the only
   real loss was the `simulation_failed` row of DEV.md's error table, restored by hand. The rest
   were counts and names.
 - `AGENTS.md`: Copperpour's file kept. The contributor's version held instructions for their own
@@ -54,7 +54,11 @@ The adaptation commit after them makes the result compile.
   tested nothing); `CARGO_BIN_EXE_copperpour`; `copperpour sim-worker`; "Konnect" →
   "Copperpour" in messages and comments of the new files.
 - Kept on purpose: the deck title `.title konnect simulation` (it is inside the binary raw-file
-  fixtures, which would otherwise no longer match) and the worker's internal status markers.
+  fixtures, which would otherwise no longer match); the worker's internal status marker
+  `KONNECT_SIM_STATUS` (`STATUS_MARKER`) and the live test's marker `KONNECT_BLOCK_RAN` (strings
+  the code writes and reads back itself); and Copperpour's own fallback state folder
+  `data_local_dir()/konnect` (Copperpour keeps it so a Konnect build takes the same lock). One
+  comment and two test names that still said Konnect were renamed during the documentation review.
 - Two Copperpour API changes since the fork's base: toolset metadata no longer has `tool_count`
   (counts come from the tool list), and `sha2` 0.11 digests no longer format as hex
   (`crate::hex::encode_hex` used instead).
@@ -121,7 +125,8 @@ Nothing found would stop a normal simulation run. Findings and what was done:
    `docs/BACKLOG.md` for review 3 and later work.
 
 Gate after fix pass 1 (`logs/gate-step4-fix1.summary`): 3,654 passed (+1), 1 failed (the known
-baseline failure), 108 ignored. Simulation live tests (`logs/live-simulation.log`): 47 passed.
+baseline failure), 108 ignored. Simulation live tests: 47 passed (`logs/live-simulation.log` was later
+overwritten by fix pass 3's run).
 Committed as `b4df684`.
 
 ## Review 2 (robustness, Linux) and fix pass 2
@@ -156,7 +161,7 @@ Committed as `131aa5a`.
 ## Review 3 (intent and liveness) and fix pass 3
 
 No state the system can enter and not leave was found. Four ways a result could read as a pass
-while the circuit simulated differed from the schematic, and two exits that were hard to find.
+while the circuit simulated differed from the schematic, and two errors that did not say how to recover.
 The owner was asleep; the corrections below report more and are easy to reverse, and are listed in
 `2026-11-01-00-Overnight_decisions.md` for the owner's review.
 
@@ -193,3 +198,14 @@ The owner was asleep; the corrections below report more and are easy to reverse,
 
 Gate after fix pass 3 (`logs/gate-step4-fix3.summary`): 3,654 passed, 1 failed (the known baseline
 failure), 109 ignored (+1, the new live test). Simulation live tests: 48 passed.
+Committed as `414e90c`.
+
+## Documentation review (sub-step 16)
+
+An independent check of this log, the plan entry, the overnight decisions, SIMULATION_NOTES, the
+plan's merge note, the migration note, the backlog and the skill against the code and logs found
+seven inaccuracies, all corrected: the failure count (44 new: 43 script, 1 toolset count); the count
+of review 3's findings in the plan entry; an incomplete list of `konnect` names kept on purpose (one
+comment and two test names were renamed; the rest are now listed with reasons); `.op` said moved out
+of SIMULATION_NOTES but still there (removed); the overnight note's reload wording; a log file
+overwritten by a later run; and a missing commit hash. Two unclear phrases replaced.

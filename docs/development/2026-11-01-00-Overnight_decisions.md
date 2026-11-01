@@ -16,6 +16,6 @@ listed here with where it is recorded, so it can be confirmed or changed. Nothin
    deliberately not warned about, to keep warnings meaningful.
 3. **Skill wording**: the I²t fuse stand-in is said not to be evidence that a real fuse protects the
    circuit; approximations on protection or inrush parts are said not to be evidence about them.
-4. **The engine-not-found message** names the configuration key and that a reload is needed.
+4. **The engine-not-found message** names the configuration key and that a server restart is needed (`reload_server` also works with the stdio transport on Unix).
 
 Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".

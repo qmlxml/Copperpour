@@ -64,7 +64,7 @@ fn every_tested_deck_is_one_whole_block_of_the_skill() {
 }
 
 #[test]
-fn a_deck_adds_no_card_that_konnect_refuses_or_that_changes_the_circuit() {
+fn a_deck_adds_no_card_that_copperpour_refuses_or_that_changes_the_circuit() {
     for (name, deck) in decks() {
         for line in deck.lines().filter(|line| !line.starts_with('*')) {
             let line = line.to_lowercase();
