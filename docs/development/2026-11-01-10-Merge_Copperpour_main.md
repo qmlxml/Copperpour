@@ -136,3 +136,22 @@ Not changed:
   runs only at release (AGENTS.md).
 - A configuration key for the 120 s limit: no user has asked for one.
 - The Rule A remarks about upstream's own tests are upstream's to make.
+
+Commit `3f54e7d9`. Gate (`logs/gate-merge-fix3.summary`): 3,815 passed, 0 failed, 115 ignored,
+`home-untouched` PASS. CI run 41336468988 on it passes on all ten jobs, Windows included (fix pass
+2's own run, 41335714410 on `02904310`, passed as well).
+
+## As shipped, against the plan
+
+Planned (owner decision 2026-11-01): merge Copperpour's `main` into `integration`, resolve the one
+conflict a trial merge showed, and pass the gate and CI. Shipped as planned, at `24749e80`, plus:
+- the new toolset `pcb_footprint_text`, for a conflict the trial merge did not show;
+- skill texts updated for it;
+- a bounded, killed and waited-for kicad-cli in `set_board_stackup`'s check;
+- a timeout reported as such;
+- documentation of upstream's tools under this branch's live editor.
+
+Recorded for upstream, not changed here: the issues in `set_board_stackup`, `set_erc_severity`
+and `text_overlap` listed in `docs/BACKLOG.md`. Copperpour's `main` keeps moving, so the branch
+will need merging again just before a pull request to Copperpour. The pull request description
+should then name `pcb_footprint_text` and the 120 s limit as decisions for its maintainers.
