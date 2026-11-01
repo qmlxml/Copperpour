@@ -53,3 +53,10 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
     mapping for every such net.
 14. **Step 6 review 3's finding that decoupling should not be pooled was not adopted**: the pooled
     check is about the net; local decoupling is `audit_decoupling`, which is not pooled.
+15. **Step 7: `6dad58a` (a copper pour no longer blocks a pad-net change; `zones_to_refill`) is
+    not applied tonight.** It reverses Copperpour's rule (two tests assert that a pour on the old or
+    new net refuses the change). Question for the owner, with a second opinion, at the end of this
+    file once the other step 7 work is done. `7fa1510`'s narrower rule (copper tracks of the old
+    net touching the pad) is taken, with the pour rule kept.
+16. **Step 7: `04afb36` is not applied** (both behaviours already present; `delete_trace` accepting
+    via UUIDs would change a public tool's inputs, and `delete_via` exists).
