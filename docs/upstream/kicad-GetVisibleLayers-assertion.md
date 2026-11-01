@@ -1,7 +1,8 @@
 # KiCad report draft: API `GetVisibleLayers` fails an assertion per unnamed layer ID
 
-Prepared 2026-11-01 for KiCad's issue tracker (gitlab.com/kicad/code/kicad). Not filed yet: filing
-needs the owner's GitLab account. Patch: `kicad-GetVisibleLayers-enabled-only.patch` (against
+Prepared 2026-11-01 for KiCad's issue tracker (gitlab.com/kicad/code/kicad). To be filed from the
+owner's GitLab account (Vasyl Melnichuk); a merge request, if made, is authored
+`Vasyl Melnichuk <qmlxml@gmail.com>`, set for that repository only. Patch: `kicad-GetVisibleLayers-enabled-only.patch` (against
 master, file `pcbnew/api/api_handler_board.cpp`; in 10.0.7 the same loop is in
 `pcbnew/api/api_handler_pcb.cpp`, `API_HANDLER_PCB::handleGetVisibleLayers`).
 
@@ -12,8 +13,25 @@ layer ID and blocks the API behind modal dialogs
 
 ## Description
 
-**KiCad version:** 10.0.7 (Arch Linux package, built with assertions); the same code is on master
-(checked 2026-11-01).
+**KiCad version:** 10.0.7, release build (CachyOS/Arch package); the dialog is wxWidgets' assertion
+check (`wxCHECK_MSG`), which this release build keeps. The same code is on master (checked
+2026-11-01).
+
+```
+Application: kicad-cli x86_64 on x86_64
+Version: 10.0.7, release build
+Libraries:
+	wxWidgets 3.2.12 EGL
+Platform: CachyOS, 64 bit, Little endian, wxBase, wayland, KDE, KDE
+Build Info:
+	wxWidgets: 3.2.11 (wchar_t,wx containers) GTK+ 0.0
+	Boost: 1.92.0
+	OCC: 7.9.3
+	ngspice: 47
+	Compiler: GCC 16.2.1 with C++ ABI 1021
+Build settings:
+	KICAD_IPC_API=ON
+```
 
 **Steps to reproduce**
 
