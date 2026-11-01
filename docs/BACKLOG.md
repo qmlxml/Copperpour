@@ -129,6 +129,10 @@ Each entry names where it was found, what is wrong, and the condition that close
   findings the pooled top level removed, and a rail judged fine has no record of which sheets
   supplied it; rails are pooled by name, so a rail named differently on two sheets is not pooled.
   Closing condition: a pooled `rail_coverage` with its sources.
+- **`apply_template` has no dry run**, so `joined_existing_nets` (template nets that joined existing
+  nets of the same name, e.g. a 6 V `VIN` joining a 24 V `VIN`) is first seen after the labels are
+  written, and undoing the join is by hand. Closing condition: a preview call that reports the
+  joins before anything is written (owner review of overnight decision 13, 2026-11-01).
 - **`f517fd8` and `d2961f4` from wilfredo-a14/agent-hub are not merged** (activity reporting to,
   and editor control of, a modified KiCad build). Owner ruling 2026-11-01, with a plan agreed by two
   models: measure first, with stock KiCad 10.0.7 running and a board open, whether KiCad answers

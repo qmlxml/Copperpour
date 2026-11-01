@@ -121,3 +121,16 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
 - **2: KEEP.** 2 models agree.
 - **3: KEEP.** 2 models agree.
 - **4: KEEP.** 2 models agree.
+- **5: KEEP.** 2 models agree.
+
+Owner instruction during this review: for the remaining decisions, where the two opinions match,
+apply that choice without asking. All remaining items matched:
+
+- **6: KEEP** the reversal (`success: false` whenever a count is unknown, a project rule was not
+  applied, the settings were not verified, or no project was found).
+- **7: KEEP** `konnect-jlcpcb-cpl-v2` (the `konnect-` prefix stays; a second rename is not worth it).
+- **8: KEEP.** **9: KEEP.** **10: KEEP.** **12: KEEP.** **14: KEEP.** **16: KEEP.**
+- **13: KEEP**, with a backlog entry: `apply_template` has no dry run, so `joined_existing_nets` is
+  first seen after the labels are written.
+- **17: KEEP**; an opt-in argument taking the whole design-rule override group from the library is
+  recorded as the future compatibility option.
