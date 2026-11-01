@@ -114,8 +114,11 @@ run doctest        cargo test --workspace --locked --no-fail-fast --doc
 run viewer-test    cargo test --locked --manifest-path crates/schematic-viewer/Cargo.toml
 
 # Anything in the gate's home was written by something not isolated.
-written="$(cd "$gate_home" && find . -mindepth 1 | sort)"
-if [ -z "$written" ]; then
+# A home that cannot be listed is a failure, not "nothing written".
+if ! written="$(set -o pipefail; cd "$gate_home" && find . -mindepth 1 | sort)"; then
+    echo "FAIL home-untouched (could not list $gate_home)" >> "$summary"
+    status=1
+elif [ -z "$written" ]; then
     echo "PASS home-untouched" >> "$summary"
 else
     echo "FAIL home-untouched (kept: $gate_home)" >> "$summary"

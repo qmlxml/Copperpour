@@ -34,22 +34,15 @@ jobs:
         run: cargo check --workspace --locked
       # Tests must not write into the user's home (crates/copperpour-test-home;
       # scripts/gate.sh runs the same check locally). The test steps below run
-      # with HOME set to an empty directory, and "Home untouched" fails if
-      # anything appears there. The toolchain stays on the runner's real home,
-      # or rustup would download a toolchain into the empty one. Not on Windows:
-      # there the per-user folders come from the profile, not from HOME.
+      # with HOME and the XDG directories inside an empty directory, and "Home
+      # untouched" fails, listing them, if anything appears there. The selftest
+      # makes that failure run on every build. Steps that write into HOME by
+      # design (installers, git config) must stay outside the two steps. Not on
+      # Windows: per-user folders come from the profile there, not from HOME.
       - name: Empty home for the tests
         if: matrix.os != 'windows-latest'
         shell: bash
-        run: |
-          empty_home="$RUNNER_TEMP/copperpour-empty-home"
-          mkdir -p "$empty_home"
-          {
-            echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}"
-            echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
-            echo "COPPERPOUR_TEST_REAL_HOME=$HOME"
-            echo "HOME=$empty_home"
-          } >> "$GITHUB_ENV"
+        run: scripts/ci_home_untouched.sh selftest && scripts/ci_home_untouched.sh prepare
       # Fast, named contract gate for the adopted outcome catalogue and the
       # reviewed legacy-debt ratchet. The full test step below remains the
       # regression gate; this makes contract drift immediately identifiable.
@@ -63,15 +56,10 @@ jobs:
       - name: Doctests
         run: cargo test --workspace --locked --doc
       - name: Home untouched
-        if: matrix.os != 'windows-latest'
+        # Also after a failing test step, so its writes are listed too.
+        if: ${{ !cancelled() && env.COPPERPOUR_CI_EMPTY_HOME != '' }}
         shell: bash
-        run: |
-          if [ -n "$(find "$HOME" -mindepth 1 -print -quit)" ]; then
-            echo "::error::the tests wrote into the empty HOME ($HOME):"
-            find "$HOME" -mindepth 1 | head -50
-            exit 1
-          fi
-          echo "nothing written under $HOME"
+        run: scripts/ci_home_untouched.sh check
 
   # The KiCAD action plugin is Python, so cargo never sees it. Its only real
   # logic is the server-PID bookkeeping (#103), where an unconditional

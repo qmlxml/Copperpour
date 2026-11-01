@@ -279,8 +279,10 @@ Each entry names where it was found, what is wrong, and the condition that close
   (`docs/development/2026-11-01-08-Test_home_isolation.md`): every test binary points its per-user
   directories at `<target>/copperpour-test-home`, and `scripts/gate.sh` fails if anything is written
   to the empty `HOME` it runs with; `every_test_binary_calls_isolate` catches a test file without
-  the call under plain `cargo test`, so in CI too. Remaining: CI does not run the empty-`HOME` check
-  itself (it changes only once the branch can be pushed and CI watched); on Windows `dirs` follows
+  the call under plain `cargo test`, so in CI too. CI runs the empty-`HOME` check on Linux and macOS
+  since 2026-11-01 (`scripts/ci_home_untouched.sh`, `docs/development/2026-11-01-11-CI_empty_home_check.md`).
+  Remaining: nothing checks that tests leave the real profile untouched on Windows, where per-user
+  folders come from the profile, not `HOME`; on Windows `dirs` follows
   `USERPROFILE` for the application-data folders (seen in CI 2026-11-01), but whether the native
   Specctra bridge's directory and kicad-cli's cache are redirected is not measured; the Windows `e2e-kicad` workflow has not been run with the isolation (run it by
   `workflow_dispatch` before a release).

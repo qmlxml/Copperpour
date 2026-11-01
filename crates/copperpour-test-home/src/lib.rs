@@ -10,9 +10,10 @@
 //! Every test binary calls [`isolate`] from a `ctor` constructor, before any
 //! test thread starts, so setting environment variables there is not a race.
 //! The child processes tests start (kicad-cli, the server binary) inherit the
-//! isolation. The gate (`scripts/gate.sh`) runs the suite with `HOME` set to an
-//! empty directory and fails if anything appears in it, which catches a test
-//! binary that does not call this, and doctests, which cannot.
+//! isolation. The gate (`scripts/gate.sh`) and CI on Linux and macOS
+//! (`scripts/ci_home_untouched.sh`) run the suite with `HOME` set to an empty
+//! directory and fail if anything appears in it, which catches a test binary
+//! that does not call this, and doctests, which cannot.
 //!
 //! On Windows `dirs` reads the known-folder API, not `APPDATA` or
 //! `LOCALAPPDATA`. The Windows CI runs of 2026-11-01 are consistent with that
