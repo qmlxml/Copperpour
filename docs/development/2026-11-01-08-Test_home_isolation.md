@@ -3,7 +3,7 @@
 Backlog item "Tests write into the developer's real state directories" (found 2026-11-01, when one
 session's test runs left 107,778 lock files and an 8 MB call log in the owner's home). Design settled
 between the two models (owner instruction): first opinion, a per-test-binary startup isolation;
-the second reviewer's, the same plus the gate as a detector (option D). 2 models agree.
+the second reviewer's, the same plus the gate's empty-`HOME` check as a detector. 2 models agree.
 
 ## Measurement before the change
 
@@ -28,7 +28,9 @@ run ended and under another session's activity; its API setting was intact.)
 - New workspace crate `copperpour-test-home` (`publish = false`): `isolate()` points `HOME`,
   `USERPROFILE`, the four XDG directories, `APPDATA`, `LOCALAPPDATA`, `KICAD_CONFIG_HOME` and
   `COPPERPOUR_STATE_DIR` at a directory shared by all test processes (first `<temp>/copperpour-test-home`;
-  moved to `<target>/copperpour-test-home` in fix pass 1), keeping `RUSTUP_HOME`/`CARGO_HOME` on the real ones. It does nothing
+  now `COPPERPOUR_TEST_HOME_ROOT` when set, else `<target>/copperpour-test-home` with the build
+  directory found by Cargo's `CACHEDIR.TAG` or the `deps` folder, else a per-process `/tmp` name;
+  fix passes 1 and 2), keeping `RUSTUP_HOME`/`CARGO_HOME` on the real ones. It does nothing
   when `COPPERPOUR_TEST_HOME_UNCHANGED=1`.
 - Every test binary (each crate's library tests, copperpour's `main.rs` tests, 29 integration test
   files, the schematic viewer) calls it from `#[ctor::ctor(unsafe)]`, which runs before any test
@@ -115,8 +117,8 @@ tree starts threads, by reading). Fixed:
    found.
 6. `UNCHANGED` exported in a shell turns isolation off: stated in the crate documentation (the
    gate's empty-home check would show it).
-7. The gate's temporary home and per-run directory are removed on every exit, including the
-   disk-space stop.
+7. The gate's per-run directory is removed on every exit, including the disk-space stop; its
+   temporary home too, except when something was written to it, when it is kept for inspection.
 8. The Windows gap is stated more widely: `dirs` ignores `USERPROFILE` and `APPDATA` for
    `home_dir`, `config_dir` and `data_local_dir`.
 - **The simulation worker is started with a cleared environment**, so a test-binary worker fell back
@@ -154,3 +156,23 @@ Fixed:
 
 Gate (`logs/gate-test-home-fix3.summary`): 3,749 passed (+1), 0 failed, 113 ignored,
 `home-untouched` PASS.
+
+Committed as `848ebd50`.
+
+## As shipped, against the plan
+
+Planned (backlog closing condition): the test harness points `COPPERPOUR_STATE_DIR` and the user
+state directory at a temporary directory for every test. Shipped, and wider: every per-user
+directory, KiCad's configuration and documents directories, and the toolchain kept on the real ones;
+a source check (`every_test_binary_calls_isolate`) that CI runs; the gate's empty-`HOME` check. Not
+shipped: the empty-`HOME` check in CI, and Windows coverage for directories `dirs` reads from the
+known-folder API (both in `docs/BACKLOG.md`). Side effect: the machine-dependent failure carried
+since the baseline is gone, so the gate passes completely.
+
+## Documentation review
+
+An independent check confirmed hashes, gate counts, names and the 29 integration test files.
+Corrected: "option D" undefined; the shared directory's location stated as the fix-1 one; the gate's
+home said to be removed on every exit (it is kept when something was written to it); `AGENTS.md` and
+`scripts/gate.sh` comments still described the gate as the only check and the directory as
+"temporary"; the Freerouting backlog entry said "the temporary `HOME`".

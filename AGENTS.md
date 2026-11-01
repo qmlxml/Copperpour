@@ -31,8 +31,10 @@ docs alone: they move at release.
 ## Tests and your home directory
 
 Every test binary calls `copperpour_test_home::isolate()` from a `#[ctor::ctor(unsafe)]` function
-(see CONTRIBUTING.md), so tests never write into the real home. Add one to any new `tests/*.rs` file.
-`scripts/gate.sh` checks it: it fails if anything is written to the empty `HOME` it runs with.
+(see CONTRIBUTING.md), so tests never write into the real home. Add one to any new `tests/*.rs` file,
+and to a crate's `src/lib.rs` or `src/main.rs` when the crate gains unit tests. The test
+`every_test_binary_calls_isolate` fails under plain `cargo test` when one is missing, and
+`scripts/gate.sh` fails if anything is written to the empty `HOME` it runs with.
 
 ## Public API
 

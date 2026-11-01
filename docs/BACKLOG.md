@@ -88,7 +88,8 @@ Each entry names where it was found, what is wrong, and the condition that close
   `optimize_seconds` never takes effect. Closing condition: the log location on each platform, or a
   count taken from the SES itself.
 - **~~Building the Freerouting command in a unit test creates `~/.local/state/freerouting`.~~** Fixed
-  2026-11-01 by the test-home isolation: the test now writes under the temporary `HOME`.
+  2026-11-01 by the test-home isolation: the test now writes under the tests'
+  shared directory (by default `target/copperpour-test-home`).
 
 - **A slow snapshot download during optimisation ends the whole route** (no missed-poll tolerance on
   `download_running_output`), deleting the temporary SES; and a job that completes between the

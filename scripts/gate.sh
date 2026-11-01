@@ -57,7 +57,8 @@ check_space() {
 check_space
 
 # Home-directory check (2026-11-01). Every test binary points its per-user
-# directories at a temporary one (crates/copperpour-test-home). To catch a binary
+# directories at the tests' shared directory (crates/copperpour-test-home; by
+# default <target>/copperpour-test-home, here a per-run one). To catch a binary
 # that does not, and doctests, which cannot, the checks run with HOME and the XDG
 # directories set to an empty directory, and the gate fails if anything is written
 # there. RUSTUP_HOME and CARGO_HOME stay on the real ones: without them rustup
