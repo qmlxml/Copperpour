@@ -4269,12 +4269,15 @@ async fn handle_place_array(
     // The library data place_component gives a part; without it every array
     // instance had no mounting style, 3D model or net ties (merge of the
     // `marju212` fork, plan step 7).
-    let library = match copperpour_sexp::parse_sexp(&source)
+    // A footprint whose library data cannot be read is placed as before,
+    // without it, and the response says so (review 3 of plan step 7: these
+    // tools placed such footprints before the merge).
+    let (library, library_data_not_applied) = match copperpour_sexp::parse_sexp(&source)
         .context("invalid footprint S-expression")
         .and_then(|root| LibraryFootprintData::read(&root))
     {
-        Ok(library) => library,
-        Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
+        Ok(library) => (Some(library), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
     };
 
     let value = footprint
@@ -4336,7 +4339,10 @@ async fn handle_place_array(
                     0.0,
                     "F.Cu",
                 )
-                .and_then(|item| library.apply_to_item(item))
+                .and_then(|item| match &library {
+                    Some(library) => library.apply_to_item(item),
+                    None => Ok(item),
+                })
                 .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -4366,9 +4372,11 @@ async fn handle_place_array(
         Ok(placed) => placed,
         Err(error) => return Ok(CallToolResult::error(format!("IPC array error: {error}"))),
     };
-    Ok(CallToolResult::json(
-        &json!({ "placed_count": placed.len(), "components": placed }),
-    ))
+    let mut body = json!({ "placed_count": placed.len(), "components": placed });
+    if let Some(reason) = library_data_not_applied {
+        body["library_data_not_applied"] = json!(reason);
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_align_components(
@@ -4495,12 +4503,15 @@ async fn handle_duplicate_component(
     // The copy gets the library data place_component gives a part (merge of
     // the `marju212` fork, plan step 7). Back-side sources were refused
     // above, so the copy is on F.Cu.
-    let library = match copperpour_sexp::parse_sexp(&source)
+    // A footprint whose library data cannot be read is placed as before,
+    // without it, and the response says so (review 3 of plan step 7: these
+    // tools placed such footprints before the merge).
+    let (library, library_data_not_applied) = match copperpour_sexp::parse_sexp(&source)
         .context("invalid footprint S-expression")
         .and_then(|root| LibraryFootprintData::read(&root))
     {
-        Ok(library) => library,
-        Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
+        Ok(library) => (Some(library), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
     };
     let item = match KiCadIpcClient::build_footprint_item(
         &fp_id,
@@ -4514,8 +4525,10 @@ async fn handle_duplicate_component(
         fp_rotation,
         &fp_layer,
     )
-    .and_then(|item| library.apply_to_item(item))
-    {
+    .and_then(|item| match &library {
+        Some(library) => library.apply_to_item(item),
+        None => Ok(item),
+    }) {
         Ok(item) => item,
         Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
     };
@@ -4525,11 +4538,15 @@ async fn handle_duplicate_component(
         &ipc_reference,
         item.clone()
     ));
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "duplicated_from": reference,
         "new_reference": fp.reference,
         "x": fp.position.x, "y": fp.position.y
-    })))
+    });
+    if let Some(reason) = library_data_not_applied {
+        body["library_data_not_applied"] = json!(reason);
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_get_board_2d_view(
@@ -8810,6 +8827,13 @@ mod footprint_text_served_tests {
         .unwrap();
         assert!(result.is_error, "{:?}", result.content);
         let text = format!("{:?}", result.content);
+        // Reported as an uncertain outcome after a mutation, not a refusal,
+        // with each difference named (review 3 of plan step 7).
         assert!(text.contains("the edit was sent"), "{text}");
+        assert!(text.contains("Do not repeat the mutation"), "{text}");
+        assert!(
+            text.contains("R1 Reference is at (10, 18.5), not (12, 17)"),
+            "{text}"
+        );
     }
 }

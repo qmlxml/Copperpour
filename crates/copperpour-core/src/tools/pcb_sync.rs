@@ -179,6 +179,10 @@ enum CopperPiece {
 #[derive(Debug, Clone, PartialEq, Default)]
 struct RoutedCopper {
     pieces: BTreeMap<String, Vec<CopperPiece>>,
+    /// For each net, what each of `pieces` is ("track 3fa…"), index for
+    /// index, so a refusal can name the item to remove. Filled by the
+    /// snapshot; a piece without one is named by its net alone.
+    sources: BTreeMap<String, Vec<String>>,
     /// Nets with a routed item whose geometry could not be read (wrong
     /// declared type, no start, end, position or width): copper of these
     /// nets counts as reaching every pad, since where it is is unknown.
@@ -193,41 +197,70 @@ const TOUCH_SLACK_MM: f64 = 0.01;
 
 impl RoutedCopper {
     /// Whether copper of `net` reaches a pad of `footprint` numbered
-    /// `number`. Layers are not compared, so copper on another layer counts:
-    /// that errs towards refusing. A pad with no reach read (no geometry, a
-    /// custom shape) counts as touched.
+    /// `number`, and if so why. Layers are not compared, so copper on another
+    /// layer counts: that errs towards refusing. A pad with no reach read (no
+    /// geometry, a custom shape) counts as touched.
+    #[cfg(test)]
     fn touches_pad(&self, footprint: &BoardFootprint, number: &str, net: &str) -> bool {
+        self.reach(footprint, number, net).is_some()
+    }
+
+    /// Why copper of `net` counts as reaching pad `number`, or `None`.
+    fn reach(&self, footprint: &BoardFootprint, number: &str, net: &str) -> Option<String> {
         let pads: Vec<&PadReach> = footprint
             .pad_reach
             .iter()
             .filter(|pad| pad.number == number)
             .collect();
-        if pads.is_empty()
-            || pads.iter().any(|pad| pad.radius.is_none())
-            || self.incomplete_nets.contains(net)
-        {
-            return true;
+        if pads.is_empty() || pads.iter().any(|pad| pad.radius.is_none()) {
+            return Some(format!(
+                "the pad's copper shape could not be bounded (a custom or unread shape), so any \
+                 copper of '{net}' counts as reaching it"
+            ));
         }
-        let Some(pieces) = self.pieces.get(net) else {
-            return false;
-        };
-        pads.iter().any(|pad| {
-            let reach = pad.radius.unwrap_or(f64::INFINITY) + TOUCH_SLACK_MM;
-            pieces.iter().any(|piece| match piece {
-                CopperPiece::Segment { a, b, half_width } => {
-                    point_segment_distance(&pad.at, a, b) <= reach + half_width
-                }
-                CopperPiece::Disc { at, radius } => {
-                    (pad.at.x - at.x).hypot(pad.at.y - at.y) <= reach + radius
+        if self.incomplete_nets.contains(net) {
+            return Some(format!(
+                "copper of '{net}' whose geometry could not be read counts as reaching it; find \
+                 and remove it in KiCad"
+            ));
+        }
+        let pieces = self.pieces.get(net)?;
+        let index = pieces.iter().position(|piece| {
+            pads.iter().any(|pad| {
+                let reach = pad.radius.unwrap_or(f64::INFINITY) + TOUCH_SLACK_MM;
+                match piece {
+                    CopperPiece::Segment { a, b, half_width } => {
+                        point_segment_distance(&pad.at, a, b) <= reach + half_width
+                    }
+                    CopperPiece::Disc { at, radius } => {
+                        (pad.at.x - at.x).hypot(pad.at.y - at.y) <= reach + radius
+                    }
                 }
             })
-        })
+        })?;
+        let source = self
+            .sources
+            .get(net)
+            .and_then(|sources| sources.get(index))
+            .cloned()
+            .unwrap_or_else(|| format!("copper of '{net}'"));
+        Some(format!("{source} reaches it"))
     }
+}
 
-    /// Whether a zone pours `net`, or a zone's net could not be read.
-    fn poured(&self, net: &str) -> bool {
-        self.unreadable_zone || self.zone_nets.contains(net)
-    }
+/// "track <uuid> at (x, y)", for a refusal to name the item to remove.
+fn item_label(
+    kind: &str,
+    id: Option<&copperpour_ipc::gen::kiapi::common::types::Kiid>,
+    at: &Point,
+) -> String {
+    let id = id.map(|id| id.value.as_str()).filter(|id| !id.is_empty());
+    format!(
+        "{kind}{} at ({:.3}, {:.3})",
+        id.map(|id| format!(" {id}")).unwrap_or_default(),
+        at.x,
+        at.y
+    )
 }
 
 fn point_segment_distance(p: &Point, a: &Point, b: &Point) -> f64 {
@@ -1127,22 +1160,35 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             // could otherwise never leave a busy net such as +5V (merge of the
             // `marju212` fork, plan step 7). The pour rule is Copperpour's
             // (#862). Without the copper, any routed net blocks.
-            let blocked = match &board.copper {
-                Some(copper) => {
-                    copper.poured(old_net)
-                        || copper.poured(new_net)
-                        || (!old_net.is_empty() && copper.touches_pad(footprint, number, old_net))
-                }
-                None => {
-                    board.routed_nets.contains_key(old_net)
-                        || board.routed_nets.contains_key(new_net)
-                }
+            // Each refusal names its cause, so the caller removes what
+            // blocks rather than tracks that do not (review 3 of plan step 7).
+            let blocked: Option<String> = match &board.copper {
+                Some(copper) if copper.unreadable_zone => Some(
+                    "a zone's net could not be read, so it may pour either net; check the zones \
+                     with list_zones or in KiCad"
+                        .to_string(),
+                ),
+                Some(copper) if copper.zone_nets.contains(old_net) => Some(format!(
+                    "a zone pours '{old_net}'; its fill would still reach the pad (list_zones, \
+                     delete_zone)"
+                )),
+                Some(copper) if copper.zone_nets.contains(new_net) => Some(format!(
+                    "a zone pours '{new_net}'; its fill does not reach the pad until refilled \
+                     (list_zones, delete_zone)"
+                )),
+                Some(copper) if !old_net.is_empty() => copper
+                    .reach(footprint, number, old_net)
+                    .map(|why| format!("{why} (query_traces, delete_trace, delete_via)")),
+                Some(_) => None,
+                None => (board.routed_nets.contains_key(old_net)
+                    || board.routed_nets.contains_key(new_net))
+                .then(|| "routed copper uses that net".to_string()),
             };
-            if blocked {
+            if let Some(why) = blocked {
                 diagnostics.push(conflict(
                     "routed_pad_net_change",
                     format!(
-                        "{} pad {} would change from '{}' to '{}' while routed copper uses that net",
+                        "{} pad {} would change from '{}' to '{}': {why}",
                         component.reference, number, old_net, new_net
                     ),
                     Some(&component.reference),
@@ -2192,9 +2238,10 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
             .filter(|w| w.value_nm >= 0)
             .map(|w| copperpour_ipc::builders::nm_to_mm(w.value_nm) / 2.0)
     };
-    // The geometry is read only from items of their declared type: whether
-    // a trace query also lists arcs and vias has not been measured here, and
-    // decoding one message as another would place copper at random. An item
+    // The geometry is read only from items of their declared type. KiCad
+    // 10.0.7 returns only the requested types (`api_handler_pcb.cpp`, review 3
+    // of plan step 7), so this is a second check: decoding one message as
+    // another would place copper at random. An item
     // with a net whose geometry is not read puts that net in
     // `incomplete_nets`, so it still refuses (review 1 of plan step 7).
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
@@ -2209,11 +2256,18 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
                 mm(track.end.as_ref()),
                 half(track.width.as_ref()),
             ) {
-                (true, Some(a), Some(b), Some(half_width)) => copper
-                    .pieces
-                    .entry(net)
-                    .or_default()
-                    .push(CopperPiece::Segment { a, b, half_width }),
+                (true, Some(a), Some(b), Some(half_width)) => {
+                    copper
+                        .sources
+                        .entry(net.clone())
+                        .or_default()
+                        .push(item_label("track", track.id.as_ref(), &a));
+                    copper
+                        .pieces
+                        .entry(net)
+                        .or_default()
+                        .push(CopperPiece::Segment { a, b, half_width });
+                }
                 _ => {
                     copper.incomplete_nets.insert(net);
                 }
@@ -2233,11 +2287,23 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
                 mm(arc.end.as_ref()),
                 half(arc.width.as_ref()),
             ) {
-                (true, Some(a), Some(m), Some(b), Some(half_width)) => copper
-                    .pieces
-                    .entry(net)
-                    .or_default()
-                    .extend(arc_pieces(a, m, b, half_width)),
+                (true, Some(a), Some(m), Some(b), Some(half_width)) => {
+                    // No tool lists or deletes an arc on a live board.
+                    let label = format!(
+                        "{} (remove it in KiCad)",
+                        item_label("arc", arc.id.as_ref(), &a)
+                    );
+                    copper
+                        .sources
+                        .entry(net.clone())
+                        .or_default()
+                        .extend([label.clone(), label]);
+                    copper
+                        .pieces
+                        .entry(net)
+                        .or_default()
+                        .extend(arc_pieces(a, m, b, half_width));
+                }
                 _ => {
                     copper.incomplete_nets.insert(net);
                 }
@@ -2267,11 +2333,18 @@ fn snapshot_board(client: &copperpour_ipc::KiCadIpcClient, board: &Path) -> Resu
                 })
                 .unwrap_or(1.0);
             match at {
-                Some(at) => copper
-                    .pieces
-                    .entry(net)
-                    .or_default()
-                    .push(CopperPiece::Disc { at, radius }),
+                Some(at) => {
+                    copper
+                        .sources
+                        .entry(net.clone())
+                        .or_default()
+                        .push(item_label("via", via.id.as_ref(), &at));
+                    copper
+                        .pieces
+                        .entry(net)
+                        .or_default()
+                        .push(CopperPiece::Disc { at, radius });
+                }
                 None => {
                     copper.incomplete_nets.insert(net);
                 }
@@ -4969,6 +5042,7 @@ mod tests {
         board.routed_nets = BTreeMap::from([("VCC".to_string(), vcc.len())]);
         board.copper = Some(RoutedCopper {
             pieces: BTreeMap::from([("VCC".to_string(), vcc)]),
+            sources: BTreeMap::new(),
             incomplete_nets: BTreeSet::new(),
             zone_nets: zone_nets.iter().map(|net| net.to_string()).collect(),
             unreadable_zone,
@@ -7149,7 +7223,14 @@ mod tests {
 
         let on = plan_moving_off_with_tracks("VCC", vec![track_item("VCC", x, y)]).await;
         assert_eq!(on["status"], "conflict", "{on:#}");
-        assert_eq!(routed_pad_conflicts(&on).len(), 1, "{on:#}");
+        let refused = routed_pad_conflicts(&on);
+        assert_eq!(refused.len(), 1, "{on:#}");
+        // The refusal names the track to remove (review 3 of plan step 7).
+        assert!(
+            refused[0].contains(&format!("track track-{x}-{y} at"))
+                && refused[0].contains("delete_trace"),
+            "{refused:?}"
+        );
 
         let mut unreadable = track_item("VCC", x, y + 20_000_000);
         let mut track =
@@ -7264,7 +7345,7 @@ mod tests {
         assert_eq!(plan["status"], "conflict", "{plan:#}");
         assert_eq!(
             routed_pad_conflicts(&plan),
-            vec!["R1 pad 2 would change from 'GND' to 'NEW_NET' while routed copper uses that net"],
+            vec!["R1 pad 2 would change from 'GND' to 'NEW_NET': a zone pours 'GND'; its fill would still reach the pad (list_zones, delete_zone)"],
         );
     }
 
@@ -7288,7 +7369,7 @@ mod tests {
         assert_eq!(plan["status"], "conflict", "{plan:#}");
         assert_eq!(
             routed_pad_conflicts(&plan),
-            vec!["R1 pad 1 would change from 'VCC' to 'GND' while routed copper uses that net"],
+            vec!["R1 pad 1 would change from 'VCC' to 'GND': a zone pours 'GND'; its fill does not reach the pad until refilled (list_zones, delete_zone)"],
         );
     }
 
@@ -7326,7 +7407,7 @@ mod tests {
         assert_eq!(plan["status"], "conflict", "{plan:#}");
         assert_eq!(
             routed_pad_conflicts(&plan),
-            vec!["R1 pad 1 would change from 'VCC' to 'NEW_NET' while routed copper uses that net"],
+            vec!["R1 pad 1 would change from 'VCC' to 'NEW_NET': a zone's net could not be read, so it may pour either net; check the zones with list_zones or in KiCad"],
             "{plan:#}"
         );
     }

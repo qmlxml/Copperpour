@@ -45,8 +45,17 @@ enum ChangedDomain {
     TextEffects,
     /// The definition's net-tie pad groups (merge of the `marju212` fork).
     NetTies,
-    /// The footprint-level zone connection override.
-    ZoneConnection,
+}
+
+/// A library zone connection the refresh did not apply, because the board
+/// footprint's own design-rule overrides are kept as a group (review 3 of
+/// plan step 7). KiCad's Update Footprint takes zone connection together
+/// with clearance and mask and paste margins, all from the library or all
+/// from the board; Copperpour keeps the board's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct KeptZoneConnection {
+    board: String,
+    library: String,
 }
 
 #[derive(Debug)]
@@ -55,6 +64,7 @@ struct PreparedUpdate {
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
     text_effects: Vec<FieldEffectsChange>,
+    kept_zone_connection: Option<KeptZoneConnection>,
 }
 
 /// A field's text effects, in board millimetres and degrees. A `None`
@@ -237,6 +247,8 @@ struct PlannedUpdate {
     preserved: PreservedState,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     text_effects: Vec<FieldEffectsChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept_zone_connection: Option<KeptZoneConnection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -857,6 +869,7 @@ fn plan_updates(
                 changed_domains: prepared.changed_domains,
                 preserved: prepared.preserved,
                 text_effects: prepared.text_effects,
+                kept_zone_connection: prepared.kept_zone_connection,
             });
             prepared_items.push(prepared.item);
         }
@@ -1427,14 +1440,28 @@ fn build_updated_instance(
         attributes.do_not_populate = current_attributes.do_not_populate;
     }
     updated.attributes = Some(attributes);
-    // A library zone-connection override replaces the instance's, as KiCad's
-    // own refresh copies it; a library without one leaves the instance's
-    // overrides alone. `preserved.instance_overrides` reports the change.
+    // The library's net ties replace the board's. Its zone connection does
+    // not: the board footprint's design-rule overrides are kept as a group,
+    // and a library value that differs is reported (review 3 of plan step 7).
     super::library_footprint::apply_net_ties_and_zone_connection(
         &mut updated,
         &library.net_ties,
-        library.zone_connection,
+        None,
     )?;
+    let board_zone_connection = current
+        .overrides
+        .as_ref()
+        .map(|overrides| overrides.zone_connection())
+        // The protobuf default, unknown, carries no override: inherited.
+        .filter(|style| *style != kiapi::board::types::ZoneConnectionStyle::ZcsUnknown)
+        .unwrap_or(kiapi::board::types::ZoneConnectionStyle::ZcsInherited);
+    let kept_zone_connection = library
+        .zone_connection
+        .filter(|library| *library != board_zone_connection)
+        .map(|library| KeptZoneConnection {
+            board: board_zone_connection.as_str_name().to_string(),
+            library: library.as_str_name().to_string(),
+        });
 
     let mut text_effects = Vec::new();
     if text_reset.any() {
@@ -1482,6 +1509,7 @@ fn build_updated_instance(
         changed_domains,
         preserved,
         text_effects,
+        kept_zone_connection,
     })
 }
 
@@ -1919,15 +1947,6 @@ fn changed_domains(
     // net ties planned a no-op and never sent them.
     if current_definition.net_ties != updated_definition.net_ties {
         changed.insert(ChangedDomain::NetTies);
-    }
-    let zone_connection = |footprint: &kiapi::board::types::FootprintInstance| {
-        footprint
-            .overrides
-            .as_ref()
-            .map(|overrides| overrides.zone_connection)
-    };
-    if zone_connection(current) != zone_connection(updated) {
-        changed.insert(ChangedDomain::ZoneConnection);
     }
     Ok(changed)
 }
@@ -3580,20 +3599,24 @@ mod tests {
         let first = build(&applied, &jumper);
         assert_eq!(
             first.changed_domains,
-            BTreeSet::from([ChangedDomain::NetTies, ChangedDomain::ZoneConnection])
+            BTreeSet::from([ChangedDomain::NetTies])
         );
         let sent = decode(&first);
         assert_eq!(
             sent.definition.as_ref().unwrap().net_ties[0].pad_number,
             vec![pads[0].clone(), pads[1].clone()]
         );
+        // The board's zone connection is kept with its other design-rule
+        // overrides, and the library's differing value reported (review 3 of
+        // plan step 7).
+        assert_eq!(sent.overrides, applied.overrides);
+        assert!(first.preserved.instance_overrides);
         assert_eq!(
-            sent.overrides.as_ref().unwrap().zone_connection,
-            kiapi::board::types::ZoneConnectionStyle::ZcsFull as i32
-        );
-        assert!(
-            !first.preserved.instance_overrides,
-            "replacing the instance's zone connection is reported"
+            first.kept_zone_connection,
+            Some(KeptZoneConnection {
+                board: "ZCS_INHERITED".to_string(),
+                library: "ZCS_FULL".to_string(),
+            })
         );
 
         let again = build(&sent, &jumper);
@@ -4384,6 +4407,7 @@ mod tests {
             changed_domains: prepared.changed_domains.clone(),
             preserved: prepared.preserved.clone(),
             text_effects: prepared.text_effects.clone(),
+            kept_zone_connection: prepared.kept_zone_connection.clone(),
         };
         let unchanged = builders::pack_any(&applied, "kiapi.board.types.FootprintInstance");
         assert_eq!(

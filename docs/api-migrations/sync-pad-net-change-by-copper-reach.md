@@ -12,5 +12,8 @@ From the `marju212/Konnect` fork (behaviour of commit `7fa1510`, re-implemented 
   so copper on another layer also counts. A copper zone on no net blocks nothing.
 - Moving a pad onto a routed net that does not reach it is now allowed; the pad shows a ratsnest to
   its new net.
-- Callers that relied on any routed net refusing the change will see fewer conflicts; the message
-  and code are unchanged.
+- Callers that relied on any routed net refusing the change will see fewer conflicts. The code is
+  unchanged; the message now ends with the cause instead of "while routed copper uses that net": the
+  track, arc or via that reaches the pad (with its UUID and position), a zone pouring the old or the
+  new net, an unreadable zone, or copper whose geometry could not be read, with the tools that
+  remove it.

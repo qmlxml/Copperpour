@@ -12,7 +12,8 @@
 - `move_footprint_texts` refuses an unknown key, a present value of the wrong type, an entry that
   changes nothing, a coordinate outside KiCad's ±2,147 mm, and a `layer` on the other side of the
   board (the text would need mirroring). The batch is read, checked and sent inside one KiCad
-  commit; the response's `texts` are read back from the board, `moved` counts distinct texts, and a
-  board that holds something other than what was sent is reported as an error that says the edit
-  was sent.
+  commit; the response's `texts` are read back from the board and `moved` counts distinct texts. If
+  the read-back fails, or the board holds something other than what was sent, the result is an
+  uncertain outcome after a mutation (`IpcOutcomeUnknown`), naming each difference; the batch is one
+  undo step in KiCad.
 - Both need KiCad running with the board open. Nothing existing changed.

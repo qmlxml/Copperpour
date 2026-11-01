@@ -7,9 +7,14 @@ From the `marju212/Konnect` fork (behaviour of commit `a7886a9`, re-implemented 
   place. Before, a solder jumper's bridge reached the board as a short in DRC.
 - `place_array` and `duplicate_component` now also carry the library's attributes, description and
   keywords and 3D models, as `place_component` already did (`duplicate_component` refuses a back-side
-  source, as before).
+  source, as before). A footprint whose library data cannot be read (for example `(attr virtual)`) is
+  still placed, without it, and the response carries `library_data_not_applied` with the reason.
 - `update_footprints_from_library` accepts both clauses instead of refusing the footprint (KiCad's own
-  solder jumpers and test points carry them). Its `changed_domains` can now include `net_ties` and
-  `zone_connection`. A library zone connection replaces the board footprint's, as KiCad's refresh
-  does, and `preserved.instance_overrides` is then `false`.
-- A footprint whose `zone_connect` value is not 0–3 is refused by all of these, naming the value.
+  solder jumpers and test points carry them). Its `changed_domains` can now include `net_ties`. The
+  board footprint's zone connection is kept, with its other design-rule overrides (clearance, mask
+  and paste margins), as before; when the library's differs, a planned update carries
+  `kept_zone_connection` (`board`, `library`). KiCad's Update Footprint takes this whole group from
+  the library or keeps it from the board; Copperpour keeps it.
+- A footprint whose `zone_connect` value is not 0–3, or with a repeated `zone_connect` or
+  `net_tie_pad_groups` clause, is refused by the sync, `place_component` and the refresh, naming the
+  problem. Net-tie groups are read as KiCad's DRC reads them: split on commas, names trimmed.

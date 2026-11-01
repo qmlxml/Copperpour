@@ -78,3 +78,9 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
   refuses and an unreadable zone still refuses; migration note; the tests asserting "not blocked"
   name the states where blocking is right (Rule A).
 - **First opinion (this session):** option 2, with the same conditions. 2 models agree.
+
+17. **Step 7 review 3: library refresh keeps the board footprint's zone connection** with its other
+    design-rule overrides, and reports a differing library value as `kept_zone_connection`, instead
+    of taking it from the library alone (which matched neither of KiCad's two modes). The other
+    option was a new argument taking the whole group from the library, as KiCad's "Update clearance
+    overrides" does; not added overnight because it is new public API.

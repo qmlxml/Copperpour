@@ -3458,7 +3458,29 @@ impl KiCadIpcClient {
 
         // Report what the board holds, not what was computed: each edited
         // text read back, by footprint and field name or UUID. The last edit
-        // of a text is what the board should show.
+        // of a text is what the board should show. The commit is published by
+        // now, so a failure here is an uncertain outcome, not a refusal
+        // (review 3 of plan step 7).
+        self.read_back_footprint_texts(edits, &results)
+            .map_err(|error| {
+                anyhow::Error::new(IpcOutcomeUnknown {
+                    command: "move_footprint_texts".to_string(),
+                    reason: format!(
+                        "the edit was sent and committed as one undo step, but reading it back \
+                         failed: {error:#}. Call list_board_footprint_texts to see what the board \
+                         holds; undo in KiCad reverts the whole batch"
+                    ),
+                })
+            })
+    }
+
+    /// The texts `results` describe, as the board now holds them, or every
+    /// difference between the two.
+    fn read_back_footprint_texts(
+        &self,
+        edits: &[IpcFootprintTextEdit],
+        results: &[IpcFootprintText],
+    ) -> Result<Vec<IpcFootprintText>> {
         let references: Vec<String> = edits
             .iter()
             .map(|edit| edit.reference.clone())
@@ -3469,56 +3491,73 @@ impl KiCadIpcClient {
         let same_text = |a: &IpcFootprintText, b: &IpcFootprintText| {
             a.reference == b.reference && a.field == b.field && a.uuid == b.uuid
         };
+        let name = |text: &IpcFootprintText| {
+            format!(
+                "{} {}",
+                text.reference,
+                text.field
+                    .as_deref()
+                    .or(text.uuid.as_deref())
+                    .unwrap_or("text")
+            )
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
         let mut read_back: Vec<IpcFootprintText> = Vec::new();
+        let mut differences: Vec<String> = Vec::new();
         for expected in results.iter().rev() {
             if read_back.iter().any(|seen| same_text(seen, expected)) {
                 continue;
             }
-            let actual = board
-                .iter()
-                .find(|text| same_text(text, expected))
-                .with_context(|| {
-                    format!(
-                        "the edit was sent, but {} {} is not on the board when read back",
-                        expected.reference,
-                        expected
-                            .field
-                            .as_deref()
-                            .or(expected.uuid.as_deref())
-                            .unwrap_or("text")
-                    )
-                })?;
-            let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+            let Some(actual) = board.iter().find(|text| same_text(text, expected)) else {
+                differences.push(format!("{} is not on the board", name(expected)));
+                continue;
+            };
             if !close(actual.position.x, expected.position.x)
                 || !close(actual.position.y, expected.position.y)
-                || actual.layer != expected.layer
-                // KiCad may hold an angle normalised (-90 as 270).
-                || !close(
-                    (actual.angle - expected.angle).rem_euclid(360.0).min(
-                        (expected.angle - actual.angle).rem_euclid(360.0),
-                    ),
-                    0.0,
-                )
-                || actual.visible != expected.visible
             {
-                anyhow::bail!(
-                    "the edit was sent, but KiCad holds {} {} at ({}, {}) on {} rather than \
-                     ({}, {}) on {}",
-                    actual.reference,
-                    actual
-                        .field
-                        .as_deref()
-                        .or(actual.uuid.as_deref())
-                        .unwrap_or("text"),
+                differences.push(format!(
+                    "{} is at ({}, {}), not ({}, {})",
+                    name(actual),
                     actual.position.x,
                     actual.position.y,
-                    actual.layer,
                     expected.position.x,
-                    expected.position.y,
+                    expected.position.y
+                ));
+            }
+            if actual.layer != expected.layer {
+                differences.push(format!(
+                    "{} is on {}, not {}",
+                    name(actual),
+                    actual.layer,
                     expected.layer
-                );
+                ));
+            }
+            // KiCad may hold an angle normalised (-90 as 270).
+            let turn = (actual.angle - expected.angle).rem_euclid(360.0);
+            if !close(turn.min(360.0 - turn), 0.0) {
+                differences.push(format!(
+                    "{} is at {} degrees, not {}",
+                    name(actual),
+                    actual.angle,
+                    expected.angle
+                ));
+            }
+            if actual.visible != expected.visible {
+                differences.push(format!(
+                    "{} is {}, not {}",
+                    name(actual),
+                    if actual.visible { "visible" } else { "hidden" },
+                    if expected.visible {
+                        "visible"
+                    } else {
+                        "hidden"
+                    }
+                ));
             }
             read_back.push(actual.clone());
+        }
+        if !differences.is_empty() {
+            anyhow::bail!("KiCad holds something else: {}", differences.join("; "));
         }
         read_back.reverse();
         Ok(read_back)

@@ -164,3 +164,37 @@ re-taken at apply. Fixed:
 
 Gate (`logs/gate-step7-fix2.summary`): 3,730 passed (+4), 1 failed (the known baseline failure),
 110 ignored.
+Committed as `1a600e4`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+Confirmed: "old net only" is the right rule (copper of the new net touching the pad is a short the
+change removes; a third net's copper is a short before and after, which DRC reports); keeping the pour
+rule leaves no state worse than before; a back-side part's silkscreen can still be cleared with
+board coordinates; KiCad 10.0.7 returns only the requested item types (`api_handler_pcb.cpp`).
+Fixed:
+
+1. **The refusal named no cause**: one message, "while routed copper uses that net", covered five
+   causes and was false for a pour on the new net. Each refusal now ends with its cause: the track,
+   arc or via that reaches the pad (UUID and position, from a new `sources` list beside the copper
+   pieces), a zone pouring the old or new net, an unreadable zone, or unread geometry, with the tools
+   that remove it. The served track test asserts the track's UUID and `delete_trace` are named.
+2. An arc, an unreadable zone, or unread geometry can only be removed in KiCad: the refusal says so;
+   the missing arc tools are in `docs/BACKLOG.md`.
+3. `set_pad_net` skips the copper check (predates step 7): `docs/BACKLOG.md`.
+4. The comment saying the trace query's types were not measured is corrected.
+5. (The reviewer's question 5, the migration notes, is item 8.)
+6. **The library refresh took the zone connection from the library alone**, while keeping the board's
+   clearance, mask and paste overrides; KiCad's Update Footprint treats the group as one. The board's
+   zone connection is now kept and a differing library value reported as `kept_zone_connection`
+   (overnight decision 17). The `zone_connection` changed domain, added earlier in this step and never
+   released, is removed. Test `net_ties_and_zone_connection_are_sent_once_then_unchanged` updated.
+7. **A failed or mismatched read-back of `move_footprint_texts` looked like a refusal**: it is now an
+   uncertain outcome after a mutation (`IpcOutcomeUnknown`), naming every difference field by field,
+   and a failed read says the edit was sent. The served test asserts both.
+8. **`place_array` and `duplicate_component` had started refusing footprints whose library data
+   cannot be read** (`(attr virtual)`, a KiCad 5 model offset), which they placed before: they place
+   them without it again and report `library_data_not_applied`. Migration notes corrected.
+
+Gate (`logs/gate-step7-fix3.summary`): 3,730 passed (unchanged: existing tests were updated, none
+added), 1 failed (the known baseline failure), 110 ignored.

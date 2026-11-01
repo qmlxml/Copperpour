@@ -144,6 +144,16 @@ Each entry names where it was found, what is wrong, and the condition that close
   writer (`footprint.cpp` 10.0.7, lines 369 and 3862), so a library refresh of such a footprint would
   never be a no-op. Copperpour follows the DRC reading. Closing condition: measured on a live board, or
   such names refused.
+- **`set_pad_net` changes a pad's net without the copper check** the sync applies, so it can make the
+  short the sync refuses (predates step 7). Closing condition: the same check, with an explicit
+  override argument.
+- **No tool lists or deletes an arc track on a live board**, so a sync refused by an arc, by an
+  unreadable zone, or by copper whose geometry could not be read can only be cleared in KiCad (the
+  refusal says so). Closing condition: `query_traces` and `delete_trace` cover arcs.
+- **`kept_zone_connection` is reported only on a planned update**: a footprint whose only difference
+  from its library is the zone connection is counted unchanged and not reported. Closing condition:
+  reported for unchanged footprints too, or an option to take the library's design-rule overrides as
+  KiCad's "Update clearance overrides" does.
 - **The sync's readback does not check that net ties were kept**, as it does for models and
   attributes. Closing condition: `net_ties` compared in the readback.
 - **The IPC paths of this step were not run against KiCad here** (no KiCad GUI session): the footprint
