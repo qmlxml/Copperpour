@@ -109,7 +109,9 @@ Follow this sequence for a clean PCB workflow:
    cannot be placed (custom-shape pads are not supported), assign those parts a
    footprint without them; when the schematic connects a pad the footprint does not
    have, fix the symbol or the footprint choice. A successful apply is one KiCad
-   undo entry, so Ctrl-Z reverses the whole update.
+   undo entry, so Ctrl-Z reverses the whole update. When the response lists
+   `zones_to_refill` (a `zones_need_refill` warning), pads changed net under those pours:
+   run `refill_zones`, then `save_project`, before any DRC, plot or export.
 3. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
    Footprints from Library**. This is distinct from `update_pcb_from_schematic`:
@@ -377,6 +379,7 @@ add_zone(board, net_name, layer, points, clearance?, min_width?,
 
 **Must call `refill_zones` after any change that affects copper pour:**
 - After adding/moving components
+- After `update_pcb_from_schematic` reports `zones_to_refill`
 - After routing new traces
 - After modifying zone outlines
 - After changing design rules

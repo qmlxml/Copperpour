@@ -661,6 +661,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // cleanup, and move_footprint_texts arguments (its schema has them).
         "silk_overlap",
         "silk_over_copper",
+        // A response field and a warning code of update_pcb_from_schematic,
+        // named in the kicad-pcb skill's sync step (plan step 7b).
+        "zones_to_refill",
+        "zones_need_refill",
         "local_x",
         "local_y",
         // Parameters and a net in the kicad-simulation protection stand-ins, which

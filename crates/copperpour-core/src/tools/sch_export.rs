@@ -214,7 +214,7 @@ pub fn tools() -> Vec<ToolDef> {
              arc or via of its old net reaches it, or a zone's net cannot be read; a copper \
              pour on either net does not block, and `zones_to_refill` (with a \
              `zones_need_refill` warning) names the pour nets to refill with refill_zones \
-             after the apply. `changes` lists the first `limit` \
+             (toolset pcb_export) after the apply, then save_project. `changes` lists the first `limit` \
              planned changes, `changes_count` all of them; `output` writes the whole \
              response to a file.",
             json!({

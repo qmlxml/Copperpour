@@ -74,3 +74,30 @@ returns; the dry run, no-op, stale-revision and preflight returns all happen bef
 
 Gate (`logs/gate-step7b-fix2.summary`): 3,733 passed (+1), 1 failed (the known baseline failure),
 110 ignored.
+Committed as `dacb8ebe`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+Confirmed: `refill_zones` exists wherever the sync runs (both are live IPC); `save_project` saves the
+live document, so it saves the refilled fills; no skill or document still tells a caller to delete a
+pour first. Fixed:
+
+1. **The warning's alternative did not refill the board**: `run_drc` with `refill_zones: true` but
+   without `sync_live_board: true` fills a temporary copy for its own check and checks the saved
+   file, which does not hold the sync yet. The warning now names `run_drc` with
+   `sync_live_board: true` and `refill_zones: true`; the served test asserts it.
+2. **A failed refill said "do not repeat possibly applied work blindly"**, so a caller following it
+   stopped with stale fills that nothing reports again. `refill_zones` failures now say the refill
+   only recomputes the fills and can be repeated safely; other uncertain operations keep the old
+   warning. Test `a_failed_refill_says_it_can_be_repeated`.
+3. **The step 7 migration note still listed a pour as a refusal**, contradicting the step 7b note in
+   the same release: corrected, pointing to the new note.
+4. The kicad-pcb skill's sync step and its refill list now say to run `refill_zones` and
+   `save_project` when the sync reports `zones_to_refill`.
+5. The warning and the tool description name the `pcb_export` toolset of `refill_zones`.
+6. The tool description and the dry-run warning also say to save after the refill.
+
+A first gate run failed Copperpour's documentation test, which read the skill's `zones_to_refill` and
+`zones_need_refill` as tool names; both were added to its `NOT_TOOLS` list. Gate
+(`logs/gate-step7b-fix3.summary`): 3,734 passed (+1), 1 failed (the known baseline failure), 110
+ignored.

@@ -8,7 +8,11 @@ re-implemented on Copperpour's code.
 - Now the change is planned and applied, as KiCad's Update PCB from Schematic does. The response has
   `zones_to_refill` (the pour nets the reassignments involve) and a `warnings` entry with code
   `zones_need_refill`, in the dry run (what the apply will leave) and after the apply (run
-  `refill_zones`, then `save_project`). Until the refill the stored fills are stale, and DRC can
+  `refill_zones`, toolset `pcb_export`, then `save_project`; or `run_drc` with `sync_live_board: true`
+  and `refill_zones: true`, which refills, saves and checks the live board). On an uncertain commit
+  outcome both are fields of the error's JSON body; a batch confirmed rolled back carries neither.
+- A failed `refill_zones` now says the refill can be repeated safely (it only recomputes the fills),
+  instead of warning against repeating it. Until the refill the stored fills are stale, and DRC can
   report shorts or unconnected items there.
 - Still refused: a track, arc or via of the pad's old net reaching the pad, and any zone whose net
   cannot be read. A conflicted plan has an empty `zones_to_refill`.

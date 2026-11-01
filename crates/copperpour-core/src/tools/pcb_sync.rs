@@ -879,15 +879,18 @@ fn refill_warning(zones: &BTreeSet<String>, applied: bool) -> Option<serde_json:
     let message = if applied {
         format!(
             "Pads changed net under zones on {nets}; their fills are stale. Run refill_zones \
-             (or run_drc with refill_zones: true), then save_project. Until then DRC can \
-             report shorts or unconnected items there, and a board saved and plotted with the \
-             stale fill can have a short. This is reported only in this response: a later \
-             sync does not detect a stale fill."
+             (toolset pcb_export), then save_project; or run_drc with sync_live_board: true \
+             and refill_zones: true, which refills the live board, saves it and checks it. A \
+             refill only recomputes the fills, so it can be repeated if it fails. Until it \
+             succeeds DRC can report shorts or unconnected items there, and a board saved and \
+             plotted with the stale fill can have a short. This is reported only in this \
+             response: a later sync does not detect a stale fill."
         )
     } else {
         format!(
             "Applying this plan changes pads' nets under zones on {nets}; their fills will be \
-             stale until refill_zones runs after the apply."
+             stale until refill_zones (toolset pcb_export) runs after the apply, followed by \
+             save_project."
         )
     };
     Some(serde_json::json!({ "code": "zones_need_refill", "message": message }))
@@ -7594,7 +7597,8 @@ mod tests {
         assert!(
             warnings.len() == 1
                 && warnings[0].contains("Run refill_zones")
-                && warnings[0].contains("then save_project"),
+                && warnings[0].contains("then save_project")
+                && warnings[0].contains("sync_live_board: true"),
             "{warnings:?}"
         );
     }

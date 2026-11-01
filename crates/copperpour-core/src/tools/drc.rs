@@ -73,13 +73,23 @@ pub(crate) fn report_write_failure(
 }
 
 fn uncertain(board: &Path, operation: &str, reason: impl std::fmt::Display) -> CallToolResult {
+    // A refill recomputes every fill from the board's current geometry, so
+    // repeating it cannot apply work twice; telling the caller not to repeat
+    // it left a board whose fills stay stale after a sync (step 7b review 3).
+    let guidance = if operation == "refill_zones" {
+        "The fills may be stale until a refill succeeds. A refill only recomputes the fills from \
+         the board as it is, so it can be repeated safely; repeat it, then save the board."
+    } else {
+        "The operation was not accepted as verified. Inspect the requested board in KiCad and its \
+         saved file before retrying; do not repeat possibly applied work blindly."
+    };
     CallToolResult::error_kind(
         ToolErrorKind::MutationOutcomeUncertain {
             operation: operation.into(),
             path: board.display().to_string(),
             reason: reason.to_string(),
         },
-        format!("{operation}: {reason}. The operation was not accepted as verified. Inspect the requested board in KiCad and its saved file before retrying; do not repeat possibly applied work blindly."),
+        format!("{operation}: {reason}. {guidance}"),
     )
 }
 
@@ -241,6 +251,23 @@ fn normalize_snapshot_metadata(node: &mut copperpour_sexp::SexpNode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed refill says it can be repeated, since it only recomputes the
+    /// fills; other uncertain operations keep the warning against repeating
+    /// them (step 7b review 3).
+    #[test]
+    fn a_failed_refill_says_it_can_be_repeated() {
+        let text = |result: &CallToolResult| format!("{:?}", result.content);
+        let board = Path::new("/tmp/board.kicad_pcb");
+        let refill = text(&uncertain(board, "refill_zones", "timed out"));
+        assert!(refill.contains("can be repeated safely"), "{refill}");
+        assert!(!refill.contains("do not repeat"), "{refill}");
+        let save = text(&uncertain(board, "save", "timed out"));
+        assert!(
+            save.contains("do not repeat possibly applied work"),
+            "{save}"
+        );
+    }
     use crate::{mcp::handler::McpHandler, test_support::MockIpcServer, tools::ServerConfig};
     use copperpour_ipc::gen::kiapi;
     use prost::Message;
