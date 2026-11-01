@@ -231,6 +231,13 @@ fn worker_command(runtime: &SimulationRuntime, dir: &Path) -> Command {
         .env("SPICE_USERINIT_DIR", ".")
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    // In Copperpour's own tests the worker may be a test binary, which isolates
+    // itself from the developer's home at start; with the environment cleared
+    // it would not find the tests' shared directory (crates/copperpour-test-home).
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("COPPERPOUR_TEST_HOME_ROOT") {
+        command.env("COPPERPOUR_TEST_HOME_ROOT", root);
+    }
     command
 }
 

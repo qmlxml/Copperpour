@@ -69,10 +69,27 @@ gate_home="$(mktemp -d "${TMPDIR:-/tmp}/copperpour-gate-home.XXXXXX")" || {
     echo "gate: could not create a temporary HOME" | tee -a "$summary"
     exit 2
 }
+# The tests' shared directory (crates/copperpour-test-home) for this run only:
+# a fresh one under the build directory, so a run neither depends on what an
+# earlier one left nor removes the directory another run of the same checkout
+# is using (review 2). Removed when the gate ends, however it ends.
+test_root="$(mktemp -d "$CARGO_TARGET_DIR/copperpour-test-home.XXXXXX")" || {
+    echo "gate: could not create the tests' shared directory" | tee -a "$summary"
+    exit 2
+}
+export COPPERPOUR_TEST_HOME_ROOT="$test_root"
+# The developer's own home, for tests that must find a per-user KiCad
+# installation: recorded before HOME changes (review 2).
+export COPPERPOUR_TEST_REAL_HOME="$real_home"
+cleanup() {
+    rm -rf "$test_root"
+    # The gate's home is kept for inspection only when the check found
+    # something in it.
+    [ -d "$gate_home" ] && rmdir "$gate_home" 2>/dev/null
+    return 0
+}
+trap cleanup EXIT
 export HOME="$gate_home"
-# The tests' shared directory (crates/copperpour-test-home) starts empty, so a
-# run does not depend on what an earlier run left there.
-rm -rf "$CARGO_TARGET_DIR/copperpour-test-home"
 unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME
 
 status=0
@@ -99,7 +116,6 @@ run viewer-test    cargo test --locked --manifest-path crates/schematic-viewer/C
 written="$(cd "$gate_home" && find . -mindepth 1 | sort)"
 if [ -z "$written" ]; then
     echo "PASS home-untouched" >> "$summary"
-    rmdir "$gate_home"
 else
     echo "FAIL home-untouched (kept: $gate_home)" >> "$summary"
     echo "===== home-untouched: written under the gate's HOME" >> "$log"

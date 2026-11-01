@@ -15,9 +15,13 @@
 //! binary that does not call this, and doctests, which cannot.
 //!
 //! Remaining gaps, stated rather than hidden: on Windows `dirs` reads the
-//! known-folder API, not these variables, for `data_local_dir`, which only
-//! `native_specctra_bridge.rs` uses for state; and kicad-cli on Windows may
-//! still use the real profile's cache folder.
+//! known-folder API and ignores `USERPROFILE` and `APPDATA` for `home_dir`,
+//! `config_dir` and `data_local_dir`, so Copperpour code that calls those
+//! through `app_dirs` is redirected only where it also honours a variable set
+//! here (`COPPERPOUR_STATE_DIR`, `APPDATA` read directly); and kicad-cli on
+//! Windows may still use the real profile's cache folder. `UNCHANGED` is
+//! inherited by grandchildren and, if exported in a shell, turns isolation off
+//! for the whole run; the gate's empty-home check is what would show it.
 
 use std::path::{Path, PathBuf};
 
@@ -30,27 +34,54 @@ pub const UNCHANGED: &str = "COPPERPOUR_TEST_HOME_UNCHANGED";
 /// model cache (review 1 of this change): only those read it.
 pub const REAL_HOME: &str = "COPPERPOUR_TEST_REAL_HOME";
 
-/// The directory every test process of this checkout shares:
-/// `<target>/copperpour-test-home`, found from the test binary's own path
-/// (`<target>/<profile>/deps/<binary>`). Under the build directory rather than
-/// the system temporary directory, so it belongs to this user and checkout:
-/// a fixed name in a shared `/tmp` could be created first by another user,
-/// even as a link into this user's home (review 1). `cargo clean` removes it,
-/// and the gate empties it before each run so runs do not depend on earlier
-/// ones. Falls back to the temporary directory with the user's name when the
-/// binary's path has no such shape.
+/// The shared directory's path, exported by [`isolate`] so that child
+/// processes (including a copy of the test binary run from elsewhere) use the
+/// same one, and set by `scripts/gate.sh` to a directory of its own per run
+/// (review 2 of this change).
+pub const ROOT: &str = "COPPERPOUR_TEST_HOME_ROOT";
+
+/// The directory test processes share: [`ROOT`] when it is set to an absolute
+/// path; else `<target>/copperpour-test-home`, where `<target>` is the nearest
+/// directory above the test binary that holds Cargo's `CACHEDIR.TAG` (so
+/// `cargo test --target <triple>` and a custom `CARGO_TARGET_DIR` find the same
+/// one), else the parent of the profile directory above the binary's `deps`.
+/// Under the build directory rather than the system temporary
+/// directory, so it belongs to this user and checkout: a fixed name in a shared
+/// `/tmp` could be created first by another user, even as a link into this
+/// user's home (review 1). When neither applies, a directory named after the
+/// user and this process is used, created fresh.
 pub fn root() -> PathBuf {
-    let from_exe = std::env::current_exe().ok().and_then(|exe| {
-        let deps = exe.parent()?;
-        (deps.file_name()? == "deps").then(|| deps.parent()?.parent().map(Path::to_path_buf))?
+    if let Some(root) = std::env::var_os(ROOT)
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+    {
+        return root;
+    }
+    // The build directory: the nearest ancestor holding Cargo's
+    // `CACHEDIR.TAG`, else the parent of the profile directory above `deps`
+    // (`<target>[/<triple>]/<profile>/deps/<binary>`); Cargo does not always
+    // write the tag (measured: not in this checkout's target directory).
+    let target = std::env::current_exe().ok().and_then(|exe| {
+        exe.ancestors()
+            .skip(1)
+            .find(|dir| dir.join("CACHEDIR.TAG").is_file())
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                let deps = exe.parent()?;
+                (deps.file_name()? == "deps")
+                    .then(|| deps.parent()?.parent().map(Path::to_path_buf))?
+            })
     });
-    from_exe
+    target
         .map(|target| target.join("copperpour-test-home"))
         .unwrap_or_else(|| {
             let user = std::env::var("USER")
                 .or_else(|_| std::env::var("USERNAME"))
                 .unwrap_or_else(|_| "user".into());
-            std::env::temp_dir().join(format!("copperpour-test-home-{user}"))
+            std::env::temp_dir().join(format!(
+                "copperpour-test-home-{user}-{}",
+                std::process::id()
+            ))
         })
 }
 
@@ -69,6 +100,7 @@ pub fn isolate() {
         return;
     }
     let root = root();
+    std::env::set_var(ROOT, &root);
     // Only an absolute home is trusted: a relative one would pin the toolchain
     // relative to the working directory (review 1).
     if let Some(real_home) = std::env::var_os("HOME")
@@ -133,12 +165,20 @@ mod tests {
     fn isolate_points_home_away_and_keeps_the_toolchain() {
         if std::env::var_os("COPPERPOUR_TEST_HOME_CHILD").is_some() {
             let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            // A real home already recorded (the gate sets it) is kept.
+            let expected_real = std::env::var_os(super::REAL_HOME)
+                .map(std::path::PathBuf::from)
+                .or_else(|| real_home.clone().filter(|home| home.is_absolute()));
             super::isolate();
             let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
             assert!(home.starts_with(super::root()), "{home:?}");
             assert_eq!(
+                std::env::var_os(super::ROOT).map(std::path::PathBuf::from),
+                Some(super::root())
+            );
+            assert_eq!(
                 std::env::var_os(super::REAL_HOME).map(std::path::PathBuf::from),
-                real_home.clone().filter(|home| home.is_absolute())
+                expected_real
             );
             assert_ne!(Some(home.clone()), real_home);
             for variable in ["XDG_DATA_HOME", "COPPERPOUR_STATE_DIR", "KICAD_CONFIG_HOME"] {

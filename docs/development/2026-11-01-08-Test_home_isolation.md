@@ -88,3 +88,42 @@ Confirmed: every test binary is covered (29 integration files, each library's un
 
 Gate (`logs/gate-test-home-fix1.summary`): 3,748 passed, 0 failed, 113 ignored, `home-untouched`
 PASS.
+Committed as `e1b8c172`.
+
+## Review 2 (robustness) and fix pass 2
+
+Confirmed: setting the environment from the constructor is safe (no constructor in the dependency
+tree starts threads, by reading). Fixed:
+
+1. **A test that runs a copy of the test binary from a temporary folder fell back to a fixed name
+   in `/tmp`.** `isolate()` now exports the shared directory as `COPPERPOUR_TEST_HOME_ROOT`, and
+   `root()` reads it first, so children and copies use the same directory; the fallback is a
+   per-process name. Measured afterwards: no `/tmp/copperpour-test-home*` after a gate run or a
+   plain `cargo test`.
+2. **Under the gate, the real home recorded was the gate's empty home**, so a per-user KiCad was not
+   found: the gate exports `COPPERPOUR_TEST_REAL_HOME` itself, which `isolate()` keeps.
+3. **The gate emptied the shared directory while another run of the same checkout could be using
+   it**: each gate run now creates its own (`mktemp -d` under the build directory), passes it in
+   `COPPERPOUR_TEST_HOME_ROOT`, and removes it when the gate ends, however it ends (`trap`).
+4. `cargo test --target <triple>` and a custom target directory: `root()` finds the build directory
+   by Cargo's `CACHEDIR.TAG`, else by the `deps` folder above the binary. (Measured: Cargo had not
+   written `CACHEDIR.TAG` in this checkout's target directory, so the first version, with the tag
+   only, sent every plain `cargo test` binary to the `/tmp` fallback; the gate caught nothing because
+   it sets the variable. Found while checking finding 1.)
+5. `install_homes` (production code reading a test variable): its comment states that the variable
+   only adds a home searched after the others, so it changes the choice only when nothing else is
+   found.
+6. `UNCHANGED` exported in a shell turns isolation off: stated in the crate documentation (the
+   gate's empty-home check would show it).
+7. The gate's temporary home and per-run directory are removed on every exit, including the
+   disk-space stop.
+8. The Windows gap is stated more widely: `dirs` ignores `USERPROFILE` and `APPDATA` for
+   `home_dir`, `config_dir` and `data_local_dir`.
+- **The simulation worker is started with a cleared environment**, so a test-binary worker fell back
+  to `/tmp`: in test builds the launcher passes `COPPERPOUR_TEST_HOME_ROOT` through (also in
+  `simulation_live.rs`'s own worker launch).
+- The new crate's test expected the recorded real home to equal `HOME` at start; under the gate
+  that value is supplied, so the test now expects a supplied value to be kept.
+
+Gate (`logs/gate-test-home-fix2.summary`): 3,748 passed, 0 failed, 113 ignored, `home-untouched`
+PASS; nothing left in `/tmp` or the build directory afterwards.

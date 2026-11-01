@@ -716,6 +716,10 @@ impl WorkerRun {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // The tests' shared directory, through the cleared environment.
+        if let Some(root) = std::env::var_os("COPPERPOUR_TEST_HOME_ROOT") {
+            command.env("COPPERPOUR_TEST_HOME_ROOT", root);
+        }
         command
     }
 

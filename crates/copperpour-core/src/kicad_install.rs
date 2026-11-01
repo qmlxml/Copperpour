@@ -470,7 +470,10 @@ fn windows_registry_install_roots() -> Vec<PathBuf> {
 /// (`COPPERPOUR_TEST_REAL_HOME`, set by `copperpour-test-home`), so a KiCad
 /// installed for one user is still found while tests run with a temporary
 /// `HOME` (review 1 of the test-isolation change). The variable only adds a
-/// place to look; it is never written to.
+/// place to look, after the system locations and the user's own home, so it
+/// changes which kicad-cli is chosen only when no other one is found; it is
+/// never written to. A user who sets it outside tests gets the same: one more
+/// home searched.
 #[allow(dead_code)]
 fn install_homes() -> Vec<PathBuf> {
     let mut homes: Vec<PathBuf> = crate::app_dirs::home_dir().into_iter().collect();
