@@ -118,3 +118,4 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
   `excluded_in_schematic`; other parts missing from the SPICE netlist get a separate code
   `not_in_spice_netlist` with a true description; both keep the result `modified`. To be done in the
   follow-up work. 2 models agree.
+- **2: KEEP.** 2 models agree.
