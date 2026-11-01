@@ -25,10 +25,18 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
 5. **HTTP clients get no progress notifications.** The contribution broadcast them to every open
    event stream, which leaked one client's progress to another; removed rather than rebuilt per
    request. Reverse: restore the `sse_senders` loop in `progress_reporter` (handler.rs).
-6. **`route_specctra_dsn` keeps `success: true` when Freerouting's log could not be read**, with the
-   new `unrouted_connections_checked: false` and a message that completeness is unknown. The
-   alternative was to report such runs as failures.
+6. ~~`route_specctra_dsn` keeps `success: true` when Freerouting's log could not be read.~~
+   **Reversed by step 5 review 3**: that broke the owner's rule that a check which did not run is
+   never reported as a pass. `success` is now false whenever the unrouted or violation count is
+   unknown, a project rule was not applied, the settings were not verified, or no project was found.
+   This makes every routing on macOS and Windows report `success: false` until Freerouting's log is
+   found there (`docs/BACKLOG.md`).
 7. **The CPL policy id changed to `konnect-jlcpcb-cpl-v2`** because the rule set changed. Reverse:
    the `policy_id` in `jlcpcb_cpl_corrections_v1.json`.
 8. **Bottom-side CPL parts with a non-zero correction are now listed for review** (still
    corrected). This adds review warnings to existing two-sided boards.
+9. **Project design rules are a lower limit for `router_settings`**: relaxing a rule, `strict_drc:
+   false` or `autorouter.ignore_net_classes: true` is refused unless `allow_below_project_rules:
+   true`. Several `.kicad_pro` files beside the DSN are refused.
+10. **Every part a built-in CPL rule rotated is listed in the review warnings** (designator overrides
+    and project rules are not).

@@ -765,6 +765,9 @@ impl JlcpcbCorrectionPolicies {
     }
 }
 
+/// The start of the note on a corrected bottom-side part in the review list.
+const BOTTOM_SIDE_NOTE_START: &str = "bottom-side part:";
+
 /// Footprint name starts that a rotation-insensitive prefix would otherwise
 /// cover but whose rotation matters.
 const POLARISED_DESPITE_PREFIX: &[&str] = &["L_CommonModeChoke"];
@@ -1002,6 +1005,18 @@ impl JlcpcbOrientationEvidence {
                 .push(&part.designator);
         }
         for ((rule_id, footprint, note), designators) in unverified {
+            // A bottom-side part is rotated by its rule, unlike the other
+            // entries, so its warning must not say "left at KiCad rotation"
+            // (merge review, plan step 5).
+            if note.starts_with(BOTTOM_SIDE_NOTE_START) {
+                warnings.push(format!(
+                    "JLCPCB rotation corrected by rule {rule_id} for bottom-side footprint {footprint}, \
+                     but the rule was observed on top-side parts only; the other mirror convention \
+                     gives a rotation 180 degrees different. Check pin 1 in JLCPCB's preview: {}.",
+                    designators.join(", ")
+                ));
+                continue;
+            }
             let mut warning = format!(
                 "JLCPCB rotation not verified for footprint {footprint} (rule {rule_id}); left at KiCad rotation: {}.",
                 designators.join(", ")
@@ -1011,6 +1026,40 @@ impl JlcpcbOrientationEvidence {
                 warning.push_str(note);
             }
             warnings.push(warning);
+        }
+        // Every part a rule rotated, so the reviewer checks those too: a wrong
+        // rule otherwise produced no warning (merge review, plan step 5).
+        // Only built-in rules: a project's own rules are the user's choice.
+        let built_in: Vec<&str> = self
+            .policies
+            .iter()
+            .filter(|policy| policy.precedence.starts_with("built-in"))
+            .map(|policy| policy.policy_id.as_str())
+            .collect();
+        let rotated: Vec<String> = self
+            .applied_corrections
+            .iter()
+            .filter(|part| part.rotation_before_degrees != part.rotation_after_degrees)
+            .filter(|part| built_in.contains(&part.policy_id.as_str()))
+            .map(|part| {
+                format!(
+                    "{} {} {} -> {} (rule {})",
+                    part.designator,
+                    part.footprint,
+                    part.rotation_before_degrees,
+                    part.rotation_after_degrees,
+                    part.rule_id
+                )
+            })
+            .collect();
+        if !rotated.is_empty() {
+            warnings.push(format!(
+                "JLCPCB rotation changed from KiCad's by a built-in rule for {} part(s); the \
+                 rules match footprint names only and rest on few observations, so check these \
+                 in JLCPCB's preview: {}.",
+                rotated.len(),
+                rotated.join("; ")
+            ));
         }
         let mut uncovered = std::collections::BTreeMap::<&str, Vec<&str>>::new();
         for part in self
@@ -1189,11 +1238,10 @@ fn jlcpcb_cpl_from_kicad_csv(
                     side: layer.to_string(),
                     policy_id: policy_id.to_string(),
                     rule_id: rule_id.to_string(),
-                    note: Some(
-                        "bottom-side part: the correction was observed on top-side parts only; \
-                         check its rotation in JLCPCB's preview"
-                            .to_string(),
-                    ),
+                    note: Some(format!(
+                        "{BOTTOM_SIDE_NOTE_START} the correction was observed on top-side parts \
+                         only; check its rotation in JLCPCB's preview"
+                    )),
                 });
             }
             applied_corrections.push(JlcpcbAppliedCorrection {
@@ -1922,7 +1970,20 @@ mod jlcpcb_assembly_tests {
         assert_eq!(evidence.unmatched_footprints[0].designator, "R1");
         assert!(!evidence.unmatched_footprints[0].review_required);
         let warnings = evidence.review_warnings();
-        assert_eq!(warnings.len(), 2);
+        // J1 unverified, U2 bottom-side, and the rotated parts U1 and U2.
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("changed from KiCad's") && warning.contains("U1 ")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("bottom-side footprint") && warning.contains("U2")),
+            "{warnings:?}"
+        );
         assert!(warnings[0].starts_with(
             "JLCPCB rotation not verified for footprint USB_C_Receptacle_HRO_TYPE-C-31-M-12"
         ));

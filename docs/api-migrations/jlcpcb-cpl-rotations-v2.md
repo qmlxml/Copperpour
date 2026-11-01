@@ -7,4 +7,6 @@ correction where none applied before include every `SOIC-*`, `SSOP-*`, `MSOP-*`,
 connector now keeps KiCad's rotation with a warning. A board exported again can therefore get a
 different CPL file. The policy id in responses changed from `konnect-jlcpcb-cpl-v1` to
 `konnect-jlcpcb-cpl-v2`, so the two rule sets can be told apart. Check the rotations of affected
-parts in JLCPCB's preview before ordering, and pin any part with a designator override.
+parts in JLCPCB's preview before ordering, and pin any part with a designator override. The
+review warnings now list every part a built-in rule rotated, and bottom-side parts with a non-zero
+correction (every observation behind the rules is of a top-side part).

@@ -117,3 +117,44 @@ part of the log on each poll.
 
 Gate after fix pass 2 (`logs/gate-step5-fix2.summary`): 3,689 passed (+4), 1 failed (the known
 baseline failure), 109 ignored.
+Committed as `e097248`.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+No state that cannot be left was found (a stale log gives an unknown count, not a false one, because
+lines are filtered by the job's tag). Findings and what was done; decisions are listed in
+`2026-11-01-00-Overnight_decisions.md` (items 6, 9, 10):
+
+1. **`success` meant two things**: "fully routed" when the log was read, "the job finished" when not.
+   This reverses fix pass 1's choice (overnight decision 6), which broke the rule that a check that
+   did not run is never a pass. `success` is now true only when the log shows zero unrouted
+   connections and zero clearance violations, the project's rules were found and applied, and the
+   settings were read back and verified; otherwise `message` lists each reason. The SES is still
+   written.
+2. **Clearance violations were ignored**: Freerouting's log reports them ("9 unrouted and 218
+   violations"); they are now parsed (`latest_violations`), reported as `clearance_violations`, and
+   make `success` false. The description says `success` is not a design-rule verdict.
+3. **The project's rules were not a lower limit**: `router_settings` could replace them, or set
+   `strict_drc: false` / `autorouter.ignore_net_classes: true`, and still get success. Now refused
+   (`relaxations`) unless `allow_below_project_rules: true`, which then never gives `success: true`.
+   Test `settings_that_relax_the_project_rules_are_found`.
+4. **Zero or several `.kicad_pro` files**: several are now refused (name one with `project_path`); none
+   makes `success` false with the reason.
+5. **A project rule the JAR did not apply** now makes `success` false and is named in `message`.
+6. **An unverifiable settings check looked like a passed one**: new `settings_checked`; false makes
+   `success` false.
+7. **Array settings were compared by plain equality**, so an echo in another order or with `3.0` for
+   `3` was refused every time. Arrays are now compared element by element and lists of names as
+   sets. Test `arrays_compare_by_element_and_name_lists_as_sets`.
+8. **"Best board" was not explained**: the description now says the board kept with
+   `optimize_seconds` is best by the optimiser's score and not DRC-clean or complete by construction.
+9. **The bottom-side review warning said "left at KiCad rotation"** for parts that were rotated. It now
+   says the part was corrected by the rule, that the rule was observed on top-side parts only, and
+   that the other mirror convention differs by 180 degrees.
+10. **A wrong top-side rule produced no warning**: every part a built-in rule rotated is now listed in
+   the review warnings (designator overrides and project rules are the user's own choice and are
+   not). `built_in_rules_correct_soic_on_both_sides_and_leave_usb_c_for_review` updated.
+11. HTTP: nothing taken away (progress was new in this step).
+
+Gate (`logs/gate-step5-fix3.summary`): 3,691 passed (+2), 1 failed (the known baseline failure),
+109 ignored.

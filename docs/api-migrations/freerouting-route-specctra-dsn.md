@@ -8,10 +8,18 @@ is refused before routing) and `project_path` (the `.kicad_pro` whose edge and h
 with the job; by default the one next to the DSN, else in its parent folder). The project's rules are
 now sent by default, so routing results can differ from earlier releases for the same board.
 
-A routing that leaves connections unrouted now returns `success: false` with the count in
-`unrouted_connections`; the SES is still written. `unrouted_connections_checked` is false when
-Freerouting's log could not be read (it is looked for where Freerouting keeps it on Linux, or at
-`FREEROUTING_LOG`); the count is then `null` and `message` says completeness is unknown.
+`success` is now true only when Freerouting's log shows no unrouted connections and no clearance
+violations, the project's design rules were found and applied, and the settings sent were read back
+and verified. Otherwise `success` is false and `message` says why; the SES is still written. New
+fields: `unrouted_connections_checked`, `clearance_violations`, `settings_checked`. A routing that
+leaves connections unrouted, or whose counts could not be read (Freerouting's log is looked for
+where Freerouting keeps it on Linux, or at `FREEROUTING_LOG`), therefore no longer reports success.
+
+`router_settings` may tighten the project's rules but not relax them: a value below the project's
+for `copper_to_edge_clearance_um`, `hole_to_hole_um` or `hole_clearance_um`, `strict_drc: false` or
+`autorouter.ignore_net_classes: true` is refused unless `allow_below_project_rules: true` is given,
+and then `success` is never true. Several `.kicad_pro` files beside the DSN are refused; name one
+with `project_path`.
 
 With the stdio transport, a call that carries a progress token receives `notifications/progress`
 during routing. The HTTP transport sends no progress.

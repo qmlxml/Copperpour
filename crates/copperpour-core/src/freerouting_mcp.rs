@@ -107,6 +107,13 @@ pub(crate) struct RouteEvidence {
     /// Connections still unrouted when the job ended, from the last count in
     /// Freerouting's log; None when the log could not be read.
     pub unrouted: Option<u64>,
+    /// Clearance violations at the end of the job, from the same log line as
+    /// `unrouted`; None when the log could not be read (merge review, plan
+    /// step 5: a board with violations read as a routed board).
+    pub violations: Option<u64>,
+    /// Whether the job's effective settings could be read back and compared
+    /// with what was sent; false means `settings_not_applied` is not evidence.
+    pub settings_checked: bool,
     /// Settings sent but not found with the same value among the job's
     /// effective settings: unknown key, typo, or a value Freerouting replaced.
     pub settings_not_applied: Vec<String>,
@@ -464,6 +471,8 @@ async fn run_state_machine(
     let job_settings = job_settings_body(settings);
     let requested = requested_settings(settings);
     let mut settings_not_applied = Vec::new();
+    // No settings sent means nothing to check.
+    let mut settings_checked = job_settings_body(settings).is_empty();
     let mut project_rules_not_applied = Vec::new();
     let mut settings_warnings = Vec::new();
     if !job_settings.is_empty() {
@@ -486,6 +495,7 @@ async fn run_state_machine(
                 )
                 .await?;
             if let Some(effective) = effective_settings(&effective) {
+                settings_checked = true;
                 settings_not_applied = settings_mismatches(&requested, effective);
                 project_rules_not_applied =
                     settings_mismatches(&project_only_settings(settings, &requested), effective);
@@ -585,6 +595,8 @@ async fn run_state_machine(
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
         unrouted: progress.read_unrouted(),
+        violations: progress.violations,
+        settings_checked,
         last_activity: progress.activity,
         settings_not_applied,
         project_rules_not_applied,
@@ -650,6 +662,7 @@ struct JobProgress {
     partial: String,
     activity: Option<String>,
     unrouted: Option<u64>,
+    violations: Option<u64>,
     last_message: String,
     last_sent: Option<Instant>,
     sent: u32,
@@ -667,6 +680,7 @@ impl JobProgress {
             partial: String::new(),
             activity: None,
             unrouted: None,
+            violations: None,
             last_message: String::new(),
             last_sent: None,
             sent: 0,
@@ -778,6 +792,9 @@ impl JobProgress {
         if let Some(unrouted) = latest_unrouted(complete, &self.tag) {
             self.unrouted = Some(unrouted);
         }
+        if let Some(violations) = latest_violations(complete, &self.tag) {
+            self.violations = Some(violations);
+        }
     }
 }
 
@@ -837,6 +854,22 @@ fn latest_unrouted(log: &str, tag: &str) -> Option<u64> {
                 }
             };
             count(" unrouted and ", true).or_else(|| count("incomplete connections: ", false))
+        })
+}
+
+/// The last clearance-violation count logged for the job tagged `tag`: a
+/// pass line's "(N unrouted and M violations)" or an optimizer line's
+/// "clearance violations: M".
+fn latest_violations(log: &str, tag: &str) -> Option<u64> {
+    log.lines()
+        .rev()
+        .filter(|line| line.contains(tag))
+        .find_map(|line| {
+            if let Some((_, rest)) = line.split_once(" unrouted and ") {
+                return rest.split_once(" violations")?.0.trim().parse().ok();
+            }
+            let (_, tail) = line.split_once("clearance violations: ")?;
+            tail.split([',', '.', ' ']).next()?.parse().ok()
         })
 }
 
@@ -1433,6 +1466,23 @@ fn settings_mismatches(sent: &Map<String, Value>, effective: &Map<String, Value>
 
 /// Equality that lets 3 match 3.0: Freerouting echoes some integers as floats.
 fn same_value(a: &Value, b: &Value) -> bool {
+    // Arrays element by element; a list of names (plane_nets, layers) as a
+    // set, in case Freerouting echoes it in another order (merge review, plan
+    // step 5: arrays were compared by plain equality).
+    if let (Value::Array(left), Value::Array(right)) = (a, b) {
+        let names = |items: &Vec<Value>| -> Option<Vec<String>> {
+            let mut names: Vec<String> = items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect::<Option<_>>()?;
+            names.sort();
+            Some(names)
+        };
+        if let (Some(left), Some(right)) = (names(left), names(right)) {
+            return left == right;
+        }
+        return left.len() == right.len() && left.iter().zip(right).all(|(x, y)| same_value(x, y));
+    }
     match (a.as_f64(), b.as_f64()) {
         // Freerouting holds some settings as Java `float` (for example
         // optimizer.improvement_threshold), which keeps about 7 significant
@@ -1441,6 +1491,38 @@ fn same_value(a: &Value, b: &Value) -> bool {
         (Some(x), Some(y)) => (x - y).abs() <= 1e-6 * x.abs().max(1.0),
         _ => a == b,
     }
+}
+
+/// Settings in `requested` that relax the project's rules (a value below the
+/// project's for one of its keys) or turn off checks. The project's rules are
+/// a lower limit unless the caller passes `allow_below_project_rules` (merge
+/// review, plan step 5).
+pub(crate) fn relaxations(
+    requested: &Map<String, Value>,
+    project: &Map<String, Value>,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    for (key, rule) in project {
+        if let (Some(asked), Some(rule)) =
+            (requested.get(key).and_then(Value::as_f64), rule.as_f64())
+        {
+            if asked < rule {
+                found.push(format!("{key}: {asked} is below the project's {rule}"));
+            }
+        }
+    }
+    if requested.get("strict_drc").and_then(Value::as_bool) == Some(false) {
+        found.push("strict_drc: false".to_string());
+    }
+    if requested
+        .get("autorouter")
+        .and_then(|autorouter| autorouter.get("ignore_net_classes"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        found.push("autorouter.ignore_net_classes: true".to_string());
+    }
+    found
 }
 
 /// A request Freerouting did not answer in time, told apart from other errors
@@ -2241,6 +2323,29 @@ mod tests {
 #[cfg(test)]
 mod settings_check_tests {
     use super::*;
+
+    #[test]
+    fn arrays_compare_by_element_and_name_lists_as_sets() {
+        use serde_json::json;
+        assert!(same_value(&json!(["GND", "VCC"]), &json!(["VCC", "GND"])));
+        assert!(same_value(&json!([3, 2.5]), &json!([3.0, 2.5])));
+        assert!(!same_value(&json!([3, 2]), &json!([2, 3])));
+    }
+
+    #[test]
+    fn settings_that_relax_the_project_rules_are_found() {
+        use serde_json::json;
+        let project = json!({"copper_to_edge_clearance_um": 500});
+        let tighter = json!({"copper_to_edge_clearance_um": 600});
+        assert!(relaxations(tighter.as_object().unwrap(), project.as_object().unwrap()).is_empty());
+        let looser = json!({
+            "copper_to_edge_clearance_um": 300,
+            "strict_drc": false,
+            "autorouter": {"ignore_net_classes": true}
+        });
+        let found = relaxations(looser.as_object().unwrap(), project.as_object().unwrap());
+        assert_eq!(found.len(), 3, "{found:?}");
+    }
 
     #[test]
     fn a_float_setting_echoed_with_float_precision_is_the_same_value() {

@@ -170,7 +170,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output.",
+            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. success is true only when Freerouting's log shows no unrouted connections and no clearance violations, the project's rules were found and applied, and the settings sent were verified; otherwise message says why, and the SES is still written. success is not a design-rule verdict: check the SES with plan_specctra_ses_import and DRC. With optimize_seconds, the board kept is the best by the optimizer's score, which is not DRC-clean or complete by construction.",
             json!({
                 "type": "object",
                 "properties": {
@@ -185,7 +185,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "plane_nets": { "type": "array", "items": { "type": "string" }, "description": "Net names Freerouting treats as power-plane nets (its plane_nets): plane routing mode and cheaper vias to the plane. A (plane ...) declared in the DSN already marks its net the same way." },
                     "plane_as_obstacle": { "type": "boolean", "description": "Whether copper pours block foreign traces (Freerouting's plane_as_obstacle, default false)." },
                     "project_path": { "type": "string", "description": "KiCad .kicad_pro whose design rules apply. By default, the only .kicad_pro next to the DSN, else in its parent folder. Its min_copper_edge_clearance, min_hole_to_hole and min_hole_clearance are sent as Freerouting's copper_to_edge_clearance_um, hole_to_hole_um and hole_clearance_um (rules at 0 are left to Freerouting's defaults), under router_settings and the named arguments, which win. The DSN carries none of them. A rule the JAR does not know is listed in project_rules.not_applied rather than refused." },
-                    "router_settings": { "type": "object", "additionalProperties": true, "description": "Any Freerouting router setting, in its JSON shape, passed through as given; the named arguments above are merged on top and win. Groups: autorouter.{max_passes, max_threads, max_items, ignore_net_classes}, fanout.{enabled, max_passes, ripup_allowed, min_escape_length_mm, max_escape_length_mm, start_via_diameter_mm, end_via_diameter_mm, pin_sorting_order, fallback_to_board_vias}, optimizer.{enabled, max_passes, max_threads, improvement_threshold, enable_preflight_guards, max_consecutive_failures, max_autoroute_passes, trace_ripup_cost_factor}, scoring.{via_costs, plane_via_costs, start_ripup_costs, default_preferred_direction_trace_cost, default_undesired_direction_trace_cost, bend_penalty}, router_scoring.*, optimizer_scoring.*, and top level copper_to_edge_clearance_um, hole_clearance_um, clearance_tolerance_um, neck_width_um, automatic_neckdown, strict_drc, trace_pull_tight_accuracy, allowed_via_types, plane_nets, plane_as_obstacle, max_threads, layers. A setting Freerouting does not apply (unknown key, typo, value it replaced) is refused before routing starts, and named in the error. So is any negative number: no Freerouting setting means anything below zero." },
+                    "router_settings": { "type": "object", "additionalProperties": true, "description": "Any Freerouting router setting, in its JSON shape, passed through as given; the named arguments above are merged on top and win. Groups: autorouter.{max_passes, max_threads, max_items, ignore_net_classes}, fanout.{enabled, max_passes, ripup_allowed, min_escape_length_mm, max_escape_length_mm, start_via_diameter_mm, end_via_diameter_mm, pin_sorting_order, fallback_to_board_vias}, optimizer.{enabled, max_passes, max_threads, improvement_threshold, enable_preflight_guards, max_consecutive_failures, max_autoroute_passes, trace_ripup_cost_factor}, scoring.{via_costs, plane_via_costs, start_ripup_costs, default_preferred_direction_trace_cost, default_undesired_direction_trace_cost, bend_penalty}, router_scoring.*, optimizer_scoring.*, and top level copper_to_edge_clearance_um, hole_clearance_um, clearance_tolerance_um, neck_width_um, automatic_neckdown, strict_drc, trace_pull_tight_accuracy, allowed_via_types, plane_nets, plane_as_obstacle, max_threads, layers. A setting Freerouting does not apply (unknown key, typo, value it replaced) is refused before routing starts, and named in the error. So is any negative number: no Freerouting setting means anything below zero. A value below the project's rule for copper_to_edge_clearance_um, hole_to_hole_um or hole_clearance_um, strict_drc: false, or autorouter.ignore_net_classes: true is refused unless allow_below_project_rules is true." },
+                    "allow_below_project_rules": { "type": "boolean", "description": "Allow router_settings to relax the project's design rules or turn off checks. The result then never reports success: true." },
                     "optimize_seconds": { "type": "integer", "minimum": 0, "maximum": 86400, "description": "Once routing is complete and the optimizer has started (optimizer_enabled), let it run this many seconds, then keep the best board found so far and stop the job (final_state OPTIMIZATION_STOPPED). Detection reads Freerouting's log; without it the optimizer runs to its end." },
                     "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "description": "Hard limit on the whole call, routing and optimizer together; the job is killed and nothing is kept when it is reached. Default 900, plus optimize_seconds when that is given. Set explicitly, it must exceed optimize_seconds, since the optimizer window only opens once routing is done." }
                 },
@@ -3163,7 +3164,13 @@ fn route_project(args: &serde_json::Value, dsn: &Path) -> anyhow::Result<Option<
         match projects.len() {
             0 => continue,
             1 => return Ok(projects.into_iter().next()),
-            _ => return Ok(None),
+            // Silently routing to Freerouting's defaults would ignore the
+            // project's rules; ask which one (merge review, plan step 5).
+            _ => anyhow::bail!(
+                "several .kicad_pro files beside the DSN in {}; name the one whose design rules \
+                 apply with project_path",
+                dir.display()
+            ),
         }
     }
     Ok(None)
@@ -3235,6 +3242,25 @@ async fn handle_route_specctra_dsn(
         }
         None => serde_json::Map::new(),
     };
+    // The project's rules are a lower limit (merge review, plan step 5):
+    // router_settings may tighten them but not relax them, and may not turn
+    // off checks, unless the caller says so explicitly.
+    let allow_relaxed = args["allow_below_project_rules"].as_bool().unwrap_or(false);
+    if !allow_relaxed {
+        if let Some(requested) = args["router_settings"].as_object() {
+            let relaxed = crate::freerouting_mcp::relaxations(requested, &project_rules);
+            if !relaxed.is_empty() {
+                return Ok(crate::tools::invalid_arg(
+                    "router_settings",
+                    &format!(
+                        "these settings relax the project's design rules or turn off checks: {}; \
+                         pass allow_below_project_rules: true to route that way anyway",
+                        relaxed.join("; ")
+                    ),
+                ));
+            }
+        }
+    }
     let settings = crate::freerouting_mcp::RouteSettings {
         max_passes,
         optimizer_enabled: args["optimizer_enabled"].as_bool(),
@@ -3261,36 +3287,65 @@ async fn handle_route_specctra_dsn(
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
         .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
-    // A board with unrouted connections is not a routed board, even though
-    // Freerouting ends the job COMPLETED (max_passes reached, or no progress).
-    // The SES is still written, for inspection. An unknown count (log not
-    // readable) is not turned into a failure.
-    let fully_routed = evidence.unrouted.is_none_or(|unrouted| unrouted == 0);
-    let message = if !fully_routed {
-        Some(format!(
-            "Freerouting left {} connection(s) unrouted; the SES at {} is incomplete",
-            evidence.unrouted.unwrap_or_default(),
-            ses_output.display()
-        ))
-    } else if evidence.unrouted.is_none() {
-        // Freerouting's log is looked for only where Freerouting keeps it on
-        // Linux (or at FREEROUTING_LOG), so elsewhere the count is unknown.
-        // Not a failure, but never a claim of a complete routing (merge
-        // review, plan step 5).
-        Some(format!(
-            "Freerouting's log could not be read, so whether every connection was routed is \
-             not known; check the SES at {} with plan_specctra_ses_import and DRC, or set \
-             FREEROUTING_LOG",
-            ses_output.display()
-        ))
-    } else {
-        None
-    };
+    // A board with unrouted connections or clearance violations is not a
+    // routed board, even though Freerouting ends the job COMPLETED. A count
+    // that could not be read, a project rule the JAR did not apply, or
+    // settings that could not be checked are not a pass either (merge
+    // review, plan step 5). The SES is written in every case, for inspection.
+    let mut problems = Vec::new();
+    match evidence.unrouted {
+        Some(0) => {}
+        Some(unrouted) => problems.push(format!("{unrouted} connection(s) left unrouted")),
+        None => problems.push(
+            "Freerouting's log could not be read, so whether every connection was routed is not \
+             known (it is looked for where Freerouting keeps it on Linux, or at FREEROUTING_LOG)"
+                .to_string(),
+        ),
+    }
+    if let Some(violations) = evidence.violations.filter(|count| *count > 0) {
+        problems.push(format!(
+            "{violations} clearance violation(s) in Freerouting's own check"
+        ));
+    }
+    if !evidence.project_rules_not_applied.is_empty() {
+        problems.push(format!(
+            "project design rules this Freerouting did not apply: {}",
+            evidence.project_rules_not_applied.join("; ")
+        ));
+    }
+    if !evidence.settings_checked {
+        problems.push(
+            "Freerouting's effective settings could not be read back, so the settings sent were \
+             not verified"
+                .to_string(),
+        );
+    }
+    if project.is_none() {
+        problems.push(
+            "no .kicad_pro was found beside the DSN or in its parent folder, so the project's \
+             edge and hole rules were not sent; name it with project_path"
+                .to_string(),
+        );
+    }
+    if allow_relaxed {
+        problems.push("allow_below_project_rules was set".to_string());
+    }
+    let fully_routed = problems.is_empty();
+    let message = (!fully_routed).then(|| {
+        format!(
+            "The SES at {} is not a verified complete routing: {}. Check it with \
+             plan_specctra_ses_import and DRC before relying on it.",
+            ses_output.display(),
+            problems.join("; ")
+        )
+    });
     Ok(CallToolResult::json(&json!({
         "success": fully_routed,
         "message": message,
         "unrouted_connections": evidence.unrouted,
         "unrouted_connections_checked": evidence.unrouted.is_some(),
+        "clearance_violations": evidence.violations,
+        "settings_checked": evidence.settings_checked,
         "method": "local_freerouting_native_mcp",
         "engine": {
             "name": "Freerouting",
