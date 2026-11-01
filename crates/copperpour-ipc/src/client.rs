@@ -8212,3 +8212,160 @@ mod stackup_tests {
         assert!(stackup.layers.is_empty());
     }
 }
+
+/// Measures whether a stock KiCad answers the editor commands the wilfredo-a14
+/// fork's `f517fd8` relies on (owner ruling 2026-11-01: measure before any
+/// narrow implementation of `set_active_layer`, `set_layer_visibility` and
+/// `run_editor_action`). Copperpour's `set_active_layer` refuses on the claim
+/// that the stable protocol has no supported active-layer mutation; the proto
+/// declares `GetActiveLayer`/`SetActiveLayer`, so one of the two is wrong.
+///
+/// Changes nothing in the design: each "set" sends back the value just read,
+/// and the action only zooms the view. Prints one line per command. The
+/// visible-layer pair is skipped unless STOCK_PROBE_VISIBLE=1 (see below).
+///
+///     KICAD_API_SOCKET=ipc:///tmp/kicad/api.sock STOCK_PROBE_BOARD=/path/board.kicad_pcb \
+///       cargo test -p copperpour-ipc --lib stock_editor_command_probe -- --ignored --nocapture
+#[cfg(test)]
+mod stock_editor_command_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a running KiCad with the board in STOCK_PROBE_BOARD open"]
+    fn stock_editor_command_probe() {
+        use kiapi::board::commands as board;
+        let socket = std::env::var("KICAD_API_SOCKET")
+            .unwrap_or_else(|_| "ipc:///tmp/kicad/api.sock".into());
+        let path = std::path::PathBuf::from(std::env::var("STOCK_PROBE_BOARD").unwrap());
+        let client = KiCadIpcClient::new(socket);
+        let document = client
+            .find_open_board(&path)
+            .expect("the board is open in KiCad");
+        let report = |name: &str, result: Result<Option<prost_types::Any>>| match result {
+            Ok(Some(any)) => println!("{name}: handled, reply {}", any.type_url),
+            Ok(None) => println!("{name}: handled, empty reply"),
+            Err(error) => println!("{name}: refused: {error:#}"),
+        };
+
+        let active = client.send_command(
+            &board::GetActiveLayer {
+                board: Some(document.clone()),
+            },
+            "kiapi.board.commands.GetActiveLayer",
+        );
+        let layer = active
+            .as_ref()
+            .ok()
+            .and_then(|any| any.as_ref())
+            .and_then(|any| board::BoardLayerResponse::decode(any.value.as_slice()).ok())
+            .map(|reply| reply.layer);
+        report("GetActiveLayer", active);
+        println!("  active layer: {layer:?}");
+        if let Some(layer) = layer {
+            report(
+                "SetActiveLayer (same layer)",
+                client.send_command(
+                    &board::SetActiveLayer {
+                        board: Some(document.clone()),
+                        layer,
+                    },
+                    "kiapi.board.commands.SetActiveLayer",
+                ),
+            );
+        }
+
+        // A different layer, read back, then the original restored: shows
+        // the change takes effect, not only that the command is accepted.
+        if let Some(original) = layer {
+            let other = if original == kiapi::board::types::BoardLayer::BlBCu as i32 {
+                kiapi::board::types::BoardLayer::BlFCu as i32
+            } else {
+                kiapi::board::types::BoardLayer::BlBCu as i32
+            };
+            report(
+                "SetActiveLayer (other layer)",
+                client.send_command(
+                    &board::SetActiveLayer {
+                        board: Some(document.clone()),
+                        layer: other,
+                    },
+                    "kiapi.board.commands.SetActiveLayer",
+                ),
+            );
+            let now = client
+                .send_command(
+                    &board::GetActiveLayer {
+                        board: Some(document.clone()),
+                    },
+                    "kiapi.board.commands.GetActiveLayer",
+                )
+                .ok()
+                .flatten()
+                .and_then(|any| board::BoardLayerResponse::decode(any.value.as_slice()).ok())
+                .map(|reply| reply.layer);
+            println!("  read back after setting {other}: {now:?}");
+            report(
+                "SetActiveLayer (restore)",
+                client.send_command(
+                    &board::SetActiveLayer {
+                        board: Some(document.clone()),
+                        layer: original,
+                    },
+                    "kiapi.board.commands.SetActiveLayer",
+                ),
+            );
+        }
+
+        // Measured 2026-11-01 on stock KiCad 10.0.7 (Arch package, assertions
+        // enabled) with the pic_programmer demo: GetVisibleLayers fails an
+        // internal assertion in ToProtoEnum<PCB_LAYER_ID> for a visible layer
+        // the protocol has no value for, opens one modal dialog per such layer,
+        // and blocks every later command until a person closes them. Sent only
+        // when STOCK_PROBE_VISIBLE=1.
+        if std::env::var("STOCK_PROBE_VISIBLE").as_deref() == Ok("1") {
+            let visible = client.send_command(
+                &board::GetVisibleLayers {
+                    board: Some(document.clone()),
+                },
+                "kiapi.board.commands.GetVisibleLayers",
+            );
+            let layers = visible
+                .as_ref()
+                .ok()
+                .and_then(|any| any.as_ref())
+                .and_then(|any| board::BoardLayers::decode(any.value.as_slice()).ok())
+                .map(|reply| reply.layers);
+            report("GetVisibleLayers", visible);
+            println!("  visible layers: {}", layers.as_ref().map_or(0, Vec::len));
+            if let Some(layers) = layers {
+                report(
+                    "SetVisibleLayers (same set)",
+                    client.send_command(
+                        &board::SetVisibleLayers {
+                            board: Some(document.clone()),
+                            layers,
+                        },
+                        "kiapi.board.commands.SetVisibleLayers",
+                    ),
+                );
+            }
+        }
+
+        let action = client.send_command(
+            &kiapi::common::commands::RunAction {
+                action: "common.Control.zoomFitScreen".into(),
+            },
+            "kiapi.common.commands.RunAction",
+        );
+        let status = action
+            .as_ref()
+            .ok()
+            .and_then(|any| any.as_ref())
+            .and_then(|any| {
+                kiapi::common::commands::RunActionResponse::decode(any.value.as_slice()).ok()
+            })
+            .map(|reply| reply.status());
+        report("RunAction common.Control.zoomFitScreen", action);
+        println!("  RunAction status: {status:?}");
+    }
+}

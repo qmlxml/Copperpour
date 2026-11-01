@@ -143,7 +143,18 @@ Each entry names where it was found, what is wrong, and the condition that close
   `set_layer_visibility` (the fork's arguments) and `run_editor_action` (PCB editor, fixed list of
   actions that open no dialog), with the full review cycle. Never taken: the activity reporting,
   `activity-hook`, the custom IPC messages, the dispatch-path and live-editor changes, `d2961f4`.
-  Revisit the rest if the owner adopts the modified KiCad build. Waiting for: a live KiCad session.
+  Revisit the rest if the owner adopts the modified KiCad build.
+  **Measured 2026-11-01** on stock KiCad 10.0.7 (Arch package) with the pic_programmer demo, by the
+  ignored test `stock_editor_command_probe` in `crates/copperpour-ipc/src/client.rs`:
+  `GetActiveLayer` and `SetActiveLayer` are handled, and a change reads back (3 → 34 → restored), so
+  `tool-directory.md`'s claim that the stable protocol has no supported active-layer mutation is
+  wrong; `RunAction` `common.Control.zoomFitScreen` is handled (`RAS_OK`). **`GetVisibleLayers`
+  fails an internal KiCad assertion** (`ToProtoEnum<PCB_LAYER_ID>`, a visible layer with no protocol
+  value), opens one modal dialog per such layer and blocks every later command until a person closes
+  them. So per the plan: `set_active_layer` and an allow-listed `run_editor_action` are to be
+  implemented; `set_layer_visibility` is not, on KiCad 10.0.7, because reading the visible layers can
+  leave KiCad waiting for a person (Rule B). Closing condition for the rest: that implementation, with
+  the full review cycle.
 
 - **Sheet files sharing symbol UUIDs** (step 4b): the flags of every sheet file go into one set, so
   if one sheet file is a copy of another under a different name, a flag in one excludes the matching
