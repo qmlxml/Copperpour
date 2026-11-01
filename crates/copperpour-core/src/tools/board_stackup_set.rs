@@ -1036,10 +1036,7 @@ async fn kicad_round_trip(
         .join(board.file_name().context("the board path names no file")?);
     tokio::fs::write(&copy, next).await?;
     if let Err(error) = crate::tools::cli::resave_board(cli, &copy).await {
-        return Ok(Some(format!(
-            "kicad-cli could not load and save a copy with this stackup, so KiCad's reading of \
-             it is unknown: {error:#}"
-        )));
+        return Ok(Some(round_trip_failure(&error)));
     }
     let saved = tokio::fs::read_to_string(&copy).await?;
     let (kicad, kicad_thickness) = match saved_stack(&saved) {
@@ -1172,6 +1169,27 @@ fn entry_differences(ours: &Entry, theirs: &Entry, out: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Why the kicad-cli check did not run to the end. A timeout says nothing
+/// about the stackup, so it is reported apart from a kicad-cli that read the
+/// copy and failed, with what to do next.
+fn round_trip_failure(error: &anyhow::Error) -> String {
+    if error
+        .downcast_ref::<crate::tools::cli::CliTimedOut>()
+        .is_some()
+    {
+        return format!(
+            "kicad-cli did not finish loading and saving a copy within {} s, so the stackup was \
+             neither checked nor written; nothing is known to be wrong with it. Retry, or set it \
+             in KiCad's Board Setup > Physical Stackup.",
+            crate::tools::cli::RESAVE_TIMEOUT_SECS
+        );
+    }
+    format!(
+        "kicad-cli could not load and save a copy with this stackup, so KiCad's reading of it is \
+         unknown: {error:#}"
+    )
 }
 
 #[cfg(test)]
@@ -2052,5 +2070,19 @@ mod tests {
             std::fs::read_to_string(&board).unwrap(),
             fixture_text(TWO_LAYER)
         );
+    }
+
+    #[test]
+    fn a_timed_out_check_is_not_reported_as_a_fault_in_the_stackup() {
+        let timed_out = anyhow::Error::new(crate::tools::cli::CliTimedOut {
+            limit: std::time::Duration::from_secs(120),
+        });
+        let message = round_trip_failure(&timed_out);
+        assert!(message.contains("within 120 s"), "{message}");
+        assert!(message.contains("Retry"), "{message}");
+        assert!(!message.contains("with this stackup"), "{message}");
+
+        let failed = anyhow::anyhow!("kicad-cli exited with 1");
+        assert!(round_trip_failure(&failed).contains("with this stackup"));
     }
 }

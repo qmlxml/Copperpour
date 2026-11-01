@@ -396,6 +396,29 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
     run_cli_owned(cli, args, timeout_dur, false).await
 }
 
+/// How long a killed kicad-cli is waited for before the call returns.
+const KILL_WAIT: Duration = Duration::from_secs(5);
+
+/// A kicad-cli that was killed because it did not finish within `limit`
+/// (only calls on a private copy kill; see [`run_cli_owned`]). A caller can
+/// tell it from a kicad-cli that ran and failed with `downcast_ref`.
+#[derive(Debug)]
+pub(crate) struct CliTimedOut {
+    pub limit: Duration,
+}
+
+impl std::fmt::Display for CliTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "kicad-cli did not finish within {} s and was stopped",
+            self.limit.as_secs_f64()
+        )
+    }
+}
+
+impl std::error::Error for CliTimedOut {}
+
 /// [`run_cli_captured`], optionally killing the child on timeout. Only callers
 /// running on a private copy may ask for that: a killed `kicad-cli` strands its
 /// project lock, so killing one on a live project would leave the lock there.
@@ -420,17 +443,50 @@ async fn run_cli_owned(
         .kill_on_drop(kill_on_timeout);
 
     #[cfg(test)]
-    let child = test_support::spawn_cli(&mut cmd)
+    let mut child = test_support::spawn_cli(&mut cmd)
         .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
     #[cfg(not(test))]
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
 
-    let output = timeout(timeout_dur, child.wait_with_output())
-        .await
-        .with_context(|| format!("kicad-cli timed out after {:?}", timeout_dur))?
-        .with_context(|| "kicad-cli process failed")?;
+    let output = if kill_on_timeout {
+        // Read the pipes here rather than through `wait_with_output`, which
+        // takes the child: on timeout it must be killed and waited for before
+        // the caller removes the private copy. On Windows a process still
+        // running in that folder makes the removal fail, and `TempDir` ignores
+        // the failure. The wait has its own limit, so a kicad-cli that cannot
+        // be ended leaves the folder behind rather than holding the call.
+        let mut stdout = child.stdout.take().context("kicad-cli has no stdout")?;
+        let mut stderr = child.stderr.take().context("kicad-cli has no stderr")?;
+        let finished = timeout(timeout_dur, async {
+            use tokio::io::AsyncReadExt;
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let (read_out, read_err) =
+                tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+            read_out?;
+            read_err?;
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>(std::process::Output {
+                status,
+                stdout: out,
+                stderr: err,
+            })
+        })
+        .await;
+        match finished {
+            Ok(output) => output.with_context(|| "kicad-cli process failed")?,
+            Err(_) => {
+                let _ = timeout(KILL_WAIT, child.kill()).await;
+                return Err(CliTimedOut { limit: timeout_dur }.into());
+            }
+        }
+    } else {
+        timeout(timeout_dur, child.wait_with_output())
+            .await
+            .with_context(|| format!("kicad-cli timed out after {:?}", timeout_dur))?
+            .with_context(|| "kicad-cli process failed")?
+    };
 
     if !output.stderr.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -707,23 +763,16 @@ pub(crate) mod test_support {
         );
         let result =
             run_cli_owned(cli.to_str().unwrap(), &[], Duration::from_millis(500), true).await;
-        assert!(
-            result.is_err(),
-            "the fake kicad-cli sleeps past the timeout"
-        );
+        let Err(error) = result else {
+            panic!("the fake kicad-cli sleeps past the timeout");
+        };
+        assert!(error.downcast_ref::<CliTimedOut>().is_some(), "{error:#}");
+        // Waited for before returning, so the caller can remove its copy at
+        // once: the process has already been reaped.
         let pid = std::fs::read_to_string(&pid_file).unwrap();
-        let proc = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
-        for _ in 0..50 {
-            let gone = !proc.exists()
-                || std::fs::read_to_string(proc.join("stat"))
-                    .is_ok_and(|stat| stat.split_whitespace().nth(2) == Some("Z"));
-            if gone {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "kicad-cli (pid {}) still runs after its timeout",
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "kicad-cli (pid {}) still exists when the call returns",
             pid.trim()
         );
     }
@@ -2074,6 +2123,9 @@ pub(crate) async fn resave_board(cli: &str, board: &Path) -> Result<()> {
     .await?;
     Ok(())
 }
+
+/// [`RESAVE_TIMEOUT`] in seconds, for messages.
+pub(crate) const RESAVE_TIMEOUT_SECS: u64 = RESAVE_TIMEOUT.as_secs();
 
 /// Limit for [`resave_board`].
 const RESAVE_TIMEOUT: Duration = Duration::from_secs(120);

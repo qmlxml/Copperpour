@@ -99,6 +99,8 @@ the old file name) and journal recovery. Only the content-write paths consult th
 - PCB editing is unchanged: it already goes through KiCad's live IPC API.
 - Annotation (`sch_annotate`) checks for locks itself and does not consult the hook, so it is still
   refused while the editor is open.
+- Tools that write the project file (`.kicad_pro`), such as `set_erc_severity`, are not schematic
+  content writes: they are still refused while KiCad has the project open, and say so.
 - Each write runs the bridge twice (before writing the scratch file and again before replacing the
   file), each as a new process, and a write can wait behind a reload. Expect writes under an open
   editor to take noticeably longer.

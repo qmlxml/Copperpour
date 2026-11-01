@@ -49,3 +49,8 @@ names; `source: "file"`, and `warning` when the file changed.
 
 `get_board_stackup`'s `hint` and description now name `set_board_stackup` for
 a closed board. No existing tool's arguments or responses change otherwise.
+
+The kicad-cli check on a copy of the board is limited to 120 s; kicad-cli is
+then stopped, and the call is refused with `plan_blocked`, saying the stackup
+was neither checked nor written and that a retry, or Board Setup, can set it.
+(The first version used the general 600 s limit, with kicad-cli left running.)

@@ -81,6 +81,8 @@ this branch's option to kill kicad-cli when the limit is reached (`run_cli_owned
 `kill_on_timeout`, for calls on a private copy). Upstream has no such option. A stalled kicad-cli
 kept the copy open for ten minutes and then went on running; on Windows the copy's temporary
 folder could not be removed. `resave_board` now kills kicad-cli on timeout, with a limit of 120 s.
+(That did not yet wait for kicad-cli to end before the folder was removed, so on Windows the folder
+could still be left behind; completed in fix pass 3.)
 Measured: kicad-cli re-saves the largest demo board, `jetson-agx-thor-baseboard` (85 MB), in
 6.2 s (KiCad 10.0.7).
 
@@ -92,3 +94,45 @@ Recorded in `docs/BACKLOG.md` as upstream's own issues, to report there, not cha
 - the kicad-cli check runs even when the stackup is unchanged;
 - `set_erc_severity` reads the project file without the shared lock;
 - two approximations in `text_overlap`.
+
+Commit `02904310`. Gate (`logs/gate-merge-fix2.summary`): 3,814 passed, 0 failed.
+
+## Review 3 (intent and liveness) and fix pass 3
+
+Confirmed:
+- After a `set_board_stackup` timeout nothing is left that makes later calls refuse. The tool takes
+  no lock, and the copy is in a private folder.
+- A new toolset for the two footprint-text tools is the right outcome, and is recorded in the form
+  `docs/api-migrations/README.md` asks for. The repository has no changelog, and the plugin and
+  packaging files list no toolset names.
+- `set_erc_severity`'s refusal names the project lock and says what to do.
+
+Fixed:
+
+1. **A timeout read as a fault in the stackup and gave no next step.** It said "could not load and
+   save a copy with this stackup", which a caller would take as a reason to change valid values.
+   - kicad-cli killed on timeout is now its own error, `CliTimedOut`.
+   - `set_board_stackup` reports it as "did not finish ... within 120 s, so the stackup was neither
+     checked nor written; nothing is known to be wrong with it. Retry, or set it in KiCad's Board
+     Setup > Physical Stackup".
+   - Test `a_timed_out_check_is_not_reported_as_a_fault_in_the_stackup`.
+2. **After the kill, nothing waited for kicad-cli to end**, so on Windows the copy's folder could
+   still be left behind. This was the claim fix pass 2 made without the code to support it.
+   - `run_cli_owned` with `kill_on_timeout` now reads the output itself. On timeout it kills
+     kicad-cli and waits up to 5 s for it to end before returning.
+   - `a_timed_out_kicad_cli_is_killed` now requires the process to be gone when the call returns,
+     instead of polling for a second.
+   - Control: with the wait replaced by a kill without waiting, it fails ("still exists when the
+     call returns").
+   - This affects every call on a private copy: the footprint upgrade, `resave_board`, and the
+     export that kills on timeout.
+3. **The 120 s limit on upstream's tool was not recorded**: `docs/api-migrations/set-board-stackup.md`
+   (unreleased) now states it and the refusal.
+4. **The live-editor document did not list project-file writers** among the writes still refused
+   while KiCad has the project open: it now does, naming `set_erc_severity`.
+
+Not changed:
+- `README.md` says "21 on-demand toolsets". It was already wrong before the merge, and its check
+  runs only at release (AGENTS.md).
+- A configuration key for the 120 s limit: no user has asked for one.
+- The Rule A remarks about upstream's own tests are upstream's to make.
