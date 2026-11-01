@@ -127,3 +127,23 @@ the tests now compiled on Unix only never ran there. Fixed:
 
 Not measured: whether kicad-cli writes a `\\?\` path of 260 characters or more into `.include`
 unchanged; if it changed `\` to `/`, such a project's model paths would be refused.
+
+Commit `5ab57554`. Gate (`logs/gate-windows-fixes3.summary`): 3,752 passed, 0 failed, 113 ignored,
+`home-untouched` PASS. CI run 41331483665 passes on all ten jobs; its Windows log shows
+`a_rewritten_model_path_passes_the_include_check`,
+`a_relative_path_under_a_verbatim_folder_uses_one_separator` (with its Windows-only `..`
+assertions), `a_hung_worker_times_out_and_is_not_available` and
+`a_relative_home_gives_no_relative_user_directory` run and passing. (Fix pass 2, `2769383a`, had
+no CI run of its own; this run covers it.)
+
+## As shipped, against the plan
+
+Planned (backlog "Windows build not checked", owner ruling 2026-11-01): CI checks the branch on
+Windows through a pull request on the fork, and the Windows job passes. Shipped: the job passes
+after five commits on this step (`70212eb8`, `394a37be`, `cb2e9972`, `2769383a`, `5ab57554`). Beyond
+the plan: one Windows product defect fixed (relative model paths refused as network locations),
+the include check hardened against mixed leading separators, relative model paths under long
+verbatim folders made to name their file, and the probe's timeout made to bound the wait for the
+killed worker. Not shipped, recorded in `docs/BACKLOG.md`: network-drive and share limits of the
+include check, the `..` difference from KiCad on Windows, the empty-`HOME` check in CI, and a
+Windows run with a real KiCad project (the `e2e-kicad` workflow is disabled on forks).

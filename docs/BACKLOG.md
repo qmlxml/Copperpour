@@ -16,9 +16,9 @@ Each entry names where it was found, what is wrong, and the condition that close
   (`ci.yml` lines 3-7), and only once Actions is enabled on the fork; pushing `integration` alone runs
   nothing.
 - **~~Windows build not checked.~~ Done 2026-11-01**
-  (`docs/development/2026-11-01-09-Windows_CI_fixes.md`): the Windows job of CI run 41329352599 on
-  pull request #1 passes, after two commits that fixed a test-only compile error and 18 Windows test
-  failures. `crates/copperpour/src/live_editor.rs` was adapted at the merge but
+  (`docs/development/2026-11-01-09-Windows_CI_fixes.md`): the Windows job passes on pull request #1
+  (first in CI run 41329352599, and on every run since, latest 41331483665), after fixing a
+  test-only compile error and 18 Windows test failures. `crates/copperpour/src/live_editor.rs` was adapted at the merge but
   not compiled for Windows: `cargo check --target x86_64-pc-windows-gnu` needs the MinGW C compiler
   for `nng-sys`. Owner ruling 2026-11-01: check it through GitHub CI (push `integration`, enable
   Actions on `qmlxml/Copperpour`, open a pull request from `integration` into the fork's `main`), not
