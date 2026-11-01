@@ -606,7 +606,7 @@ active layer belongs to the editor session, not the `.kicad_pcb` document.
 
 Close the board in KiCad, make a backup copy, remove only the injected
 `(active_layer "...")` line from the board file, and reopen the board. Do not
-remove the surrounding `(setup ...)` block. Later versions, including every
-Copperpour release, refuse `set_active_layer` with `unsupported_capability` and
-leave the file byte-identical until stable KiCad IPC exposes a native operation with
-readback.
+remove the surrounding `(setup ...)` block. Later versions never write the token. Copperpour releases before the
+2026-11-01 change refused `set_active_layer` with `unsupported_capability`; since then it changes
+the active layer of a board open in KiCad over IPC (KiCad 10.0.7 handles `SetActiveLayer` and a
+change reads back) and still never writes the board file.

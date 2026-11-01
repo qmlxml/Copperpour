@@ -5014,6 +5014,41 @@ impl KiCadIpcClient {
     }
 
     /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).
+    /// The PCB editor's active layer for `document`. (From the wilfredo-a14
+    /// fork's `f517fd8`; measured on stock KiCad 10.0.7, 2026-11-01.)
+    pub fn get_active_layer_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<kiapi::board::types::BoardLayer> {
+        let response = unpack_required::<kiapi::board::commands::BoardLayerResponse>(
+            self.send_command(
+                &kiapi::board::commands::GetActiveLayer {
+                    board: Some(document),
+                },
+                "kiapi.board.commands.GetActiveLayer",
+            )?,
+            "GetActiveLayer",
+        )?;
+        Ok(kiapi::board::types::BoardLayer::try_from(response.layer)
+            .unwrap_or(kiapi::board::types::BoardLayer::BlUndefined))
+    }
+
+    /// Make `layer` the PCB editor's active layer for `document`.
+    pub fn set_active_layer_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        layer: kiapi::board::types::BoardLayer,
+    ) -> Result<()> {
+        self.send_command(
+            &kiapi::board::commands::SetActiveLayer {
+                board: Some(document),
+                layer: layer as i32,
+            },
+            "kiapi.board.commands.SetActiveLayer",
+        )?;
+        Ok(())
+    }
+
     pub fn run_action(&self, action: &str) -> Result<()> {
         let cmd = kiapi::common::commands::RunAction {
             action: action.to_string(),
