@@ -56,8 +56,8 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
 15. **Step 7: `6dad58a` (a copper pour no longer blocks a pad-net change; `zones_to_refill`) is
     not applied tonight.** It reverses Copperpour's rule (two tests assert that a pour on the old or
     new net refuses the change). Question for the owner, with a second opinion, at the end of this
-    file once the other step 7 work is done. `7fa1510`'s narrower rule (copper tracks of the old
-    net touching the pad) is taken, with the pour rule kept.
+    file once the other step 7 work is done. `7fa1510`'s narrower rule (tracks, arcs or vias of
+    the old net reaching the pad) is taken, with the pour rule kept.
 16. **Step 7: `04afb36` is not applied** (both behaviours already present; `delete_trace` accepting
     via UUIDs would change a public tool's inputs, and `delete_via` exists).
 
@@ -74,8 +74,9 @@ Details: `2026-10-31-04-Step4_yuvaltal912_simulation.md`, "Review 3".
 - **Second opinion (second reviewer, asked without a stated preference): option 2**, because a fill is derived
   data that `refill_zones` regenerates, while a track is not. Conditions: report `zones_to_refill` in
   the plan as well as after apply, as a warning naming the next action; collect zone nets separately
-  from track nets in `snapshot_board` (today one `routed_nets` count mixes them), so a track still
-  refuses and an unreadable zone still refuses; migration note; the tests asserting "not blocked"
+  from track nets in `snapshot_board`, so a track still refuses and an unreadable zone still refuses
+  (already met since `d31f5fb`: `RoutedCopper` keeps zone nets and unreadable zones apart from track
+  geometry, and an unreadable zone refuses); migration note; the tests asserting "not blocked"
   name the states where blocking is right (Rule A).
 - **First opinion (this session):** option 2, with the same conditions. 2 models agree.
 

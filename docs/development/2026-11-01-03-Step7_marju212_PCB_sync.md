@@ -44,7 +44,8 @@ already in Copperpour, and its `LibraryExtras` duplicated Copperpour's `LibraryF
   sources, and it was removed.) Test
   `placed_items_carry_net_ties_and_the_zone_connection`.
 - Library refresh: both clauses accepted; both copied onto the rebuilt footprint; new changed domains
-  `net_ties` and `zone_connection`. Without them a refresh that differed only in net ties planned a
+  `net_ties` and `zone_connection` (the zone connection part was superseded by review 3, item 6: the
+  board's is kept, and the `zone_connection` domain removed). Without them a refresh that differed only in net ties planned a
   no-op and never sent them. Test `net_ties_and_zone_connection_are_sent_once_then_unchanged` also
   checks that a second refresh is a no-op (`109f890`); control: with the net-tie comparison disabled
   it fails.
@@ -101,8 +102,8 @@ Confirmed: `footprint_text.rs` matches the fork's after the rename and depends o
 arc; the tests fail if the behaviour regresses. Fixed:
 
 1. **A copper zone on no net was recorded as pouring the empty net**, so every pad gaining or losing
-   a net was refused on a board with such a zone. Only named zone nets are recorded now. Served test
-   `a_zone_on_no_net_does_not_block_a_pad_gaining_a_net` (R1's VCC pad starts on no net); control:
+   a net was refused on a board with such a zone. Only named zone nets are recorded now. Test through
+   `tools/call` (the mock KiCad of the sync tests), `a_zone_on_no_net_does_not_block_a_pad_gaining_a_net` (R1's VCC pad starts on no net); control:
    with the fix disabled it fails. (A first version of this test moved a pad between two named nets
    and passed with the fix disabled; it was rewritten.)
 2. **A routed item whose geometry was not read was ignored by the new rule**, so the change was
@@ -116,7 +117,7 @@ arc; the tests fail if the behaviour regresses. Fixed:
 5. A doc comment of `the_schematic_decides_dnp_over_the_library` had moved onto the new test: moved
    back.
 6. **The pad-reach tests built the copper by hand**, so nothing tested `snapshot_board`'s reading:
-   the served test board now holds tracks, and
+   the mock board of the `tools/call` tests now holds tracks, and
    `served_tracks_far_from_or_on_the_pad_decide_the_change` runs a dry run with the real KiCad
    capture of R1 and a VCC track 20 mm away (ready), on the pad (conflict), and with no width
    (conflict); control: with `incomplete_nets` disabled it fails.
@@ -146,7 +147,7 @@ re-taken at apply. Fixed:
 4. **The read, check and send were not one commit, and the response was the computed result**: now
    inside `run_commit` (a refused edit or failed send drops the commit), footprints decoded once into
    a map by reference (finding 8), and the response is the texts read back from the board, compared
-   with what was sent (angles modulo 360). Served tests in `footprint_text_served_tests` with the
+   with what was sent (angles modulo 360). Tests through `tools/call` in `footprint_text_served_tests`, with the
    item-store mock: one `UpdateItems` per batch and the read-back position; a refused edit sends
    nothing; a board that keeps something else is reported. Control: with the read-back refusal
    replaced by success, the last test fails. (A first control disabled only the x comparison and
@@ -178,7 +179,7 @@ Fixed:
    causes and was false for a pour on the new net. Each refusal now ends with its cause: the track,
    arc or via that reaches the pad (UUID and position, from a new `sources` list beside the copper
    pieces), a zone pouring the old or new net, an unreadable zone, or unread geometry, with the tools
-   that remove it. The served track test asserts the track's UUID and `delete_trace` are named.
+   that remove it. The `tools/call` track test asserts the track's UUID and `delete_trace` are named.
 2. An arc, an unreadable zone, or unread geometry can only be removed in KiCad: the refusal says so;
    the missing arc tools are in `docs/BACKLOG.md`.
 3. `set_pad_net` skips the copper check (predates step 7): `docs/BACKLOG.md`.
@@ -191,10 +192,21 @@ Fixed:
    released, is removed. Test `net_ties_and_zone_connection_are_sent_once_then_unchanged` updated.
 7. **A failed or mismatched read-back of `move_footprint_texts` looked like a refusal**: it is now an
    uncertain outcome after a mutation (`IpcOutcomeUnknown`), naming every difference field by field,
-   and a failed read says the edit was sent. The served test asserts both.
+   and a failed read says the edit was sent. The `tools/call` test asserts both.
 8. **`place_array` and `duplicate_component` had started refusing footprints whose library data
    cannot be read** (`(attr virtual)`, a KiCad 5 model offset), which they placed before: they place
    them without it again and report `library_data_not_applied`. Migration notes corrected.
 
+Committed as `564be3e`.
+
 Gate (`logs/gate-step7-fix3.summary`): 3,730 passed (unchanged: existing tests were updated, none
 added), 1 failed (the known baseline failure), 110 ignored.
+
+## Documentation review
+
+An independent check confirmed the commit hashes, names, JSON fields and gate counts. Corrected: the
+`a7886a9` section still described the zone connection as copied (superseded by review 3); the review
+3 section lacked its commit; the plan's table did not account for the 13 behaviours of the method
+section; "one commit" in that table meant one KiCad commit; overnight decision 15 named tracks only;
+the prepared question's "one count mixes them" was already met by `d31f5fb`; "served test" was
+undefined (now "test through `tools/call`").
