@@ -6,8 +6,8 @@ rewrite all of its commits and the commit IDs quoted in the step logs.
 
 ## What came in
 
-Twelve upstream commits, from the branch's base `f0616624` to `24749e80` (31 October to
-1 November): `set_board_stackup` (pull request #232), `set_erc_severity` (#233), the `text_overlap`
+Twelve upstream commits, from the branch's base `f0616624` to `24749e80` (committed 31 October to
+1 November; `bba3a1cc` authored 29 October): `set_board_stackup` (pull request #232), `set_erc_severity` (#233), the `text_overlap`
 check in `check_schematic_overlaps` (#221), and changes to `copperpour init` and `status`: the
 `konnect` alias's hooks are replaced, the operating-rules skill is installed as `copperpour`, and
 duplicate hooks are reported (#246, #248, #249). A trial merge in a separate worktree found one
@@ -25,7 +25,7 @@ conflicting block, in 1 of the 14 files changed on both sides.
   - Tried first and undone before committing: moving `set_active_layer` to `editor_navigation`.
     That tool is released (it used to always refuse), so moving it would change a published
     toolset.
-  - Chosen (the two models agree, each giving its recommendation before seeing the other's): a new
+  - Chosen (a first and a second opinion, each given before seeing the other, recommended the same): a new
     toolset, `pcb_footprint_text`, holding only the two new tools. No released tool changes
     toolset; the migration note `docs/api-migrations/footprint-text-tools.md` names the new
     toolset. Rejected: putting them in `placement` (that toolset scores and positions footprints
@@ -75,7 +75,8 @@ Confirmed:
 - Nothing loads toolsets by a fixed list that would miss `pcb_footprint_text`: the starter kit is
   `project` and `config`, and the hooks are built from the registry.
 
-Fixed (a combination defect): `set_board_stackup` checks its result by re-saving a private copy of
+Fixed (a defect that exists only in the combination of upstream's tool and this branch's runner):
+`set_board_stackup` checks its result by re-saving a private copy of
 the board with kicad-cli (`resave_board`). That call used the general 600 s limit, and did not use
 this branch's option to kill kicad-cli when the limit is reached (`run_cli_owned`'s
 `kill_on_timeout`, for calls on a private copy). Upstream has no such option. A stalled kicad-cli
@@ -124,8 +125,8 @@ Fixed:
      instead of polling for a second.
    - Control: with the wait replaced by a kill without waiting, it fails ("still exists when the
      call returns").
-   - This affects every call on a private copy: the footprint upgrade, `resave_board`, and the
-     export that kills on timeout.
+   - This affects every call that kills kicad-cli on a private copy: DRC on a private copy
+     (`run_drc_on_private_copy`), `resave_board`, and the simulation netlist export.
 3. **The 120 s limit on upstream's tool was not recorded**: `docs/api-migrations/set-board-stackup.md`
    (unreleased) now states it and the refusal.
 4. **The live-editor document did not list project-file writers** among the writes still refused
@@ -147,7 +148,8 @@ Planned (owner decision 2026-11-01): merge Copperpour's `main` into `integration
 conflict a trial merge showed, and pass the gate and CI. Shipped as planned, at `24749e80`, plus:
 - the new toolset `pcb_footprint_text`, for a conflict the trial merge did not show;
 - skill texts updated for it;
-- a bounded, killed and waited-for kicad-cli in `set_board_stackup`'s check;
+- in `set_board_stackup`'s check, kicad-cli limited to 120 s, stopped at the limit, and waited for
+  before its copy is removed;
 - a timeout reported as such;
 - documentation of upstream's tools under this branch's live editor.
 
@@ -155,3 +157,24 @@ Recorded for upstream, not changed here: the issues in `set_board_stackup`, `set
 and `text_overlap` listed in `docs/BACKLOG.md`. Copperpour's `main` keeps moving, so the branch
 will need merging again just before a pull request to Copperpour. The pull request description
 should then name `pcb_footprint_text` and the 120 s limit as decisions for its maintainers.
+
+## Documentation review
+
+An independent check confirmed the commits, the upstream range and pull-request numbers, the tool
+and toolset counts, the code described, the CI runs and the gate summaries. Corrected:
+- the callers affected by the wait after a kill (the footprint upgrade does not kill; DRC on a
+  private copy does);
+- the date range, which is of commit dates;
+- two compressed or coined phrases;
+- the wording of how the toolset choice was made.
+
+It also noted that three measurements had no saved record. They were re-run on 2026-11-01 at
+18:36 UTC, with kicad-cli 10.0.7:
+- `kicad-cli pcb upgrade --force` on the 84,806,775-byte `jetson-agx-thor-baseboard` board:
+  6.9 s (6.2 s in the first run);
+- `live_kicad_saves_the_written_stack_unchanged`: passed in 3.0 s, with no skip message;
+- the control, a kill without the wait: `a_timed_out_kicad_cli_is_killed` failed with "still
+  exists when the call returns", and passed with the wait restored.
+
+The output is in `logs/merge-main-measurements.txt`, which is local only, since `logs/` is not
+tracked.

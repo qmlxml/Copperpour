@@ -2113,7 +2113,7 @@ pub(crate) async fn resave_board(cli: &str, board: &Path) -> Result<()> {
     // The callers pass a private copy, so kicad-cli may be killed on timeout;
     // otherwise it keeps the copy open, and on Windows its temporary folder
     // cannot be removed. 120 s: the 85 MB jetson-agx-thor-baseboard demo
-    // re-saves in 6.2 s (KiCad 10.0.7, measured 2026-11-01).
+    // re-saves in 6.2 s and 6.9 s in two runs (KiCad 10.0.7, measured 2026-11-01).
     run_cli_owned(
         cli,
         &["pcb", "upgrade", "--force", board],
